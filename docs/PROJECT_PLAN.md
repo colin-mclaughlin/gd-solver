@@ -415,6 +415,8 @@ struct AnchorRngState { uintptr_t fastRandState; bool locked; uint32_t seed; };
 ```
 GD uses a fast-random source somewhere in gameplay. **If RNG state is not captured and restored, restores will not be deterministic.** Note also `matcool/ReplayBot`'s known issue: *"rob uses a time function somewhere in the physics (why)"*, and a replay that "can randomly die at 26%." Nondeterminism sources are real and must be hunted down in Phase 0.
 
+> **DISPROVEN EMPIRICALLY — see §13.2.** `GJBaseGameLayer::m_randomSeed` takes a different value on every single reset, and ten replays of one input sequence under those ten different seeds produced **byte-identical** physics traces. RNG state does not affect physics and does not need to be captured or restored. Do not build savestate work on this paragraph.
+
 **(c) A ready-made savestate validation method.** `PlayerStateRestorer` exposes exactly the Phase 0 test needed:
 ```cpp
 static float positionalDrift(PlayerObject*, PlayerStateBundle const&);
@@ -607,6 +609,37 @@ The RLDash mod is a working Geode mod and its skeleton is a good starting point.
 10. Mixture-of-Experts for game-mode switching
 
 **Open RL question never resolved:** whether v2's regression came from the jump penalty or the death penalty magnitude. The isolation test was designed but not run.
+
+---
+
+## 13. Phase 0 results (measured, 2026-08-18)
+
+Measured on GD 2.2081 / Geode 5.8.2, Stereo Madness, 120 Hz display. Instrumentation is `mod/src/{main,Probe}.cpp`; raw traces land in the mod's save dir, and Geode writes a full per-session log to `<GD>/geode/logs/`.
+
+### 13.1 Determinism — GATE PASSED
+Ten replays of one recorded input sequence produced **one distinct trace hash**, byte-identical including step 0, under all three configs (no fix / §5.2 fix / fix + forced seeds). Phase 0 item 1 is retired.
+
+**Correction to §5.2's framing:** vanilla GD is *already* deterministic here — config (a), with no fix at all, was also 10/10 identical. The fix is not what delivers determinism on a machine with steady vsync. It is still worth keeping for two measured reasons: real frame hitches occur (deltas of 1/35, 1/47, 1/30 observed at attempt start) and vanilla folds those straight into physics; and it yields exactly one physics step per call, which is the granularity a frame-perfect macro needs.
+
+### 13.2 RNG does not affect physics — Phase 0 item 2 retired
+`m_randomSeed` differs on every reset. Config (b) does **not** force seeds, so its ten identical runs each ran under a different seed. This is a cleaner result than the forced-seed config could give. `m_replayRandSeed` is 0 throughout. See the correction inline in §5.6b.
+
+### 13.3 Tick structure — most of Phase 0 item 6
+`GJBaseGameLayer::update` is called **once per rendered frame** with `dt = 1/refresh`, and GD subdivides that into `refresh/240` sub-steps internally. Returning `1/240` from `getModifiedDelta` collapses this to exactly **one 240 Hz physics step per call** — the single-tick primitive. Running `round(nativeDt / (1/240))` such calls per frame restores real-time pace at full 240 Hz input granularity, and raising that count is the Phase 0 item 3 throughput lever.
+
+**peony's §5.2 part 3 (the `fractionOf240` midhook) is NOT needed.** Returning `1/240` already forces the step count to 1. This was the most build-fragile piece of §5.2 and it can be skipped.
+
+### 13.4 Bindings corrections
+- **`GJBaseGameLayer::m_currentStep` is NOT a physics step counter.** It sits in the replay cluster (`m_recordInputs`, `m_recordString`, `m_queuedRecordedButtons`, `m_queuedReplayButtons`) and read **0 for an entire level completion**. It is maintained only while GD's own replay system is active. Do not use it as a macro frame index or savestate key — maintain your own counter, reset per attempt.
+- **`handleButton`'s third argument is not "isPlayer1" in any useful sense.** Filtering human jump input on it discarded every press; the game passes `false` for the large majority (observed true×1 / false×10). Injection currently passes `true`; unresolved.
+- **`PlayLayer::loadFromCheckpoint(CheckpointObject*)` `0x3b7640`** is the restore primitive missing from §6.2 Layer 3, alongside `removeCheckpoint(bool)` `0x3b7f00` and `m_checkpointArray`.
+- **`PlayLayer::levelComplete()` `0x3a7a80`** is hookable — a second completion signal not in the §5.1 table. `playEndAnimationToPos` is **not** virtual; do not declare it so.
+
+### 13.5 Never run RLDash alongside the solver
+The old `colin.rldash` mod was installed during the first sweeps. Geode chains `update` hooks, so its `glReadPixels` + per-capture `log::debug` ran inside our stepping path — exactly the two things §9 calls fatal. It alone accounted for config (a)'s apparent nondeterminism (4 distinct hashes → 1 once removed) and for a stale `m_isOnGround4` at step 0. **Any timing measurement (Phase 0 items 3 and 4) is invalid with it loaded.**
+
+### 13.6 Still open
+Replay fidelity against the recorded human run is close but not exact (diverged at step 1166/1823, same death point and final percent). Suspected off-by-one in recording phase, since fixed. Items 4, 5 and 7 (savestate cost, drift, completion detection) not yet started.
 
 ---
 
