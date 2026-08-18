@@ -120,6 +120,33 @@ struct Config {
 	int stallLimit  = 400;
 	int escapeJump  = 200;
 
+	// Iterative deepening on air toggle count. Starts at 1 so the very first
+	// things tried are "never change the input" and "change it exactly once" -
+	// the latter being "hold from ship entry onward".
+	int toggleBudget    = 1;
+	int maxToggleBudget = 24;
+
+	// Prefix commitment (plan section 7, "segment decomposition").
+	//
+	// Measured: once the air toggles at a given budget were exhausted, the
+	// search fell back into the ALREADY-SOLVED cube prefix and re-searched it
+	// exhaustively - 2.9 million steps at 1099 steps per death, best% frozen,
+	// and the toggle budget could never deepen because an 800-decision cube
+	// tree never exhausts. Freezing the prefix behind the frontier fixes all
+	// three at once.
+	//
+	// Measured in GAME STEPS behind the best progress, not stack indices.
+	//
+	// The first version stored an absolute stack index taken when best% improved
+	// - i.e. when the stack was DEEPEST. Backtracking later shrank the stack to
+	// exactly that index, so commitDepth == stack.size() and the search froze
+	// solid: budgets 1..24 exhausted in one second with 87 total deaths.
+	// A step-based cutoff is stable under stack growth and shrinkage.
+	// 1 s at 240Hz. Must be well BELOW the length of a section, or the floor can
+	// never advance within it: the ship is ~330 steps, so a 480-step window
+	// would still span the whole thing and freeze nothing.
+	int commitLookbackSteps = 240;
+
 	// Give up on a branch that survives this long without a decision point or
 	// death, to avoid an unbounded descent.
 	int maxSegmentSteps = 2000;
@@ -697,6 +724,19 @@ struct Decision {
 	int               step      = 0;       // solver step index at capture
 	uint8_t           tried     = 0;       // bit0 = tried release, bit1 = tried hold
 	bool              choice    = false;   // action currently being explored
+	bool              airPolicy = false;   // which branch policy created this
+
+	// Iterative deepening on toggle count, for air sections.
+	//
+	// Good ship paths have FEW input changes: "hold from ship entry" is one
+	// toggle, "hold then release to level off" is two. DFS on raw hold/release
+	// reaches those last, having exhausted astronomically many high-toggle
+	// sequences first. Bounding the toggle count and raising the bound on
+	// exhaustion searches simple paths before complicated ones, and stays
+	// complete as the bound grows.
+	bool enteringHold  = false; // hold state on arrival, so a toggle is well-defined
+	int  togglesBefore = 0;     // air toggles used on the path up to this decision
+	bool modeTransition = false; // pushed because the game mode changed here
 };
 
 struct Solver {
@@ -714,6 +754,10 @@ struct Solver {
 	uint64_t              lastReport = 0;
 	float                 diedAtX      = -1.f;
 	bool                  prevOnGround = false;
+	bool                  prevAirMode  = false;
+	int                   togglesUsed  = 0;
+	size_t                commitDepth  = 0; // cached for logging; see solverCommitFloor()
+	int                   bestStep     = 0; // solver step at which bestPct was reached
 	uint64_t              deathsAtBest = 0;
 	uint64_t              escapes      = 0;
 
@@ -725,6 +769,11 @@ struct Solver {
 		hold = false;
 		step = 0;
 		lastBranch = 0;
+		togglesUsed = 0;
+		prevAirMode = false;
+		prevOnGround = false;
+		commitDepth = 0;
+		bestStep = 0;
 		bestPct = 0.f;
 		deaths = restores = steps = 0;
 	}
@@ -1057,6 +1106,7 @@ void pollHotkeys() {
 			st.mode = Mode::Idle;
 		} else if (PlayLayer::get()) {
 			g_config.physicsFix = true; // the solver requires fixed-dt stepping
+			g_config.toggleBudget = 1;  // deepening is per-search, not global
 
 			// Practice mode is what makes resetLevel respawn to a checkpoint
 			// instead of the level start, which is the only revive path we have.
@@ -1265,15 +1315,99 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		Decision d;
 		d.step = sv.step;
+		if (auto* p = m_player1) {
+			d.airPolicy = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
+		}
 		if (CheckpointObject* cp = pl->createCheckpoint()) { cp->retain(); d.cp = cp; }
 
-		// Try release first: no-press is the likelier correct branch.
-		d.choice = false;
-		d.tried  = 1u << 0;
+		d.enteringHold  = sv.hold;
+		d.togglesBefore = d.airPolicy ? sv.togglesUsed : 0;
+
+		// Move ordering. Both branches are still explored (subject to the toggle
+		// budget), so this changes only which is tried FIRST.
+		if (d.airPolicy) {
+			// Continue whatever we were doing. A sustained hold then costs one
+			// decision instead of many consecutive lucky flips, and the cheap
+			// branch is the simple one.
+			//
+			// No physics rule here on purpose. The previous attempt preferred
+			// "hold when m_isOnGround" to lift off the floor - but in ship mode
+			// m_isOnGround is also true against the CEILING, so it held the ship
+			// harder into it and best% went backwards, 35.23% -> 33.78%.
+			d.choice = sv.hold;
+		} else {
+			// Cube: no-press is the likelier correct branch (~10% jump rate in
+			// the BC dataset), and this policy already clears 35% of the level.
+			d.choice = false;
+		}
+		d.tried = d.choice ? (1u << 1) : (1u << 0);
 
 		sv.stack.push_back(d);
 		sv.hold       = d.choice;
 		sv.lastBranch = sv.step;
+	}
+
+	// The committed prefix, recomputed against the CURRENT stack every time.
+	//
+	// Decisions older than commitLookbackSteps behind the best progress are
+	// frozen: new progress is evidence the prefix works, so re-searching it is
+	// waste (measured: 2.9M steps re-deriving a solved cube path). A minimum
+	// window is always left mutable so the search can never freeze itself.
+	size_t solverCommitFloor() {
+		auto& sv = Solver::get();
+		if (sv.stack.empty()) return 0;
+
+		// Prefer the last mode transition at or before the frontier. The game
+		// tells us where one section ends and the next begins, and that is the
+		// right unit to commit: measured, a 1200-step (5 s) window left ~870
+		// steps of solved CUBE mutable, and the search burned 3.27M steps there
+		// re-deriving it while the toggle budget never once deepened.
+		//
+		// The transition decision itself stays mutable so the search can still
+		// choose its hold state from the exact step the section begins.
+		size_t floorIdx = 0;
+		bool anchored = false;
+		for (size_t i = sv.stack.size(); i-- > 0; ) {
+			if (sv.stack[i].modeTransition && sv.stack[i].step <= sv.bestStep) {
+				floorIdx = i;
+				anchored = true;
+				break;
+			}
+		}
+
+		// Take the LATER of the transition anchor and a sliding window behind the
+		// frontier, so the floor keeps advancing WITHIN a long section as
+		// progress is made. Anchoring only at the section start left all ~82
+		// ship decisions mutable forever, so the toggle budget was spent
+		// re-deriving the solved part of the ship instead of extending it.
+		(void)anchored;
+		if (sv.bestStep > g_config.commitLookbackSteps) {
+			const int cutoff = sv.bestStep - g_config.commitLookbackSteps;
+			size_t windowIdx = 0;
+			while (windowIdx < sv.stack.size() && sv.stack[windowIdx].step < cutoff) windowIdx++;
+			floorIdx = std::max(floorIdx, windowIdx);
+		}
+
+		// Never freeze the whole stack.
+		const size_t maxFloor = sv.stack.size() > 16 ? sv.stack.size() - 16 : 0;
+		return std::min(floorIdx, maxFloor);
+	}
+
+	// Restore to a decision's captured state. loadFromCheckpoint alone restores
+	// position but does not revive a dead player, so this drives practice
+	// mode's own respawn, which does both.
+	void solverRestoreState(Decision& d) {
+		auto* pl = PlayLayer::get();
+		if (!pl || !d.cp) return;
+		if (auto* arr = pl->m_checkpointArray) {
+			arr->removeAllObjects();
+			arr->addObject(d.cp);
+		}
+		auto& ps = ProbeState::get();
+		ps.solverRestoring = true;
+		pl->resetLevel();
+		ps.solverRestoring = false;
+		Solver::get().restores++;
 	}
 
 	// Unwind to the most recent decision with an untried branch and take it.
@@ -1287,42 +1421,91 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// Abandon a chunk of the stack so the search resumes much earlier.
 		if (g_config.stallLimit > 0 &&
 		    sv.deaths - sv.deathsAtBest > static_cast<uint64_t>(g_config.stallLimit)) {
-			const size_t drop = std::min(static_cast<size_t>(g_config.escapeJump),
-			                             sv.stack.size() > 1 ? sv.stack.size() - 1 : 0);
+			// Never rewind below the committed prefix. The previous version only
+			// held a floor when the stack TOP was an air decision, so once the
+			// air decisions were popped the guard stopped applying and the
+			// escape tunnelled straight back into the solved cube section.
+			const size_t escFloor = solverCommitFloor();
+			size_t maxDrop = sv.stack.size() > escFloor
+			               ? sv.stack.size() - escFloor : 0;
+
+			// Also prefer not to rewind out of an air section we are working on.
+			if (!sv.stack.empty() && sv.stack.back().airPolicy) {
+				size_t firstAir = 0;
+				while (firstAir < sv.stack.size() && !sv.stack[firstAir].airPolicy) firstAir++;
+				if (firstAir < sv.stack.size()) {
+					const size_t keep = firstAir + 1; // keep the entry decision itself
+					const size_t airDrop = sv.stack.size() > keep ? sv.stack.size() - keep : 0;
+					maxDrop = std::min(maxDrop, airDrop);
+				}
+			}
+
+			const size_t drop = std::min(static_cast<size_t>(g_config.escapeJump), maxDrop);
 			for (size_t i = 0; i < drop; i++) {
 				if (sv.stack.back().cp) sv.stack.back().cp->release();
 				sv.stack.pop_back();
 			}
 			sv.escapes++;
 			sv.deathsAtBest = sv.deaths;
+
+			// Phase A2: the rewind distance in steps AND seconds. Arithmetic says
+			// 200 air decisions should be ~800 steps (3.3 s); observation said
+			// 0.1-0.2 s (~24-48 steps). Those cannot both be true, so measure it
+			// rather than reason about it.
+			const int stepTo    = sv.stack.empty() ? 0 : sv.stack.back().step;
+			const int deltaSteps = sv.step - stepTo;
+
+			// Phase A3: composition of what is left on the stack.
+			size_t airCount = 0;
+			for (auto const& e : sv.stack) if (e.airPolicy) airCount++;
+
 			log::info("Solver: stalled {} deaths at {:.2f}% - abandoned {} decisions, "
 			          "depth now {} (escape #{})",
 			          g_config.stallLimit, sv.bestPct, drop, sv.stack.size(), sv.escapes);
+			log::info("  rewind: step {} -> {} = {} steps = {:.3f} s at 240Hz",
+			          sv.step, stepTo, deltaSteps, deltaSteps / 240.0);
+			log::info("  stack composition: {} air-policy, {} cube-policy of {} total",
+			          airCount, sv.stack.size() - airCount, sv.stack.size());
 		}
 
-		while (!sv.stack.empty()) {
+		// Stop at the committed prefix rather than the bottom of the stack.
+		// Popping past it is what let the search waste itself re-deriving a
+		// cube path it already had.
+		const size_t floor = solverCommitFloor();
+		sv.commitDepth = floor; // cached for logging
+		while (sv.stack.size() > floor) {
 			Decision& d = sv.stack.back();
+
+			// The untried branch of an air decision is by construction the one
+			// that toggles. Refuse it when the path is already at the toggle
+			// budget; the bound rises when the whole tree at this bound is done.
+			if (d.tried != 0b11 && d.airPolicy) {
+				const bool wouldToggle = (!d.choice) != d.enteringHold;
+				// Relative to the committed prefix: toggles spent inside a
+				// frozen, already-working prefix must not count against the
+				// budget for the part still being solved.
+				const int floorToggles = floor < sv.stack.size()
+				                       ? sv.stack[floor].togglesBefore : 0;
+				const int spent = d.togglesBefore - floorToggles;
+				if (wouldToggle && spent >= g_config.toggleBudget) {
+					if (d.cp) d.cp->release();
+					sv.stack.pop_back();
+					continue;
+				}
+			}
 
 			if (d.tried != 0b11) {
 				d.choice = !d.choice;
 				d.tried |= d.choice ? (1u << 1) : (1u << 0);
+				// Only AIR decisions spend toggle budget. Counting cube flips too
+				// meant ~800 cube decisions exhausted the budget before the ship
+				// was even reached, so every air toggle was refused and each
+				// budget level "exhausted" after a single path.
+				sv.togglesUsed = d.togglesBefore +
+					((d.airPolicy && d.choice != d.enteringHold) ? 1 : 0);
 
 				const float xBefore = m_player1 ? m_player1->getPositionX() : -1.f;
-				if (d.cp) {
-					// loadFromCheckpoint restores position but does NOT revive a
-					// dead player. Practice mode's own respawn does both, so put
-					// our target checkpoint at the end of the array GD reads and
-					// let resetLevel drive it.
-					if (auto* arr = pl->m_checkpointArray) {
-						arr->removeAllObjects();
-						arr->addObject(d.cp);
-					}
-					auto& ps = ProbeState::get();
-					ps.solverRestoring = true;
-					pl->resetLevel();
-					ps.solverRestoring = false;
-					sv.restores++;
-				}
+				solverRestoreState(d);
 				const float xAfter = m_player1 ? m_player1->getPositionX() : -1.f;
 
 				// Decisive check that a restore actually moves the player back.
@@ -1355,10 +1538,16 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		sv.lastReport = now;
 
 		const double secs = probe::ticksToMicros(now - sv.startTicks) / 1e6;
+		const double stepsPerSec = secs > 0 ? sv.steps / secs : 0.0;
+
+		// The speed multiplier matters for interpreting anything observed by eye:
+		// the search runs many times faster than real time, so a rewind of 3.3
+		// GAME seconds plays back in a fraction of a wall-clock second. Game time
+		// and wall-clock time are not interchangeable here.
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
-		          "steps {}  ({:.0f} steps/s, {:.0f} restores/s)",
+		          "steps {}  budget {}  commit {}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
-		          secs > 0 ? sv.steps / secs : 0.0,
+		          g_config.toggleBudget, sv.commitDepth, stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
 	}
 
@@ -1400,6 +1589,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (pct > sv.bestPct) {
 			sv.bestPct      = pct;
 			sv.deathsAtBest = sv.deaths; // progress: reset the stall counter
+
+			// Record where the frontier reached. The commit floor is derived
+			// from this against the CURRENT stack, never stored as an index.
+			if (sv.step > sv.bestStep) sv.bestStep = sv.step;
 		}
 		solverReport(false);
 
@@ -1420,19 +1613,86 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (m_player1->m_isDead) {
 			sv.deaths++;
 			sv.diedAtX = m_player1->getPositionX();
+
+			// Phase A1: what mode is this section actually in, and which branch
+			// policy is driving it? The ship riding the floor into the first
+			// block is exactly what the CUBE policy would produce, because its
+			// jump-commitment logic releases the button the instant the player
+			// leaves the ground.
+			if (sv.deaths <= 20 || sv.deaths % 500 == 0) {
+				auto* p = m_player1;
+				const bool air = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
+				log::info("Solver death #{}: step {} X {:.1f} {:.2f}%  policy={}  "
+				          "ship={} ufo={} wave={} swing={} ball={} robot={} spider={}  "
+				          "onGround={}/{}/{}/{}  yVel={:.3f}  hold={}",
+				          sv.deaths, sv.step, sv.diedAtX, pl->getCurrentPercent(),
+				          air ? "AIR" : "CUBE",
+				          p->m_isShip, p->m_isBird, p->m_isDart, p->m_isSwing,
+				          p->m_isBall, p->m_isRobot, p->m_isSpider,
+				          p->m_isOnGround, p->m_isOnGround2, p->m_isOnGround3, p->m_isOnGround4,
+				          p->m_yVelocity, sv.hold);
+			}
+
 			if (!solverBacktrack()) {
-				solverReport(true);
-				log::error("Solver: search space EXHAUSTED at best {:.2f}%. No solution "
-				           "under this branching policy - loosen airBranchInterval.",
-				           sv.bestPct);
-				sv.clear();
-				ProbeState::get().mode = Mode::Idle;
+				// Every path within the current toggle budget is exhausted.
+				// Deepen and restart rather than giving up: this is what makes
+				// the search complete as the bound grows.
+				if (g_config.toggleBudget < g_config.maxToggleBudget) {
+					g_config.toggleBudget++;
+					solverReport(true);
+					log::info("Solver: exhausted every path with <= {} air toggles above "
+					          "the committed prefix (depth {}) at {:.2f}%. Deepening to {}.",
+					          g_config.toggleBudget - 1, sv.commitDepth, sv.bestPct,
+					          g_config.toggleBudget);
+
+					// Resume from the committed prefix, not from level start:
+					// re-deriving a solved prefix is exactly the waste this fixes.
+					if (!sv.stack.empty()) {
+						Decision& d = sv.stack.back();
+						solverRestoreState(d);
+						sv.step        = d.step;
+						sv.macro.resize(static_cast<size_t>(d.step), 0);
+						sv.hold        = d.choice;
+						sv.lastBranch  = d.step;
+						sv.togglesUsed = d.togglesBefore +
+							((d.airPolicy && d.choice != d.enteringHold) ? 1 : 0);
+						sv.deathsAtBest = sv.deaths;
+						// Reopen the frontier above the floor at the new budget.
+						for (auto& e : sv.stack) {
+							if (e.airPolicy) e.tried = e.choice ? (1u << 1) : (1u << 0);
+						}
+					} else {
+						const float keepBest = sv.bestPct;
+						sv.clear();
+						sv.running    = true;
+						sv.bestPct    = keepBest;
+						sv.startTicks = probe::nowTicks();
+						sv.lastReport = sv.startTicks;
+						ProbeState::get().resetPending = true;
+					}
+				} else {
+					solverReport(true);
+					log::error("Solver: EXHAUSTED at best {:.2f}% up to {} air toggles.",
+					           sv.bestPct, g_config.maxToggleBudget);
+					sv.clear();
+					ProbeState::get().mode = Mode::Idle;
+				}
 			}
 			return false;
 		}
 
 		auto* p = m_player1;
 		const bool airMode = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
+
+		// A mode change is the most timing-critical frame in a section, and
+		// nothing otherwise guarantees a decision lands on it. Force one so the
+		// search can pick its hold state from the exact step the ship begins.
+		if (airMode != sv.prevAirMode) {
+			sv.prevAirMode = airMode;
+			solverPushDecision();
+			if (!sv.stack.empty()) sv.stack.back().modeTransition = true;
+			return true;
+		}
 
 		if (airMode) {
 			// Hold state controls the trajectory continuously, so the action
