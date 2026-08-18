@@ -47,6 +47,11 @@ constexpr int    kJumpButton      = 1;     // PlayerButton::Jump
 // Config (c) of Probe 1: an arbitrary fixed value, only its constancy matters.
 constexpr uint64_t kForcedSeed = 0x5EEDC0FFEEULL;
 
+// Wall-clock the solver may spend per rendered frame before yielding. Keeps the
+// window pumping messages so the process never goes Not Responding, at the cost
+// of capping throughput at (budget / step cost) x refresh.
+constexpr double kSolverFrameBudgetUs = 12'000.0; // 12 ms
+
 // ---------------------------------------------------------------------------
 // Runtime configuration
 // ---------------------------------------------------------------------------
@@ -91,6 +96,39 @@ struct Config {
 	// step. Sweepable with F9/F10 to confirm 1 is exactly right rather than
 	// approximately right.
 	int injectionLeadSteps = 1;
+
+	// Branch granularity for modes where input matters every frame (ship, wave,
+	// UFO, swing). 1 would be exhaustive and correct but explodes; this is the
+	// knob to tighten if a section proves unsolvable.
+	int airBranchInterval = 4;
+
+	// Minimum gap between decisions while grounded. Branching on EVERY grounded
+	// frame is the complete formulation, but it produced a 3400-deep stack over
+	// a third of Stereo Madness - which both blew memory and, per Probe 5,
+	// degraded restore cost badly enough to cut throughput 15x. Landings and
+	// orb contacts still always branch, since those are timing-critical.
+	int groundBranchInterval = 4;
+
+	// Escape from the DFS thrash documented in plan section 6.3: when the fatal
+	// mistake happened long before the death, DFS exhausts an innocent subtree
+	// near the death instead of backing up to the culprit. After this many
+	// deaths with no improvement in best%, abandon a chunk of the stack to force
+	// exploration further back.
+	//
+	// This TRADES AWAY strict completeness, which was the main argument for DFS
+	// over beam. Set stallLimit to 0 to disable and get pure DFS back.
+	int stallLimit  = 400;
+	int escapeJump  = 200;
+
+	// Give up on a branch that survives this long without a decision point or
+	// death, to avoid an unbounded descent.
+	int maxSegmentSteps = 2000;
+
+	// Hard cap on search depth. Each frame retains a ~22 KB checkpoint, and
+	// holding thousands of them also degrades restore cost badly (measured:
+	// 43 ms -> 165 ms at 1000 live states), so an unbounded stack strangles
+	// throughput long before it exhausts memory.
+	int maxStackDepth = 4000;
 };
 
 Config g_config;
@@ -103,6 +141,14 @@ enum class Mode {
 	Idle,
 	RecordInput,  // capture what the human presses, per step
 	Determinism,  // Probe 1: replay fixed input N times, compare trace hashes
+	RestoreTest,  // Probe 4b: does a restore reproduce the future, bit-for-bit?
+	Solve,        // DFS search for an input sequence that clears the level
+};
+
+// Which save/restore mechanism the restore test exercises.
+enum class RestoreKind {
+	Full,        // PlayLayer::createCheckpoint / loadFromCheckpoint
+	PlayerOnly,  // PlayerObject::saveToCheckpoint / loadFromCheckpoint
 };
 
 struct ProbeState {
@@ -185,6 +231,32 @@ struct ProbeState {
 	bool recordedPhysicsFix = false;
 	bool haveRecordingMeta  = false;
 
+	// Set immediately before a reset the solver itself requested, so the
+	// suppression in resetLevel lets that one through.
+	bool solverWantsReset = false;
+
+	// True while the solver is deliberately using resetLevel as a respawn to a
+	// chosen checkpoint. The reset must run for real, but must NOT wipe the
+	// solver's per-attempt bookkeeping.
+	bool solverRestoring = false;
+
+	// --- Probe 4b: restore fidelity ---
+	// Drift-zero at t=0 is necessary but not sufficient. The real question is
+	// whether the SAME input from a restored state produces the same future.
+	RestoreKind  restoreKind   = RestoreKind::Full;
+	int          restorePhase  = 0;   // 0 = running to anchor, 1 = segment A, 2 = segment B
+	int          restoreAnchor = 480; // step at which to capture (2 s in)
+	int          restoreLen    = 600; // steps to simulate per segment
+	probe::Trace segmentA;
+	probe::Trace segmentB;
+	CheckpointObject* fullCp   = nullptr;
+	PlayerCheckpoint* playerCp = nullptr;
+
+	void releaseCheckpoints() {
+		if (fullCp)   { fullCp->release();   fullCp   = nullptr; }
+		if (playerCp) { playerCp->release(); playerCp = nullptr; }
+	}
+
 	// --- determinism sweep (spans attempts; cleared when a sweep starts) ---
 	int  runIndex    = 0;
 	int  runsLeft    = 0;
@@ -227,6 +299,10 @@ struct ProbeState {
 		scripted.clear();
 		humanReference.clear();
 		humanReferencePercent = 0.f;
+		releaseCheckpoints();
+		restorePhase = 0;
+		segmentA.clear();
+		segmentB.clear();
 		dtSamples.clear();
 		nativeDtLocked     = false;
 		nativeDt           = 0.0;
@@ -577,6 +653,164 @@ void onAttemptEnded() {
 }
 
 // ---------------------------------------------------------------------------
+// The solver
+// ---------------------------------------------------------------------------
+//
+// DFS with backtracking over decision points, pruning on death.
+//
+// The action at a decision point is "the button state to hold until the next
+// decision point", which covers both a cube's tap-on-landing and a ship's
+// sustained hold with one model.
+//
+// Ordering: try NOT pressing first. The behaviour-cloning dataset showed a
+// ~10% jump rate, so no-press is the likelier branch and finding it first
+// prunes more.
+
+// Where input can change the outcome, per game mode (plan section 6.3). Getting
+// this wrong in the permissive direction costs a slightly-too-frequent branch;
+// getting it wrong in the restrictive direction can make a level unsolvable
+// because the one frame that mattered was never considered.
+bool isDecisionPoint(PlayerObject* p, int stepsSinceLast) {
+	if (!p) return false;
+
+	const bool ship  = p->m_isShip;
+	const bool ufo   = p->m_isBird;
+	const bool wave  = p->m_isDart;
+	const bool swing = p->m_isSwing;
+
+	if (ship || wave || swing || ufo) {
+		// Hold state controls the trajectory continuously. Branching every
+		// single frame is correct but explodes, so branch on a fixed grid and
+		// tighten it only if a section proves unsolvable at this granularity.
+		return stepsSinceLast >= g_config.airBranchInterval;
+	}
+
+	// Cube, ball, spider: only on a surface or touching an orb. Robot also
+	// varies jump height with hold duration, which this does not yet model.
+	const bool onGround = p->m_isOnGround;
+	const bool onRing   = p->m_touchingRings && p->m_touchingRings->count() > 0;
+	return onGround || onRing;
+}
+
+struct Decision {
+	CheckpointObject* cp        = nullptr; // state entering this decision
+	int               step      = 0;       // solver step index at capture
+	uint8_t           tried     = 0;       // bit0 = tried release, bit1 = tried hold
+	bool              choice    = false;   // action currently being explored
+};
+
+struct Solver {
+	bool                  running    = false;
+	std::vector<Decision> stack;
+	std::vector<uint8_t>  macro;      // input applied per step, truncated on backtrack
+	bool                  hold       = false;
+	int                   step       = 0;
+	int                   lastBranch = 0;
+	float                 bestPct    = 0.f;
+	uint64_t              deaths     = 0;
+	uint64_t              restores   = 0;
+	uint64_t              steps      = 0;
+	uint64_t              startTicks = 0;
+	uint64_t              lastReport = 0;
+	float                 diedAtX      = -1.f;
+	bool                  prevOnGround = false;
+	uint64_t              deathsAtBest = 0;
+	uint64_t              escapes      = 0;
+
+	void clear() {
+		for (auto& d : stack) if (d.cp) d.cp->release();
+		stack.clear();
+		macro.clear();
+		running = false;
+		hold = false;
+		step = 0;
+		lastBranch = 0;
+		bestPct = 0.f;
+		deaths = restores = steps = 0;
+	}
+
+	static Solver& get() { static Solver s; return s; }
+};
+
+void solverWriteMacro(const char* name) {
+	auto& sv = Solver::get();
+	std::string path = probe::outputPath(name);
+	if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+		std::fprintf(f, "# gd-solver macro v1, %zu steps, physics_fix=%d, 240Hz\n",
+		             sv.macro.size(), g_config.physicsFix ? 1 : 0);
+		for (size_t i = 0; i < sv.macro.size(); i++) {
+			std::fputc(sv.macro[i] ? '1' : '0', f);
+			if ((i + 1) % 80 == 0) std::fputc('\n', f);
+		}
+		std::fputc('\n', f);
+		std::fclose(f);
+		log::info("Solver: macro written to {}", path);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Probe 4b: restore fidelity
+// ---------------------------------------------------------------------------
+
+const char* restoreKindName(RestoreKind k) {
+	return k == RestoreKind::Full ? "FULL (PlayLayer checkpoint)"
+	                              : "PLAYER-ONLY (PlayerObject checkpoint)";
+}
+
+void startRestoreTest(RestoreKind kind) {
+	auto& st = ProbeState::get();
+	if (!PlayLayer::get()) { log::warn("Probe 4b: not in a level"); return; }
+
+	if (st.scripted.empty()) {
+		bool fix = false;
+		if (!loadInput(st.scripted, &fix) || st.scripted.empty()) {
+			st.scripted = makeFallbackInput(kMaxTraceRows);
+			log::warn("Probe 4b: no recorded input, using synthetic pattern");
+		}
+	}
+
+	st.restoreKind  = kind;
+	st.mode         = Mode::RestoreTest;
+	st.restorePhase = 0;
+	st.segmentA.reserve(kMaxTraceRows);
+	st.segmentB.reserve(kMaxTraceRows);
+	st.releaseCheckpoints();
+	st.resetPending = true;
+
+	log::info("Probe 4b: restore fidelity, mechanism = {}. Anchor at step {}, "
+	          "{} steps per segment.",
+	          restoreKindName(kind), st.restoreAnchor, st.restoreLen);
+}
+
+void finishRestoreTest() {
+	auto& st = ProbeState::get();
+
+	const uint64_t hA = st.segmentA.hash();
+	const uint64_t hB = st.segmentB.hash();
+	const size_t   at = st.segmentA.firstDivergenceMasked(st.segmentB, probe::kInputSourceMask);
+
+	log::info("================ Probe 4b: restore fidelity ================");
+	log::info("  mechanism: {}", restoreKindName(st.restoreKind));
+	log::info("  segment A (original): {} rows, hash {:016X}", st.segmentA.size(), hA);
+	log::info("  segment B (restored): {} rows, hash {:016X}", st.segmentB.size(), hB);
+
+	if (at == SIZE_MAX && st.segmentA.size() == st.segmentB.size()) {
+		log::info("  RESTORE IS SOUND - {} steps after restore are bit-identical.",
+		          st.segmentA.size());
+	} else {
+		log::error("  RESTORE IS NOT SOUND - diverges {} step(s) after the restore point.", at);
+		std::string base = st.restoreKind == RestoreKind::Full ? "probe4b_full" : "probe4b_playeronly";
+		st.segmentA.writeCsv(probe::outputPath(base + "_A.csv"));
+		st.segmentB.writeCsv(probe::outputPath(base + "_B.csv"));
+		log::error("  segments written to {}_A.csv / _B.csv for diffing", base);
+	}
+	log::info("===========================================================");
+
+	st.releaseCheckpoints();
+	st.mode = Mode::Idle;
+}
+
+// ---------------------------------------------------------------------------
 // Probe 5: savestate cost
 // ---------------------------------------------------------------------------
 //
@@ -595,6 +829,38 @@ size_t processMemoryBytes() {
 	return pmc.WorkingSetSize;
 }
 
+// Total wall-clock budget per phase. The first version ran a flat 1000
+// restores and hung an object-heavy demon for ~94 seconds, long enough for
+// Windows to mark the process Not Responding. Each phase now stops early once
+// it has spent this long, so cost scales the sample count down automatically.
+constexpr double kProbe5BudgetUs = 4'000'000.0; // 4 s
+
+void logStats(const char* label, std::vector<double>& us) {
+	const probe::Stats s = probe::summarize(us);
+	log::info("  {:<20} n={:<5} min {:.1f}us  median {:.1f}us  p99 {:.1f}us  max {:.1f}us",
+	          label, s.count, s.min, s.median, s.p99, s.max);
+}
+
+// Bucketed means answer "uniform or degrading?" directly, instead of leaving it
+// to be inferred from the gap between min and median.
+void logTrend(const char* label, std::vector<double> const& us) {
+	if (us.size() < 10) return;
+	const size_t buckets = 5;
+	const size_t per     = us.size() / buckets;
+	std::string line;
+	for (size_t b = 0; b < buckets; b++) {
+		double sum = 0.0;
+		for (size_t i = b * per; i < (b + 1) * per; i++) sum += us[i];
+		line += fmt::format("{:.0f}us ", sum / static_cast<double>(per));
+		if (b + 1 < buckets) line += "-> ";
+	}
+	const double first = us.front(), last = us.back();
+	log::info("  {} trend over time: {}", label, line);
+	log::info("  {} first={:.0f}us last={:.0f}us ratio={:.2f}x -> {}",
+	          label, first, last, first > 0 ? last / first : 0.0,
+	          (first > 0 && last / first > 1.5) ? "DEGRADING" : "uniform");
+}
+
 void runProbe5(int count) {
 	auto* pl = PlayLayer::get();
 	if (!pl || !pl->m_player1) {
@@ -602,66 +868,124 @@ void runProbe5(int count) {
 		return;
 	}
 
-	log::info("Probe 5: savestate cost, {} iterations...", count);
+	log::info("Probe 5: savestate cost, up to {} iterations per phase "
+	          "({:.0f}s budget each)...", count, kProbe5BudgetUs / 1e6);
+	log::warn("Probe 5: DISABLE other mods that hook createCheckpoint or "
+	          "loadFromCheckpoint (QOLMod does) - Geode chains hooks, so their "
+	          "code runs inside every timed call.");
 
-	// --- capture cost, retaining every checkpoint so memory can be measured ---
-	std::vector<CheckpointObject*> kept;
-	kept.reserve(count);
+	// --- Phase A: capture cost, with NO accumulation ---------------------
+	// Create and immediately release, so this measures capture alone rather
+	// than capture-while-N-checkpoints-are-live.
 	std::vector<double> createUs;
 	createUs.reserve(count);
-
-	const size_t memStart = processMemoryBytes();
-	size_t memAt1 = 0, memAt100 = 0;
-
-	for (int i = 0; i < count; i++) {
-		const uint64_t t0 = probe::nowTicks();
-		CheckpointObject* cp = pl->createCheckpoint();
-		const uint64_t t1 = probe::nowTicks();
-		createUs.push_back(probe::ticksToMicros(t1 - t0));
-
-		if (cp) { cp->retain(); kept.push_back(cp); }
-
-		if (i == 0)  memAt1   = processMemoryBytes();
-		if (i == 99) memAt100 = processMemoryBytes();
-	}
-	const size_t memAtN = processMemoryBytes();
-
-	// --- restore cost, against a single checkpoint ---
-	std::vector<double> loadUs;
-	loadUs.reserve(count);
-	if (!kept.empty()) {
+	{
+		const uint64_t start = probe::nowTicks();
 		for (int i = 0; i < count; i++) {
 			const uint64_t t0 = probe::nowTicks();
-			pl->loadFromCheckpoint(kept.front());
+			CheckpointObject* cp = pl->createCheckpoint();
 			const uint64_t t1 = probe::nowTicks();
-			loadUs.push_back(probe::ticksToMicros(t1 - t0));
+			createUs.push_back(probe::ticksToMicros(t1 - t0));
+			if (cp) { cp->retain(); cp->release(); }
+			if (probe::ticksToMicros(probe::nowTicks() - start) > kProbe5BudgetUs) break;
+		}
+	}
+	logStats("createCheckpoint", createUs);
+
+	// --- Phase A2: player-only capture/restore ---------------------------
+	// PlayLayer::createCheckpoint bundles player state WITH level state
+	// (object states, effect manager, sequence triggers). The player-only pair
+	// skips all of that, so it should be O(1) in object count. Correctness is
+	// a separate question - see the restore-fidelity test (F12).
+	if (auto* p = pl->m_player1) {
+		if (PlayerCheckpoint* pc = PlayerCheckpoint::create()) {
+			pc->retain();
+
+			std::vector<double> saveUs, restoreUs;
+			saveUs.reserve(count);
+			restoreUs.reserve(count);
+
+			uint64_t start = probe::nowTicks();
+			for (int i = 0; i < count; i++) {
+				const uint64_t t0 = probe::nowTicks();
+				p->saveToCheckpoint(pc);
+				const uint64_t t1 = probe::nowTicks();
+				saveUs.push_back(probe::ticksToMicros(t1 - t0));
+				if (probe::ticksToMicros(probe::nowTicks() - start) > kProbe5BudgetUs) break;
+			}
+
+			start = probe::nowTicks();
+			for (int i = 0; i < count; i++) {
+				const uint64_t t0 = probe::nowTicks();
+				p->loadFromCheckpoint(pc);
+				const uint64_t t1 = probe::nowTicks();
+				restoreUs.push_back(probe::ticksToMicros(t1 - t0));
+				if (probe::ticksToMicros(probe::nowTicks() - start) > kProbe5BudgetUs) break;
+			}
+
+			const probe::Stats ss = probe::summarize(saveUs);
+			const probe::Stats rs = probe::summarize(restoreUs);
+			logStats("player saveToCP", saveUs);
+			logStats("player loadFromCP", restoreUs);
+			log::info("  player-only restore median {:.3f} ms", rs.median / 1000.0);
+			(void)ss;
+
+			pc->release();
 		}
 	}
 
-	const probe::Stats cs = probe::summarize(createUs);
+	// --- Phase B: restore cost against exactly ONE live checkpoint -------
+	// This is the number that gates the architecture, and the condition a real
+	// search actually runs under.
+	std::vector<double> loadUs;
+	loadUs.reserve(count);
+	if (CheckpointObject* cp = pl->createCheckpoint()) {
+		cp->retain();
+		const uint64_t start = probe::nowTicks();
+		for (int i = 0; i < count; i++) {
+			const uint64_t t0 = probe::nowTicks();
+			pl->loadFromCheckpoint(cp);
+			const uint64_t t1 = probe::nowTicks();
+			loadUs.push_back(probe::ticksToMicros(t1 - t0));
+			if (probe::ticksToMicros(probe::nowTicks() - start) > kProbe5BudgetUs) break;
+		}
+		cp->release();
+	}
+	std::vector<double> loadOrdered = loadUs; // keep chronological order for the trend
+	logStats("loadFromCheckpoint", loadUs);
+	logTrend("loadFromCheckpoint", loadOrdered);
+
 	const probe::Stats ls = probe::summarize(loadUs);
 
-	log::info("  createCheckpoint   min {:.1f}us  median {:.1f}us  p99 {:.1f}us  max {:.1f}us",
-	          cs.min, cs.median, cs.p99, cs.max);
-	log::info("  loadFromCheckpoint min {:.1f}us  median {:.1f}us  p99 {:.1f}us  max {:.1f}us",
-	          ls.min, ls.median, ls.p99, ls.max);
+	// --- Phase C: memory scaling, measured separately --------------------
+	{
+		std::vector<CheckpointObject*> kept;
+		const int memN = 200;
+		kept.reserve(memN);
+		const size_t memStart = processMemoryBytes();
+		size_t memAt10 = 0, memAt100 = 0;
+		for (int i = 0; i < memN; i++) {
+			if (CheckpointObject* cp = pl->createCheckpoint()) { cp->retain(); kept.push_back(cp); }
+			if (i == 9)  memAt10  = processMemoryBytes();
+			if (i == 99) memAt100 = processMemoryBytes();
+		}
+		const size_t memEnd = processMemoryBytes();
+		const double perState = kept.size() > 1
+			? static_cast<double>(memEnd - memStart) / static_cast<double>(kept.size()) : 0.0;
+		log::info("  memory: start {} KB, at 10 {} KB, at 100 {} KB, at {} {} KB",
+		          memStart / 1024, memAt10 / 1024, memAt100 / 1024, kept.size(), memEnd / 1024);
+		log::info("  marginal per live checkpoint: ~{:.0f} bytes ({:.1f} KB)",
+		          perState, perState / 1024.0);
+		for (auto* c : kept) c->release();
+	}
 
-	const double perState = kept.size() > 1
-		? static_cast<double>(memAtN - memStart) / static_cast<double>(kept.size())
-		: 0.0;
-	log::info("  memory: start {} KB, after 1 {} KB, after 100 {} KB, after {} {} KB",
-	          memStart / 1024, memAt1 / 1024, memAt100 / 1024, kept.size(), memAtN / 1024);
-	log::info("  marginal per live checkpoint: ~{:.0f} bytes ({:.1f} KB)", perState, perState / 1024.0);
-
-	// Gate from the plan: <1ms viable, 1-10ms constrains the search design,
-	// >10ms forces an architecture rethink.
+	// Gate from the plan: <1ms viable, 1-10ms constrains the search, >10ms
+	// forces an architecture rethink.
 	const char* verdict = ls.median < 1000.0  ? "VIABLE (<1ms): savestate search is cheap"
 	                    : ls.median < 10000.0 ? "CONSTRAINED (1-10ms): search must minimise restores"
 	                                          : "PROBLEM (>10ms): architecture rethink";
 	log::info("  restore median {:.3f} ms -> {}", ls.median / 1000.0, verdict);
-
-	for (auto* cp : kept) cp->release();
-	log::info("Probe 5: released {} checkpoints", kept.size());
+	log::info("Probe 5: done");
 }
 
 // ---------------------------------------------------------------------------
@@ -681,9 +1005,11 @@ bool keyPressedEdge(int vk) {
 void pollHotkeys() {
 	auto& st = ProbeState::get();
 
-	if (keyPressedEdge(VK_F1)) startDeterminismSweep(false, false); // config a
-	if (keyPressedEdge(VK_F2)) startDeterminismSweep(true,  false); // config b
-	if (keyPressedEdge(VK_F3)) startDeterminismSweep(true,  true);  // config c
+	// Config (c), forced seeds, is retired: m_randomSeed differs on every reset
+	// and ten runs under ten different seeds were byte-identical, so RNG is
+	// proven irrelevant to physics.
+	if (keyPressedEdge(VK_F1)) startDeterminismSweep(false, false); // vanilla dt
+	if (keyPressedEdge(VK_F3)) startDeterminismSweep(true,  false); // fixed dt
 
 	if (keyPressedEdge(VK_F5)) {
 		st.mode = Mode::RecordInput;
@@ -722,7 +1048,35 @@ void pollHotkeys() {
 		          g_config.physicsFix ? "ENABLED" : "disabled");
 	}
 
+	if (keyPressedEdge(VK_F2)) {
+		auto& sv = Solver::get();
+		if (sv.running) {
+			log::info("Solver: stopped by user at best {:.2f}%", sv.bestPct);
+			solverWriteMacro("partial.txt");
+			sv.clear();
+			st.mode = Mode::Idle;
+		} else if (PlayLayer::get()) {
+			g_config.physicsFix = true; // the solver requires fixed-dt stepping
+
+			// Practice mode is what makes resetLevel respawn to a checkpoint
+			// instead of the level start, which is the only revive path we have.
+			PlayLayer::get()->m_isPracticeMode = true;
+
+			sv.clear();
+			sv.running    = true;
+			sv.startTicks = probe::nowTicks();
+			sv.lastReport = sv.startTicks;
+			st.mode       = Mode::Solve;
+			st.resetPending = true;
+			log::info("Solver: starting DFS. air branch interval {} steps, "
+			          "release-before-hold ordering. F2 again to stop.",
+			          g_config.airBranchInterval);
+		}
+	}
+
 	if (keyPressedEdge(VK_F11)) runProbe5(1000);
+	if (keyPressedEdge(VK_F12)) startRestoreTest(RestoreKind::Full);
+	if (keyPressedEdge(VK_F4))  startRestoreTest(RestoreKind::PlayerOnly);
 
 	if (keyPressedEdge(VK_F7)) {
 		std::string p = probe::outputPath("trace_manual.csv");
@@ -854,6 +1208,274 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		st.trace.push(row);
 	}
 
+	// Advances the Probe 4b state machine one step. Returns false when the
+	// enclosing per-frame step loop should stop early (a restore just moved the
+	// player, so continuing to step this frame would run from the wrong state).
+	bool driveRestoreTest() {
+		auto& st = ProbeState::get();
+		auto* pl = PlayLayer::get();
+		if (!pl || !m_player1) return true;
+
+		const int since = st.stepCounter - st.restoreAnchor;
+
+		if (st.restorePhase == 0) {
+			if (st.stepCounter < st.restoreAnchor) return true;
+
+			// Reached the anchor: capture with BOTH mechanisms so the same run
+			// can be replayed against either.
+			if (CheckpointObject* cp = pl->createCheckpoint()) { cp->retain(); st.fullCp = cp; }
+			if (PlayerCheckpoint* pc = PlayerCheckpoint::create()) {
+				pc->retain();
+				m_player1->saveToCheckpoint(pc);
+				st.playerCp = pc;
+			}
+			st.restorePhase = 1;
+			log::info("Probe 4b: anchored at step {}", st.stepCounter);
+			return true;
+		}
+
+		// Record the segment currently being simulated.
+		probe::Trace& seg = (st.restorePhase == 1) ? st.segmentA : st.segmentB;
+		if (!st.trace.size()) return true;
+		seg.push(st.trace[st.trace.size() - 1]);
+
+		if (since < st.restoreLen) return true;
+
+		if (st.restorePhase == 1) {
+			// Restore and replay the identical input from the anchor.
+			if (st.restoreKind == RestoreKind::Full) {
+				if (st.fullCp) pl->loadFromCheckpoint(st.fullCp);
+			} else {
+				if (st.playerCp) m_player1->loadFromCheckpoint(st.playerCp);
+			}
+			st.stepCounter  = st.restoreAnchor;
+			st.restorePhase = 2;
+			log::info("Probe 4b: restored, replaying the same {} steps", st.restoreLen);
+			return false;
+		}
+
+		finishRestoreTest();
+		return false;
+	}
+
+	// Push a decision at the current state and take the first branch.
+	void solverPushDecision() {
+		auto& sv = Solver::get();
+		auto* pl = PlayLayer::get();
+
+		Decision d;
+		d.step = sv.step;
+		if (CheckpointObject* cp = pl->createCheckpoint()) { cp->retain(); d.cp = cp; }
+
+		// Try release first: no-press is the likelier correct branch.
+		d.choice = false;
+		d.tried  = 1u << 0;
+
+		sv.stack.push_back(d);
+		sv.hold       = d.choice;
+		sv.lastBranch = sv.step;
+	}
+
+	// Unwind to the most recent decision with an untried branch and take it.
+	// Returns false when the tree is exhausted.
+	bool solverBacktrack() {
+		auto& sv = Solver::get();
+		auto* pl = PlayLayer::get();
+
+		// Escape the thrash: if best% has not improved in a long time, the
+		// culprit is far behind the death and exhausting this subtree is futile.
+		// Abandon a chunk of the stack so the search resumes much earlier.
+		if (g_config.stallLimit > 0 &&
+		    sv.deaths - sv.deathsAtBest > static_cast<uint64_t>(g_config.stallLimit)) {
+			const size_t drop = std::min(static_cast<size_t>(g_config.escapeJump),
+			                             sv.stack.size() > 1 ? sv.stack.size() - 1 : 0);
+			for (size_t i = 0; i < drop; i++) {
+				if (sv.stack.back().cp) sv.stack.back().cp->release();
+				sv.stack.pop_back();
+			}
+			sv.escapes++;
+			sv.deathsAtBest = sv.deaths;
+			log::info("Solver: stalled {} deaths at {:.2f}% - abandoned {} decisions, "
+			          "depth now {} (escape #{})",
+			          g_config.stallLimit, sv.bestPct, drop, sv.stack.size(), sv.escapes);
+		}
+
+		while (!sv.stack.empty()) {
+			Decision& d = sv.stack.back();
+
+			if (d.tried != 0b11) {
+				d.choice = !d.choice;
+				d.tried |= d.choice ? (1u << 1) : (1u << 0);
+
+				const float xBefore = m_player1 ? m_player1->getPositionX() : -1.f;
+				if (d.cp) {
+					// loadFromCheckpoint restores position but does NOT revive a
+					// dead player. Practice mode's own respawn does both, so put
+					// our target checkpoint at the end of the array GD reads and
+					// let resetLevel drive it.
+					if (auto* arr = pl->m_checkpointArray) {
+						arr->removeAllObjects();
+						arr->addObject(d.cp);
+					}
+					auto& ps = ProbeState::get();
+					ps.solverRestoring = true;
+					pl->resetLevel();
+					ps.solverRestoring = false;
+					sv.restores++;
+				}
+				const float xAfter = m_player1 ? m_player1->getPositionX() : -1.f;
+
+				// Decisive check that a restore actually moves the player back.
+				// Every death previously cost a full run's worth of steps, which
+				// is what you see when the restore is being overridden.
+				if (sv.restores <= 5) {
+					log::info("Solver: restore #{} to step {} - player X {:.1f} -> {:.1f} "
+					          "(dead before: {}, after: {})",
+					          sv.restores, d.step, xBefore, xAfter,
+					          sv.diedAtX, m_player1 && m_player1->m_isDead ? "yes" : "no");
+				}
+				sv.step = d.step;
+				sv.macro.resize(static_cast<size_t>(d.step), 0);
+				sv.hold       = d.choice;
+				sv.lastBranch = d.step;
+				return true;
+			}
+
+			if (d.cp) d.cp->release();
+			sv.stack.pop_back();
+		}
+		return false;
+	}
+
+	void solverReport(bool force) {
+		auto& sv = Solver::get();
+		const uint64_t now = probe::nowTicks();
+		// Sampled on wall clock, never per tick.
+		if (!force && probe::ticksToMicros(now - sv.lastReport) < 2'000'000.0) return;
+		sv.lastReport = now;
+
+		const double secs = probe::ticksToMicros(now - sv.startTicks) / 1e6;
+		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
+		          "steps {}  ({:.0f} steps/s, {:.0f} restores/s)",
+		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
+		          secs > 0 ? sv.steps / secs : 0.0,
+		          secs > 0 ? sv.restores / secs : 0.0);
+	}
+
+	// One solver step. Returns false to stop the enclosing per-frame loop
+	// (a restore moved the player, so stepping again this frame is invalid).
+	bool solverStep() {
+		auto& sv = Solver::get();
+		auto* pl = PlayLayer::get();
+		if (!pl || !m_player1) return false;
+
+		// A restore is supposed to revive the player. If GD instead requires
+		// its respawn sequence, the search would stall here forever - so say so
+		// loudly once rather than spinning silently.
+		if (m_player1->m_isDead) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				log::error("Solver: player still dead after a restore. "
+				           "loadFromCheckpoint does not revive on its own; the search "
+				           "cannot continue without a respawn path. Stopping.");
+			}
+			solverReport(true);
+			solverWriteMacro("partial.txt");
+			sv.clear();
+			ProbeState::get().mode = Mode::Idle;
+			return false;
+		}
+
+		// Apply the current hold and advance exactly one physics step.
+		applyInput(sv.hold);
+		if (sv.macro.size() <= static_cast<size_t>(sv.step)) sv.macro.resize(sv.step + 1, 0);
+		sv.macro[sv.step] = sv.hold ? 1 : 0;
+
+		GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+		sv.step++;
+		sv.steps++;
+
+		const float pct = pl->getCurrentPercent();
+		if (pct > sv.bestPct) {
+			sv.bestPct      = pct;
+			sv.deathsAtBest = sv.deaths; // progress: reset the stall counter
+		}
+		solverReport(false);
+
+		if (ProbeState::get().finished) {
+			solverReport(true);
+			log::info("================ SOLVED ================");
+			log::info("  {} steps, {} deaths, {} restores, depth {}",
+			          sv.step, sv.deaths, sv.restores, sv.stack.size());
+			solverWriteMacro("solution.txt");
+			log::info("  Verify by replaying from frame 0 - a solution found via "
+			          "savestates only counts if it reproduces in a clean run.");
+			log::info("========================================");
+			sv.clear();
+			ProbeState::get().mode = Mode::Idle;
+			return false;
+		}
+
+		if (m_player1->m_isDead) {
+			sv.deaths++;
+			sv.diedAtX = m_player1->getPositionX();
+			if (!solverBacktrack()) {
+				solverReport(true);
+				log::error("Solver: search space EXHAUSTED at best {:.2f}%. No solution "
+				           "under this branching policy - loosen airBranchInterval.",
+				           sv.bestPct);
+				sv.clear();
+				ProbeState::get().mode = Mode::Idle;
+			}
+			return false;
+		}
+
+		auto* p = m_player1;
+		const bool airMode = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
+
+		if (airMode) {
+			// Hold state controls the trajectory continuously, so the action
+			// genuinely is per-segment and persists across the interval.
+			if (sv.step - sv.lastBranch >= g_config.airBranchInterval) solverPushDecision();
+		} else if (sv.hold) {
+			// Committed to a jump. Do NOT branch again while still grounded:
+			// re-branching every step overwrote the hold after one step, so no
+			// press ever lasted long enough to become a jump. Release once the
+			// jump has actually launched.
+			if (!p->m_isOnGround) {
+				sv.hold = false;
+				sv.lastBranch = sv.step;
+			}
+		} else {
+			const bool onGround = p->m_isOnGround;
+			const bool onRing   = p->m_touchingRings && p->m_touchingRings->count() > 0;
+
+			// Always branch on a landing or an orb - those are the frames where
+			// timing actually matters. Between them, branch on an interval
+			// rather than every frame.
+			const bool landed      = onGround && !sv.prevOnGround;
+			const bool intervalDue = onGround &&
+				(sv.step - sv.lastBranch >= g_config.groundBranchInterval);
+
+			if (landed || onRing || intervalDue) solverPushDecision();
+			sv.prevOnGround = onGround;
+		}
+
+		if (sv.stack.size() > static_cast<size_t>(g_config.maxStackDepth)) {
+			log::error("Solver: stack depth {} exceeded cap {} (~{} MB of checkpoints). "
+			           "Stopping - the branching policy is too fine-grained.",
+			           sv.stack.size(), g_config.maxStackDepth,
+			           (sv.stack.size() * 22) / 1024);
+			solverReport(true);
+			solverWriteMacro("partial.txt");
+			sv.clear();
+			ProbeState::get().mode = Mode::Idle;
+			return false;
+		}
+		return true;
+	}
+
 	void update(float dt) {
 		pollHotkeys();
 
@@ -880,12 +1502,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		if (st.resetPending && pl) {
 			st.resetPending = false;
+			st.solverWantsReset = true;
 			st.resetPerAttempt();
 			pl->resetLevelFromStart();
+			st.solverWantsReset = false;
 			return;
 		}
 
-		const bool active = pl && m_player1 && !m_player1->m_isDead && !st.finished;
+		// The solver deliberately runs while the player is dead - that is
+		// exactly when it needs to backtrack and respawn. Gating it behind
+		// !m_isDead froze the search on the first death.
+		const bool solving = st.mode == Mode::Solve && Solver::get().running;
+		const bool active  = pl && m_player1 && (solving || (!m_player1->m_isDead && !st.finished));
 
 		if (st.mode == Mode::Idle || !active) {
 			GJBaseGameLayer::update(dt);
@@ -906,6 +1534,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// Logged once per attempt, never per step.
 			log::debug("attempt start: m_currentStep = {}", m_currentStep);
 		}
+		// The solver runs its own loop: as many steps per rendered frame as the
+		// budget allows, rather than real-time pace.
+		if (st.mode == Mode::Solve) {
+			auto& sv = Solver::get();
+			const uint64_t frameStart = probe::nowTicks();
+			while (sv.running) {
+				if (!solverStep()) break;
+				if (probe::ticksToMicros(probe::nowTicks() - frameStart) > kSolverFrameBudgetUs) break;
+			}
+			return;
+		}
+
 		// With the fix on, one update(1/240) call is exactly one physics step,
 		// so several run per rendered frame to hold real-time pace. Without it,
 		// one call advances however many sub-steps the engine decides and the
@@ -954,6 +1594,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			}
 			st.stepCounter++;
 
+			if (st.mode == Mode::RestoreTest && !driveRestoreTest()) break;
+
 			// Stop mid-frame rather than stepping a dead or finished player.
 			if ((m_player1 && m_player1->m_isDead) || st.finished || !st.trace.valid()) break;
 		}
@@ -996,9 +1638,31 @@ class $modify(SolverPlayLayer, PlayLayer) {
 		return true;
 	}
 
+	// GD schedules this after a death, and in normal mode it resets the level
+	// to the START - overriding whatever we restored. That is why every death
+	// cost a full run's worth of steps. While the solver is driving restores
+	// itself, GD's automatic reset must not fire.
+	void delayedResetLevel() {
+		if (Solver::get().running) return;
+		PlayLayer::delayedResetLevel();
+	}
+
 	void resetLevel() {
+		auto& st = ProbeState::get();
+
+		// The only resets during a search are ones the solver asked for: either
+		// starting a fresh attempt, or respawning to a chosen checkpoint.
+		if (Solver::get().running && !st.solverWantsReset && !st.solverRestoring) return;
+
+		const bool restoring = st.solverRestoring;
+		st.solverWantsReset = false;
+
 		PlayLayer::resetLevel();
-		ProbeState::get().resetPerAttempt();
+
+		// A restore-respawn must not clear the solver's step counter or trace.
+		if (restoring) return;
+
+		st.resetPerAttempt();
 
 		// Log the seeds BEFORE overwriting them. Configs (b) and (c) produced
 		// byte-identical traces, which either means RNG does not affect physics
@@ -1020,13 +1684,23 @@ class $modify(SolverPlayLayer, PlayLayer) {
 	void playEndAnimationToPos(cocos2d::CCPoint position) {
 		PlayLayer::playEndAnimationToPos(position);
 		auto& st = ProbeState::get();
-		st.endAnimStep = m_currentStep;
+		st.endAnimStep = st.stepCounter;
 		st.finished    = true;
+		// Phase 0 item 7. The solver's only success path runs through this, so
+		// confirm which signal fires and when rather than assuming.
+		log::info("COMPLETION: playEndAnimationToPos fired at solver step {} ({:.2f}%)",
+		          Solver::get().running ? Solver::get().step : st.stepCounter,
+		          getCurrentPercent());
 	}
 
 	void levelComplete() {
 		PlayLayer::levelComplete();
-		ProbeState::get().levelCompleteStep = m_currentStep;
+		auto& st = ProbeState::get();
+		st.levelCompleteStep = st.stepCounter;
+		log::info("COMPLETION: levelComplete fired at solver step {} (endAnim had "
+		          "{}fired first)",
+		          Solver::get().running ? Solver::get().step : st.stepCounter,
+		          st.endAnimStep >= 0 ? "" : "NOT ");
 	}
 };
 
