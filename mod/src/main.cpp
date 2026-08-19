@@ -51,6 +51,11 @@ constexpr int    kJumpButton      = 1;     // PlayerButton::Jump
 // Config (c) of Probe 1: an arbitrary fixed value, only its constancy matters.
 constexpr uint64_t kForcedSeed = 0x5EEDC0FFEEULL;
 
+// How long verification keeps stepping past the end of a macro, waiting for the
+// level to register completion. Half a second is ample; the observed lag was one
+// step.
+constexpr int kVerifyGraceSteps = 120;
+
 // Wall-clock the solver may spend per rendered frame before yielding. Keeps the
 // window pumping messages so the process never goes Not Responding, at the cost
 // of capping throughput at (budget / step cost) x refresh.
@@ -150,6 +155,18 @@ struct Config {
 	// never advance within it: the ship is ~330 steps, so a 480-step window
 	// would still span the whole thing and freeze nothing.
 	int commitLookbackSteps = 240;
+
+	// Adaptive widening. 240 steps is one second of gameplay, chosen because
+	// Stereo Madness's ship is only ~330 steps. On a longer section that window
+	// is proportionally far too tight: Time Machine stalled at 93.77% with
+	// commit pinned and only ~60 decisions mutable, so any correction that had
+	// to begin more than a second before the death was physically unreachable.
+	//
+	// Commitment must therefore be REVOCABLE (plan section 2.6 option 3): after
+	// this many escapes with no improvement, double the window and let the
+	// search reach further back, up to the cap.
+	int escapesBeforeWidening = 6;
+	int maxCommitLookbackSteps = 7680; // 32 s
 
 	// Give up on a branch that survives this long without a decision point or
 	// death, to avoid an unbounded descent.
@@ -973,6 +990,8 @@ struct Solver {
 	bool                  prevAirMode  = false;
 	int                   togglesUsed  = 0;
 	size_t                commitDepth  = 0; // cached for logging; see solverCommitFloor()
+	int                   lookbackSteps = 0;   // current (possibly widened) window
+	int                   escapesAtWiden = 0;  // escape count when it last widened
 	int                   bestStep     = 0; // solver step at which bestPct was reached
 	uint64_t              deathsAtBest = 0;
 	uint64_t              escapes      = 0;
@@ -1037,6 +1056,8 @@ struct Solver {
 		prevOnGround = false;
 		commitDepth = 0;
 		bestStep = 0;
+		lookbackSteps = 0;
+		escapesAtWiden = 0;
 		bestPct = 0.f;
 		deaths = restores = steps = 0;
 	}
@@ -2685,8 +2706,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// ship decisions mutable forever, so the toggle budget was spent
 		// re-deriving the solved part of the ship instead of extending it.
 		(void)anchored;
-		if (sv.bestStep > g_config.commitLookbackSteps) {
-			const int cutoff = sv.bestStep - g_config.commitLookbackSteps;
+		if (sv.lookbackSteps <= 0) sv.lookbackSteps = g_config.commitLookbackSteps;
+		if (sv.bestStep > sv.lookbackSteps) {
+			const int cutoff = sv.bestStep - sv.lookbackSteps;
 			size_t windowIdx = 0;
 			while (windowIdx < sv.stack.size() && sv.stack[windowIdx].step < cutoff) windowIdx++;
 			floorIdx = std::max(floorIdx, windowIdx);
@@ -2906,6 +2928,24 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			sv.escapes++;
 			sv.deathsAtBest = sv.deaths;
 
+			// Escapes that keep bouncing off the commit floor mean the search is
+			// boxed in: it has nowhere left to explore inside the window. Widen
+			// it so previously-frozen decisions become mutable again. Those have
+			// untried branches, so this genuinely enlarges the search space -
+			// deterministic DFS then explores paths it could not reach before,
+			// rather than re-deriving the same ones.
+			if (sv.escapes - sv.escapesAtWiden >= static_cast<uint64_t>(g_config.escapesBeforeWidening)
+			    && sv.lookbackSteps < g_config.maxCommitLookbackSteps) {
+				const int before = sv.lookbackSteps;
+				sv.lookbackSteps = std::min(sv.lookbackSteps * 2,
+				                            g_config.maxCommitLookbackSteps);
+				sv.escapesAtWiden = sv.escapes;
+				log::info("Solver: {} escapes with no progress at {:.2f}% - widening the "
+				          "mutable window {} -> {} steps ({:.1f}s -> {:.1f}s of reach)",
+				          g_config.escapesBeforeWidening, sv.bestPct, before,
+				          sv.lookbackSteps, before / 240.0, sv.lookbackSteps / 240.0);
+			}
+
 			// Phase A2: the rewind distance in steps AND seconds. Arithmetic says
 			// 200 air decisions should be ~800 steps (3.3 s); observation said
 			// 0.1-0.2 s (~24-48 steps). Those cannot both be true, so measure it
@@ -2988,9 +3028,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// GAME seconds plays back in a fraction of a wall-clock second. Game time
 		// and wall-clock time are not interchangeable here.
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
-		          "steps {}  budget {}  commit {}  resync {}/{}  anchorReplays {}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
+		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  anchorReplays {}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
-		          g_config.toggleBudget, sv.commitDepth, sv.resyncs, sv.resyncFailures,
+		          g_config.toggleBudget, sv.commitDepth, sv.lookbackSteps, sv.resyncs, sv.resyncFailures,
 		          sv.anchorReplays, stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
 	}
@@ -3183,6 +3223,16 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// Record where the frontier reached. The commit floor is derived
 			// from this against the CURRENT stack, never stored as an index.
 			if (sv.step > sv.bestStep) sv.bestStep = sv.step;
+
+			// Progress: the window was wide enough, so return to the cheap
+			// default. A permanently wide window would keep the whole tail of the
+			// level mutable and undo the point of committing at all.
+			if (sv.lookbackSteps > g_config.commitLookbackSteps) {
+				log::info("Solver: progress at {:.2f}% - narrowing window back to {} steps",
+				          sv.bestPct, g_config.commitLookbackSteps);
+				sv.lookbackSteps  = g_config.commitLookbackSteps;
+				sv.escapesAtWiden = sv.escapes;
+			}
 
 			// Far enough past the last validation: re-derive the prefix cleanly.
 			if (g_config.resyncEnabled &&
@@ -3391,9 +3441,30 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		}
 		if (st.mode == Mode::Verify) {
 			const size_t idx = static_cast<size_t>(st.stepCounter);
+
+			// Past the end of the macro: keep stepping with no input for a short
+			// grace period before judging.
+			//
+			// Completion does not always register on the same step it did during
+			// the solve - Time Machine's end animation fired one step later on
+			// replay, so the macro ran out first and a genuine clear was reported
+			// as a death at the final step.
 			if (idx >= st.scripted.size()) {
-				finishVerify(st.finished, static_cast<int>(idx),
-				             pl->getCurrentPercent());
+				const size_t over = idx - st.scripted.size();
+				if (st.finished) {
+					finishVerify(true, static_cast<int>(idx), pl->getCurrentPercent());
+					return;
+				}
+				if (m_player1 && m_player1->m_isDead) {
+					finishVerify(false, static_cast<int>(idx), pl->getCurrentPercent());
+					return;
+				}
+				if (over >= static_cast<size_t>(kVerifyGraceSteps)) {
+					finishVerify(false, static_cast<int>(idx), pl->getCurrentPercent());
+					return;
+				}
+				GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+				st.stepCounter++;
 				return;
 			}
 			const int steps = g_config.physicsFix ? g_config.stepsPerFrame : 1;
