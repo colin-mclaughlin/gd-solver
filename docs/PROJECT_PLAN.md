@@ -641,6 +641,80 @@ The old `colin.rldash` mod was installed during the first sweeps. Geode chains `
 ### 13.6 Still open
 Replay fidelity against the recorded human run is close but not exact (diverged at step 1166/1823, same death point and final percent). Suspected off-by-one in recording phase, since fixed. Items 4, 5 and 7 (savestate cost, drift, completion detection) not yet started.
 
+### 13.7 PHASE 1 COMPLETE — Stereo Madness solved and verified (2026-08-19)
+
+```
+SOLVED       20330 steps, 382 deaths, 0 restores, depth 520
+VERIFICATION PASSED - clears the level from frame 0 in normal mode,
+             practice off, no savestates. Not a savestate artifact.
+```
+
+The macro is in `solution.txt`. Every input in it was chosen by search.
+
+**What made the ship section solvable** (it stalled at 35.23% for many runs):
+- **Toggle-count iterative deepening** for air modes. Actions are "continue vs
+  toggle", not "release vs hold", and the number of toggles is bounded and
+  raised on exhaustion. Good ship paths are simple: "hold from entry" is one
+  toggle. Plain DFS on raw hold/release reaches those last, after astronomically
+  many high-toggle sequences.
+- **Sliding commit floor.** Freeze decisions more than ~240 steps behind the
+  frontier, anchored at mode transitions, and count toggles RELATIVE to the
+  floor so a solved prefix hands its budget back. Without this the search spent
+  millions of steps re-deriving an already-solved cube section.
+
+### 13.8 GD's practice checkpoints are approximate BY DESIGN — do not fight this
+
+The single most expensive finding of the project. Restores are **not** bit-exact,
+and cannot be made so:
+
+> For ship, UFO and wave, GD generates practice checkpoints **a set distance
+> behind the icon** rather than at it, because those modes carry momentum. In
+> cube they are placed on contact with a safe surface. The community-documented
+> consequence is that practice mode is not 1:1 with real gameplay — which is why
+> every serious bot ships a "practice fix".
+
+Evidence accumulated before finding this, all consistent with it:
+- Probe 4b: restores bit-identical in cube (step 480), never in ship.
+- Restoring **557 named scalar fields** of `PlayerObject` + `PlayLayer` +
+  `GJGameState` changed **nothing** — the solve stayed byte-identical
+  (20330 steps / 1466 deaths) and verification still failed at the same step.
+  The visible state *was* identical; the approximation is not in fields we can
+  read.
+- A 20,425-step solve found via savestates died at 91.71% on clean replay.
+
+**Do not spend more time extending savestate field lists.** Two real defects were
+found and fixed on the way, and both are worth keeping:
+- **Restore lands exactly one physics step BEFORE the captured state.** Re-step
+  once after restoring to realign. This alone moved verification 5.93% -> 91.71%.
+- **`m_gameModeChangedTime` is not restored** by `createCheckpoint`.
+
+### 13.9 The architecture that actually works
+
+**Savestate-free search.** On backtrack, replay from frame 0 to the decision
+instead of restoring. Measured **42,000 steps/sec (175x real time)** — *faster*
+per step than the savestate path, because no checkpoints are created or held.
+Cost is O(prefix) per branch instead of O(1), so it suits short segments.
+
+**Iterative repair.** Verification reports the exact step where a
+savestate-derived macro stops being real. Lock everything before it as a verified
+prefix, replay that prefix once, then search forward savestate-free. Each round
+converts a failure into locked-in progress. This is what closed Stereo Madness:
+savestates for the first 89%, savestate-free for the last ~2000 steps.
+
+**Implication for demons:** every demon is ship- and wave-heavy, i.e. mostly the
+mode where checkpoints are approximate. The savestate/replay split is not a
+Stereo Madness workaround, it is the general design — savestates in cube-like
+modes, replay in air modes.
+
+### 13.10 Method note
+
+Three of the four real bugs were found by **mechanical byte-level comparison** of
+object memory across a restore, not by reasoning about which field ought to
+matter. Every reasoned guess (an offset, the held button, `m_extraDelta`) was
+wrong. Probe 4a was Phase 0 item 5, was deferred as speculative, and turned out
+to be the tool that resolved this. When a fix produces byte-identical output,
+that is the signal to change technique, not to apply more of the same.
+
 ---
 
 ## 11. Reference material

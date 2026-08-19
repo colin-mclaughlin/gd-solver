@@ -27,11 +27,15 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include <cstring>
+#include <cctype>
+#include <memory>
 
 #include "Probe.hpp"
 #include "Socket.hpp"
 
 using namespace geode::prelude;
+
 
 namespace {
 
@@ -156,6 +160,39 @@ struct Config {
 	// 43 ms -> 165 ms at 1000 live states), so an unbounded stack strangles
 	// throughput long before it exhausts memory.
 	int maxStackDepth = 4000;
+
+	// Probe 4b experiment switch: force all captured scalar state after restore.
+	// Off: the targeted field list above should now be sufficient. Turning this
+	// back on is the fallback if a restore goes unsound again.
+
+	// Periodic resync: how far the frontier may advance before the committed
+	// prefix is re-validated by a clean replay from frame 0.
+	//
+	// Restores are not bit-exact in ship sections and six rounds of byte-level
+	// comparison have not found the missing state. Rather than require a perfect
+	// substrate, the search periodically re-derives its own prefix with no
+	// savestates at all: that both PROVES the prefix works in normal play and
+	// leaves the player in a provably clean state to continue from, so restore
+	// error cannot accumulate beyond one interval.
+	int resyncIntervalSteps = 2400; // 10 s of gameplay
+
+	// OFF by default. Resync was added as a correctness net, but it regressed the
+	// solver from a full-level solve in 24 s to stalling at 45%, and its own
+	// bookkeeping is buggy (counter resets, lastGoodStep reads 0 after being
+	// set). Debugging the safety net instead of the thing it protects is the
+	// wrong order. F8 toggles it back on.
+	bool resyncEnabled = false;
+
+	// Search WITHOUT savestates: on backtrack, replay from frame 0 to the
+	// decision instead of restoring a checkpoint.
+	//
+	// GD's practice checkpoints are documented as not 1:1 with real gameplay,
+	// and specifically approximate in ship/UFO/wave because of momentum - they
+	// are generated a set distance BEHIND the icon rather than at it. That is an
+	// engine design choice, not a bug we can patch, which is why restoring 557
+	// scalar fields changed nothing. Where fidelity matters more than speed,
+	// replay is the only exact option.
+	bool noSavestates = false;
 };
 
 Config g_config;
@@ -170,6 +207,7 @@ enum class Mode {
 	Determinism,  // Probe 1: replay fixed input N times, compare trace hashes
 	RestoreTest,  // Probe 4b: does a restore reproduce the future, bit-for-bit?
 	Solve,        // DFS search for an input sequence that clears the level
+	Verify,       // replay a found macro from frame 0, no savestates, no practice
 };
 
 // Which save/restore mechanism the restore test exercises.
@@ -262,6 +300,28 @@ struct ProbeState {
 	// suppression in resetLevel lets that one through.
 	bool solverWantsReset = false;
 
+	// Step at which the last verification failed, so restore-fidelity testing
+	// can target the region that actually breaks instead of the level opening.
+	int lastVerifyFailStep = -1;
+
+	// Step at which a resync replay died. This is drift caught in normal play,
+	// and a far better anchor for restore-fidelity testing than a guess.
+	int lastResyncFailStep = -1;
+
+	// Iterative repair: the portion of a macro that has been PROVEN to replay
+	// from frame 0. Verification reports the exact step where a savestate-derived
+	// path stops being real, so everything before it (less a margin) is known
+	// good. The next solve starts by replaying this, then searches forward from a
+	// provably clean state - turning each failed verification into locked-in
+	// progress without needing to explain the drift.
+	std::vector<uint8_t> verifiedPrefix;
+
+	// Sanitised level name, used to namespace every output file. Without this a
+	// solve on one level silently overwrites another's macro, and a stale
+	// verified prefix from a previous level would be replayed against the wrong
+	// geometry.
+	std::string levelKey = "unknown";
+
 	// True while the solver is deliberately using resetLevel as a respawn to a
 	// chosen checkpoint. The reset must run for real, but must NOT wipe the
 	// solver's per-attempt bookkeeping.
@@ -276,6 +336,23 @@ struct ProbeState {
 	int          restoreLen    = 600; // steps to simulate per segment
 	probe::Trace segmentA;
 	probe::Trace segmentB;
+	probe::TraceRow anchorRow{};   // state captured at the anchor
+	bool           haveAnchorRow = false;
+	// Probe 4a: raw PlayerObject bytes at capture, for a field-level diff after
+	// restore. The boundary state compares EXACT on position/velocity yet the
+	// next step diverges, so whatever differs is a field not being compared.
+	std::vector<uint8_t> anchorBytes;
+	double anchorGameModeChangedTime = 0.0;
+	bool   anchorUnkA29 = false;
+	// PlayerObject now compares clean at the boundary except cosmetics and
+	// SeedValueRSV noise, yet the next step still diverges - so the missing
+	// state is on the LAYER, not the player.
+	std::vector<uint8_t> anchorLayerBytes;
+	double aExtraDelta = 0.0, aTimePlayed = 0.0, aTimestamp = 0.0;
+	int    aTickIndex = 0, aClickIndex = 0, aResumeTimer = 0;
+	bool   aJumping = false;
+	double aAttemptTime = 0.0, aBestAttemptTime = 0.0, aCurrentTime = 0.0;
+	bool   aHasJumped = false;
 	CheckpointObject* fullCp   = nullptr;
 	PlayerCheckpoint* playerCp = nullptr;
 
@@ -335,6 +412,12 @@ struct ProbeState {
 		nativeDt           = 0.0;
 		recordedPhysicsFix = false;
 		haveRecordingMeta  = false;
+
+		// Per-level, not per-attempt: these describe a specific level's macro and
+		// are meaningless (worse, actively wrong) once a different level loads.
+		verifiedPrefix.clear();
+		lastVerifyFailStep  = -1;
+		lastResyncFailStep  = -1;
 	}
 
 	static ProbeState& get() {
@@ -350,8 +433,13 @@ struct ProbeState {
 // Deliberately plain text: one '0'/'1' per physics step, 80 per line, so a
 // recording can be eyeballed and hand-edited.
 
+// All solver/probe output is namespaced by level.
+std::string levelFilePath(std::string const& suffix) {
+	return probe::outputPath(ProbeState::get().levelKey + "_" + suffix);
+}
+
 std::string inputFilePath() {
-	return probe::outputPath("input.txt");
+	return levelFilePath("input.txt");
 }
 
 bool saveInput(std::vector<uint8_t> const& input) {
@@ -373,8 +461,9 @@ bool saveInput(std::vector<uint8_t> const& input) {
 	return true;
 }
 
-bool loadInput(std::vector<uint8_t>& out, bool* physicsFixOut = nullptr) {
-	std::FILE* f = std::fopen(inputFilePath().c_str(), "rb");
+bool loadMacroFile(std::string const& path, std::vector<uint8_t>& out,
+                   bool* physicsFixOut = nullptr) {
+	std::FILE* f = std::fopen(path.c_str(), "rb");
 	if (!f) return false;
 
 	out.clear();
@@ -396,6 +485,10 @@ bool loadInput(std::vector<uint8_t>& out, bool* physicsFixOut = nullptr) {
 		*physicsFixOut = (at != std::string::npos && comment[at + 12] == '1');
 	}
 	return true;
+}
+
+bool loadInput(std::vector<uint8_t>& out, bool* physicsFixOut = nullptr) {
+	return loadMacroFile(inputFilePath(), out, physicsFixOut);
 }
 
 // A deterministic fallback pattern, used when nothing has been recorded yet.
@@ -680,6 +773,73 @@ void onAttemptEnded() {
 }
 
 // ---------------------------------------------------------------------------
+// Verification: does the macro reproduce in a clean run?
+// ---------------------------------------------------------------------------
+//
+// A solution found via savestates is an artifact until it replays from frame 0
+// with no restores and no practice mode. This is the check that makes an
+// unsound restore impossible to mistake for a success.
+
+void startVerify(bool practiceMode) {
+	auto& st = ProbeState::get();
+	auto* pl = PlayLayer::get();
+	if (!pl) { log::warn("Verify: not in a level"); return; }
+
+	std::string path = levelFilePath("solution.txt");
+	bool fileFix = false;
+	if (!loadMacroFile(path, st.scripted, &fileFix) || st.scripted.empty()) {
+		log::error("Verify: no macro at {}", path);
+		return;
+	}
+
+	g_config.physicsFix = fileFix;          // replay as it was recorded
+	pl->m_isPracticeMode = practiceMode;
+
+	// Isolating one variable: the search ran in practice mode, the first
+	// verification in normal mode, and it failed deterministically at step 1222.
+	// If the macro passes WITH practice mode on and fails without it, practice
+	// mode alters physics and the search must account for it. If it fails in
+	// both, practice mode is innocent and restore soundness is the suspect.
+	st.mode = Mode::Verify;
+	st.resetPending = true;
+	log::info("Verify: replaying {} steps from frame 0, practice mode {}, "
+	          "no savestates, no restores. physics_fix={}",
+	          st.scripted.size(), practiceMode ? "ON" : "OFF", fileFix ? 1 : 0);
+}
+
+void finishVerify(bool completed, int atStep, float pct) {
+	auto& st = ProbeState::get();
+	auto* plv = PlayLayer::get();
+	log::info("================ VERIFICATION (practice {}) ================",
+	          plv && plv->m_isPracticeMode ? "ON" : "OFF");
+	if (completed) {
+		log::info("  PASSED - the macro clears the level from frame 0 in normal mode.");
+		log::info("  {} steps, reached {:.2f}%", atStep, pct);
+		log::info("  This is an independently reproducible solution, not a savestate artifact.");
+	} else {
+		st.lastVerifyFailStep = atStep;
+
+		// Lock in everything up to a margin before the failure.
+		const int margin = 600; // 2.5 s
+		const int keep   = std::max(0, atStep - margin);
+		if (keep > static_cast<int>(st.verifiedPrefix.size())) {
+			st.verifiedPrefix.assign(st.scripted.begin(), st.scripted.begin() + keep);
+			log::info("  Locked a verified prefix of {} steps. F2 will replay it and "
+			          "search forward from there.", keep);
+		}
+
+		log::error("  FAILED - died at step {} of {} ({:.2f}%).",
+		           atStep, st.scripted.size(), pct);
+		log::error("  Probe 4b (F12) will now anchor near this step to test whether "
+		           "restores are still sound this late in the level.");
+		log::error("  The macro does not reproduce. Either a restore was unsound, or "
+		           "practice mode differs from normal play, or injection timing differs.");
+	}
+	log::info("==============================================");
+	st.mode = Mode::Idle;
+}
+
+// ---------------------------------------------------------------------------
 // The solver
 // ---------------------------------------------------------------------------
 //
@@ -737,6 +897,29 @@ struct Decision {
 	bool enteringHold  = false; // hold state on arrival, so a toggle is well-defined
 	int  togglesBefore = 0;     // air toggles used on the path up to this decision
 	bool modeTransition = false; // pushed because the game mode changed here
+
+	// State the vanilla checkpoint does NOT restore, found by byte-diffing
+	// PlayerObject across a restore (Probe 4a). Everything else that differed
+	// was cocos render bookkeeping, particle/streak flags, or SeedValueRSV
+	// anti-cheat obfuscation whose raw bytes change without the value changing.
+	double gameModeChangedTime = 0.0;
+	bool   unkA29 = false;
+
+	// Layer state the checkpoint also drops (Probe 4a on GJBaseGameLayer).
+	// m_extraDelta is the accumulator getModifiedDelta mutates; the rest are
+	// time/tick bookkeeping that time-based physics can read.
+	double layerExtraDelta = 0.0;
+	double layerTimePlayed = 0.0;
+	double layerTimestamp  = 0.0;
+	int    layerTickIndex  = 0;
+	int    layerClickIndex = 0;
+	int    layerResumeTimer = 0;
+	bool   layerJumping    = false;
+
+	// PlayLayer's OWN region, above sizeof(GJBaseGameLayer) = 14240, which every
+	// earlier byte comparison was blind to. Restoring the full forced set here
+	// made a transition-window restore bit-identical, and these are the
+	// time-carrying fields in that region.
 };
 
 struct Solver {
@@ -760,8 +943,40 @@ struct Solver {
 	int                   bestStep     = 0; // solver step at which bestPct was reached
 	uint64_t              deathsAtBest = 0;
 	uint64_t              escapes      = 0;
+	struct PendingExtra {
+		double gameModeChangedTime = 0.0;
+		bool   unkA29 = false;
+		double extraDelta = 0.0, timePlayed = 0.0, timestamp = 0.0;
+		int    tickIndex = 0, clickIndex = 0, resumeTimer = 0;
+		bool   jumping = false;
+		double attemptTime = 0.0, bestAttemptTime = 0.0, currentTime = 0.0;
+		bool   hasJumped = false;
+		bool   valid = false;
+	};
+	PendingExtra          pendingExtra{};
+
+	bool                  resyncing      = false;
+	bool                  resyncForBacktrack = false;
+	bool                  resumeHold     = false;
+	int                   resumeToggles  = 0;
+	int                   resumeBranch   = 0;
+	uint64_t              replayBacktracks = 0;
+	int                   resyncTarget   = 0;
+	int                   lastResyncStep = 0;
+	uint64_t              resyncs        = 0;
+	uint64_t              resyncFailures = 0;
+	std::vector<uint8_t>  resyncMacro;      // prefix being validated
+	std::vector<uint8_t>  lastGoodMacro;    // last prefix that replayed clean
+	int                   lastGoodStep   = 0;
 
 	void clear() {
+		// Drop our checkpoint out of GD's array first. We swap our own object
+		// into m_checkpointArray to drive the practice respawn; releasing ours
+		// while the game still references it leaves a dangling pointer, which
+		// is a plausible cause of the crashes on returning to the level screen.
+		if (auto* pl = PlayLayer::get()) {
+			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+		}
 		for (auto& d : stack) if (d.cp) d.cp->release();
 		stack.clear();
 		macro.clear();
@@ -770,6 +985,15 @@ struct Solver {
 		step = 0;
 		lastBranch = 0;
 		togglesUsed = 0;
+		resyncing = false;
+		resyncForBacktrack = false;
+		replayBacktracks = 0;
+		resyncTarget = 0;
+		lastResyncStep = 0;
+		resyncs = resyncFailures = 0;
+		resyncMacro.clear();
+		lastGoodMacro.clear();
+		lastGoodStep = 0;
 		prevAirMode = false;
 		prevOnGround = false;
 		commitDepth = 0;
@@ -783,7 +1007,7 @@ struct Solver {
 
 void solverWriteMacro(const char* name) {
 	auto& sv = Solver::get();
-	std::string path = probe::outputPath(name);
+	std::string path = levelFilePath(name);
 	if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
 		std::fprintf(f, "# gd-solver macro v1, %zu steps, physics_fix=%d, 240Hz\n",
 		             sv.macro.size(), g_config.physicsFix ? 1 : 0);
@@ -810,12 +1034,45 @@ void startRestoreTest(RestoreKind kind) {
 	auto& st = ProbeState::get();
 	if (!PlayLayer::get()) { log::warn("Probe 4b: not in a level"); return; }
 
-	if (st.scripted.empty()) {
-		bool fix = false;
-		if (!loadInput(st.scripted, &fix) || st.scripted.empty()) {
-			st.scripted = makeFallbackInput(kMaxTraceRows);
-			log::warn("Probe 4b: no recorded input, using synthetic pattern");
-		}
+	// Prefer the solution macro: its first ~1200 steps are known to replay
+	// cleanly from frame 0, so anchor 480 + 600 steps stays inside verified
+	// territory. Testing restore fidelity on top of an input that does not
+	// replay faithfully would measure nothing.
+	bool fix = false;
+	bool loaded = loadMacroFile(levelFilePath("solution.txt"), st.scripted, &fix);
+	if (loaded && !st.scripted.empty()) {
+		log::info("Probe 4b: using solution.txt ({} steps)", st.scripted.size());
+	} else if (loadInput(st.scripted, &fix) && !st.scripted.empty()) {
+		log::warn("Probe 4b: no solution.txt, falling back to input.txt - note this "
+		          "recording is known not to replay faithfully, so a divergence may "
+		          "be the replay rather than the restore.");
+	} else {
+		st.scripted = makeFallbackInput(kMaxTraceRows);
+		fix = true;
+		log::warn("Probe 4b: no recorded input, using synthetic pattern");
+	}
+
+	// The macro's granularity depends on this. Leaving it at the default meant
+	// each update() covered two physics steps, stretching all input timing and
+	// killing the run before the anchor was ever reached.
+	g_config.physicsFix = fix;
+
+	PlayLayer::get()->m_isPracticeMode = true; // checkpoint respawn requires it
+
+	// Restores were sound at step 480 yet verification still failed at 18855,
+	// so soundness must be checked where it breaks, not only at the opening.
+	if (st.lastResyncFailStep > 400) {
+		// Anchor just BEFORE the failure so the divergence happens inside the
+		// measured window. The resync failure localised the drift to a 183-step
+		// window at the cube->ship transition.
+		st.restoreAnchor = std::max(240, st.lastResyncFailStep - 300);
+		st.restoreLen    = 400;
+		log::info("Probe 4b: anchoring at {} (resync failed at {} - the mode "
+		          "transition window)", st.restoreAnchor, st.lastResyncFailStep);
+	} else if (st.lastVerifyFailStep > st.restoreLen + 240) {
+		st.restoreAnchor = st.lastVerifyFailStep - st.restoreLen - 120;
+		log::info("Probe 4b: anchoring at {} (just before the last verification "
+		          "failure at {})", st.restoreAnchor, st.lastVerifyFailStep);
 	}
 
 	st.restoreKind  = kind;
@@ -1058,7 +1315,6 @@ void pollHotkeys() {
 	// and ten runs under ten different seeds were byte-identical, so RNG is
 	// proven irrelevant to physics.
 	if (keyPressedEdge(VK_F1)) startDeterminismSweep(false, false); // vanilla dt
-	if (keyPressedEdge(VK_F3)) startDeterminismSweep(true,  false); // fixed dt
 
 	if (keyPressedEdge(VK_F5)) {
 		st.mode = Mode::RecordInput;
@@ -1079,22 +1335,14 @@ void pollHotkeys() {
 		}
 	}
 
-	if (keyPressedEdge(VK_F10)) {
-		g_config.injectionLeadSteps++;
-		log::info("Probe 0: injection lead now {} steps", g_config.injectionLeadSteps);
-	}
-	if (keyPressedEdge(VK_F9)) {
-		g_config.injectionLeadSteps = std::max(0, g_config.injectionLeadSteps - 1);
-		log::info("Probe 0: injection lead now {} steps", g_config.injectionLeadSteps);
-	}
+	// Player-only checkpoints are deliberately NOT offered. PlayerCheckpoint
+	// carries no level state, so restoring one discards trigger and
+	// moving-object state - fine on a 2013 level, wrong everywhere this project
+	// is aiming. The full CheckpointObject path is the only correct one.
 
 	if (keyPressedEdge(VK_F8)) {
-		g_config.physicsFix = !g_config.physicsFix;
-		log::info("Probe 0: physics fix now {}. Record (F5) with this ON once the "
-		          "delta is correct, so the human reference is itself captured under "
-		          "fixed dt - comparing a fixed-dt replay against a vanilla recording "
-		          "can never match exactly, because vanilla is not reproducible.",
-		          g_config.physicsFix ? "ENABLED" : "disabled");
+		g_config.resyncEnabled = !g_config.resyncEnabled;
+		log::info("Solver: periodic resync {}", g_config.resyncEnabled ? "ENABLED" : "disabled");
 	}
 
 	if (keyPressedEdge(VK_F2)) {
@@ -1107,6 +1355,7 @@ void pollHotkeys() {
 		} else if (PlayLayer::get()) {
 			g_config.physicsFix = true; // the solver requires fixed-dt stepping
 			g_config.toggleBudget = 1;  // deepening is per-search, not global
+			g_config.noSavestates = false; // re-enabled below if a verified prefix exists
 
 			// Practice mode is what makes resetLevel respawn to a checkpoint
 			// instead of the level start, which is the only revive path we have.
@@ -1118,6 +1367,18 @@ void pollHotkeys() {
 			sv.lastReport = sv.startTicks;
 			st.mode       = Mode::Solve;
 			st.resetPending = true;
+
+			if (!st.verifiedPrefix.empty()) {
+				sv.resyncMacro  = st.verifiedPrefix;
+				sv.resyncTarget = static_cast<int>(st.verifiedPrefix.size());
+				sv.resyncing    = true;
+				sv.step         = 0;
+				sv.hold         = false;
+				g_config.noSavestates = true;
+				log::info("Solver: starting from a VERIFIED prefix of {} steps. Searching "
+				          "forward WITHOUT savestates - every branch replays from frame 0, "
+				          "so the result is exact by construction.", sv.resyncTarget);
+			}
 			log::info("Solver: starting DFS. air branch interval {} steps, "
 			          "release-before-hold ordering. F2 again to stop.",
 			          g_config.airBranchInterval);
@@ -1126,7 +1387,8 @@ void pollHotkeys() {
 
 	if (keyPressedEdge(VK_F11)) runProbe5(1000);
 	if (keyPressedEdge(VK_F12)) startRestoreTest(RestoreKind::Full);
-	if (keyPressedEdge(VK_F4))  startRestoreTest(RestoreKind::PlayerOnly);
+	if (keyPressedEdge(VK_F4))  startVerify(false); // normal mode
+	if (keyPressedEdge(VK_F3))  startVerify(true);  // practice mode
 
 	if (keyPressedEdge(VK_F7)) {
 		std::string p = probe::outputPath("trace_manual.csv");
@@ -1280,6 +1542,38 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				st.playerCp = pc;
 			}
 			st.restorePhase = 1;
+			// Snapshot the exact state at capture time, so the state after
+			// restore+realign can be compared against it field by field. This
+			// separates "the restore lands somewhere else" from "the restore is
+			// right but the next step differs".
+			if (st.trace.size() > 0) {
+				st.anchorRow = st.trace[st.trace.size() - 1];
+				st.haveAnchorRow = true;
+			}
+			if (m_player1) {
+				const auto* raw = reinterpret_cast<const uint8_t*>(m_player1);
+				st.anchorBytes.assign(raw, raw + sizeof(PlayerObject));
+				st.anchorGameModeChangedTime = m_player1->m_gameModeChangedTime;
+				st.anchorUnkA29              = m_player1->m_unkA29;
+				// sizeof(GJBaseGameLayer) is 14240 but PlayLayer is larger, so
+				// everything in PlayLayer's own region - m_attemptTime among it -
+				// was never being compared at all.
+				const auto* lraw = reinterpret_cast<const uint8_t*>(PlayLayer::get());
+				st.anchorLayerBytes.assign(lraw, lraw + sizeof(PlayLayer));
+				st.aExtraDelta  = m_extraDelta;
+				st.aTimePlayed  = m_timePlayed;
+				st.aTimestamp   = m_timestamp;
+				st.aTickIndex   = m_tickIndex;
+				st.aClickIndex  = m_clickIndex;
+				st.aResumeTimer = m_resumeTimer;
+				st.aJumping     = m_jumping;
+				if (auto* pl2 = PlayLayer::get()) {
+					st.aAttemptTime     = pl2->m_attemptTime;
+					st.aBestAttemptTime = pl2->m_bestAttemptTime;
+					st.aCurrentTime     = pl2->m_currentTime;
+					st.aHasJumped       = pl2->m_hasJumped;
+				}
+			}
 			log::info("Probe 4b: anchored at step {}", st.stepCounter);
 			return true;
 		}
@@ -1294,12 +1588,903 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (st.restorePhase == 1) {
 			// Restore and replay the identical input from the anchor.
 			if (st.restoreKind == RestoreKind::Full) {
-				if (st.fullCp) pl->loadFromCheckpoint(st.fullCp);
+				// The practice-respawn path, exactly as the solver restores.
+				// Testing loadFromCheckpoint instead would measure a path the
+				// solver never takes.
+				const size_t prev = st.restoreAnchor > 0
+				                  ? static_cast<size_t>(st.restoreAnchor - 1) : 0;
+				const bool realign = prev < st.scripted.size() && st.scripted[prev] != 0;
+				// Exercise the same extra-state restoration the solver uses.
+				Solver::PendingExtra e;
+				e.gameModeChangedTime = st.anchorGameModeChangedTime;
+				e.unkA29      = st.anchorUnkA29;
+				e.extraDelta  = st.aExtraDelta;
+				e.timePlayed  = st.aTimePlayed;
+				e.timestamp   = st.aTimestamp;
+				e.tickIndex   = st.aTickIndex;
+				e.clickIndex  = st.aClickIndex;
+				e.resumeTimer = st.aResumeTimer;
+				e.jumping     = st.aJumping;
+				e.attemptTime     = st.aAttemptTime;
+				e.bestAttemptTime = st.aBestAttemptTime;
+				e.currentTime     = st.aCurrentTime;
+				e.hasJumped       = st.aHasJumped;
+				e.valid       = true;
+				Solver::get().pendingExtra = e;
+				solverRestoreCheckpoint(st.fullCp, realign);
 			} else {
 				if (st.playerCp) m_player1->loadFromCheckpoint(st.playerCp);
 			}
 			st.stepCounter  = st.restoreAnchor;
 			st.restorePhase = 2;
+
+			// Compare the restored state against the captured one directly.
+			if (st.haveAnchorRow && m_player1) {
+				auto const& a = st.anchorRow;
+				auto* p = m_player1;
+				auto* pl2 = PlayLayer::get();
+				const float  x  = p->getPositionX(),  y = p->getPositionY();
+				const float  r  = p->getRotation();
+				const double vy = p->m_yVelocity,     g = p->m_gravity;
+				const bool same =
+					probe::bits(x)  == a.x  && probe::bits(y) == a.y &&
+					probe::bits(r)  == a.rotation &&
+					probe::bits(vy) == a.yVelocity && probe::bits(g) == a.gravity;
+				log::info("Probe 4b: state at restore boundary is {}", same ? "EXACT" : "DIFFERENT");
+				log::info("  captured : x={:.6f} y={:.6f} rot={:.6f} yVel={:.6f} onGround={} ship={}",
+				          probe::asFloat(a.x), probe::asFloat(a.y), probe::asFloat(a.rotation),
+				          probe::asDouble(a.yVelocity),
+				          (a.flags & probe::FlagOnGround) ? 1 : 0,
+				          (a.flags & probe::FlagShip) ? 1 : 0);
+				log::info("  restored : x={:.6f} y={:.6f} rot={:.6f} yVel={:.6f} onGround={} ship={}",
+				          x, y, r, vy, p->m_isOnGround ? 1 : 0, p->m_isShip ? 1 : 0);
+				log::info("  holdingJump={}  jumpBuffered={}  percent={:.4f}",
+				          ProbeState::get().isHolding ? 1 : 0, p->m_jumpBuffered ? 1 : 0,
+				          pl2 ? pl2->getCurrentPercent() : 0.f);
+			}
+
+			// Probe 4a: which bytes of PlayerObject did the restore fail to bring
+			// back? Reported as ranges with the nearest known field, so the
+			// answer is a field list rather than a guess.
+			if (!st.anchorBytes.empty() && m_player1) {
+				const auto* now = reinterpret_cast<const uint8_t*>(m_player1);
+				struct FieldRef { const char* name; size_t off; size_t size; };
+				// Generated from bindings/2.2081 - every named PlayerObject member,
+				// so a differing byte range is reported as a FIELD NAME rather than
+				// a bare offset I then have to guess at.
+				static const FieldRef fields[] = {
+					{"m_mainLayer", offsetof(PlayerObject, m_mainLayer), sizeof(PlayerObject::m_mainLayer)},
+					{"m_wasTeleported", offsetof(PlayerObject, m_wasTeleported), sizeof(PlayerObject::m_wasTeleported)},
+					{"m_fixGravityBug", offsetof(PlayerObject, m_fixGravityBug), sizeof(PlayerObject::m_fixGravityBug)},
+					{"m_reverseSync", offsetof(PlayerObject, m_reverseSync), sizeof(PlayerObject::m_reverseSync)},
+					{"m_yVelocityBeforeSlope", offsetof(PlayerObject, m_yVelocityBeforeSlope), sizeof(PlayerObject::m_yVelocityBeforeSlope)},
+					{"m_dashX", offsetof(PlayerObject, m_dashX), sizeof(PlayerObject::m_dashX)},
+					{"m_dashY", offsetof(PlayerObject, m_dashY), sizeof(PlayerObject::m_dashY)},
+					{"m_dashAngle", offsetof(PlayerObject, m_dashAngle), sizeof(PlayerObject::m_dashAngle)},
+					{"m_dashStartTime", offsetof(PlayerObject, m_dashStartTime), sizeof(PlayerObject::m_dashStartTime)},
+					{"m_dashRing", offsetof(PlayerObject, m_dashRing), sizeof(PlayerObject::m_dashRing)},
+					{"m_slopeStartTime", offsetof(PlayerObject, m_slopeStartTime), sizeof(PlayerObject::m_slopeStartTime)},
+					{"m_justPlacedStreak", offsetof(PlayerObject, m_justPlacedStreak), sizeof(PlayerObject::m_justPlacedStreak)},
+					{"m_maybeLastGroundObject", offsetof(PlayerObject, m_maybeLastGroundObject), sizeof(PlayerObject::m_maybeLastGroundObject)},
+					{"m_collisionLogTop", offsetof(PlayerObject, m_collisionLogTop), sizeof(PlayerObject::m_collisionLogTop)},
+					{"m_collisionLogBottom", offsetof(PlayerObject, m_collisionLogBottom), sizeof(PlayerObject::m_collisionLogBottom)},
+					{"m_collisionLogLeft", offsetof(PlayerObject, m_collisionLogLeft), sizeof(PlayerObject::m_collisionLogLeft)},
+					{"m_collisionLogRight", offsetof(PlayerObject, m_collisionLogRight), sizeof(PlayerObject::m_collisionLogRight)},
+					{"m_lastCollisionBottom", offsetof(PlayerObject, m_lastCollisionBottom), sizeof(PlayerObject::m_lastCollisionBottom)},
+					{"m_lastCollisionTop", offsetof(PlayerObject, m_lastCollisionTop), sizeof(PlayerObject::m_lastCollisionTop)},
+					{"m_lastCollisionLeft", offsetof(PlayerObject, m_lastCollisionLeft), sizeof(PlayerObject::m_lastCollisionLeft)},
+					{"m_lastCollisionRight", offsetof(PlayerObject, m_lastCollisionRight), sizeof(PlayerObject::m_lastCollisionRight)},
+					{"m_unk50C", offsetof(PlayerObject, m_unk50C), sizeof(PlayerObject::m_unk50C)},
+					{"m_unk510", offsetof(PlayerObject, m_unk510), sizeof(PlayerObject::m_unk510)},
+					{"m_currentSlope2", offsetof(PlayerObject, m_currentSlope2), sizeof(PlayerObject::m_currentSlope2)},
+					{"m_preLastGroundObject", offsetof(PlayerObject, m_preLastGroundObject), sizeof(PlayerObject::m_preLastGroundObject)},
+					{"m_slopeAngle", offsetof(PlayerObject, m_slopeAngle), sizeof(PlayerObject::m_slopeAngle)},
+					{"m_slopeSlidingMaybeRotated", offsetof(PlayerObject, m_slopeSlidingMaybeRotated), sizeof(PlayerObject::m_slopeSlidingMaybeRotated)},
+					{"m_quickCheckpointMode", offsetof(PlayerObject, m_quickCheckpointMode), sizeof(PlayerObject::m_quickCheckpointMode)},
+					{"m_collidedObject", offsetof(PlayerObject, m_collidedObject), sizeof(PlayerObject::m_collidedObject)},
+					{"m_lastGroundObject", offsetof(PlayerObject, m_lastGroundObject), sizeof(PlayerObject::m_lastGroundObject)},
+					{"m_collidingWithLeft", offsetof(PlayerObject, m_collidingWithLeft), sizeof(PlayerObject::m_collidingWithLeft)},
+					{"m_collidingWithRight", offsetof(PlayerObject, m_collidingWithRight), sizeof(PlayerObject::m_collidingWithRight)},
+					{"m_maybeSavedPlayerFrame", offsetof(PlayerObject, m_maybeSavedPlayerFrame), sizeof(PlayerObject::m_maybeSavedPlayerFrame)},
+					{"m_scaleXRelated2", offsetof(PlayerObject, m_scaleXRelated2), sizeof(PlayerObject::m_scaleXRelated2)},
+					{"m_groundYVelocity", offsetof(PlayerObject, m_groundYVelocity), sizeof(PlayerObject::m_groundYVelocity)},
+					{"m_yVelocityRelated", offsetof(PlayerObject, m_yVelocityRelated), sizeof(PlayerObject::m_yVelocityRelated)},
+					{"m_scaleXRelated3", offsetof(PlayerObject, m_scaleXRelated3), sizeof(PlayerObject::m_scaleXRelated3)},
+					{"m_scaleXRelated4", offsetof(PlayerObject, m_scaleXRelated4), sizeof(PlayerObject::m_scaleXRelated4)},
+					{"m_scaleXRelated5", offsetof(PlayerObject, m_scaleXRelated5), sizeof(PlayerObject::m_scaleXRelated5)},
+					{"m_isCollidingWithSlope", offsetof(PlayerObject, m_isCollidingWithSlope), sizeof(PlayerObject::m_isCollidingWithSlope)},
+					{"m_dashFireSprite", offsetof(PlayerObject, m_dashFireSprite), sizeof(PlayerObject::m_dashFireSprite)},
+					{"m_isBallRotating", offsetof(PlayerObject, m_isBallRotating), sizeof(PlayerObject::m_isBallRotating)},
+					{"m_unk669", offsetof(PlayerObject, m_unk669), sizeof(PlayerObject::m_unk669)},
+					{"m_currentPotentialSlope", offsetof(PlayerObject, m_currentPotentialSlope), sizeof(PlayerObject::m_currentPotentialSlope)},
+					{"m_currentSlope", offsetof(PlayerObject, m_currentSlope), sizeof(PlayerObject::m_currentSlope)},
+					{"m_collidingWithSlopeId", offsetof(PlayerObject, m_collidingWithSlopeId), sizeof(PlayerObject::m_collidingWithSlopeId)},
+					{"m_slopeFlipGravityRelated", offsetof(PlayerObject, m_slopeFlipGravityRelated), sizeof(PlayerObject::m_slopeFlipGravityRelated)},
+					{"m_particleSystems", offsetof(PlayerObject, m_particleSystems), sizeof(PlayerObject::m_particleSystems)},
+					{"m_slopeAngleRadians", offsetof(PlayerObject, m_slopeAngleRadians), sizeof(PlayerObject::m_slopeAngleRadians)},
+					{"m_rotateObjectsRelated", offsetof(PlayerObject, m_rotateObjectsRelated), sizeof(PlayerObject::m_rotateObjectsRelated)},
+					{"m_potentialSlopeMap", offsetof(PlayerObject, m_potentialSlopeMap), sizeof(PlayerObject::m_potentialSlopeMap)},
+					{"m_rotationSpeed", offsetof(PlayerObject, m_rotationSpeed), sizeof(PlayerObject::m_rotationSpeed)},
+					{"m_rotateSpeed", offsetof(PlayerObject, m_rotateSpeed), sizeof(PlayerObject::m_rotateSpeed)},
+					{"m_isRotating", offsetof(PlayerObject, m_isRotating), sizeof(PlayerObject::m_isRotating)},
+					{"m_isBallRotating2", offsetof(PlayerObject, m_isBallRotating2), sizeof(PlayerObject::m_isBallRotating2)},
+					{"m_hasGlow", offsetof(PlayerObject, m_hasGlow), sizeof(PlayerObject::m_hasGlow)},
+					{"m_isHidden", offsetof(PlayerObject, m_isHidden), sizeof(PlayerObject::m_isHidden)},
+					{"m_ghostType", offsetof(PlayerObject, m_ghostType), sizeof(PlayerObject::m_ghostType)},
+					{"m_ghostTrail", offsetof(PlayerObject, m_ghostTrail), sizeof(PlayerObject::m_ghostTrail)},
+					{"m_iconSprite", offsetof(PlayerObject, m_iconSprite), sizeof(PlayerObject::m_iconSprite)},
+					{"m_iconSpriteSecondary", offsetof(PlayerObject, m_iconSpriteSecondary), sizeof(PlayerObject::m_iconSpriteSecondary)},
+					{"m_iconSpriteWhitener", offsetof(PlayerObject, m_iconSpriteWhitener), sizeof(PlayerObject::m_iconSpriteWhitener)},
+					{"m_iconGlow", offsetof(PlayerObject, m_iconGlow), sizeof(PlayerObject::m_iconGlow)},
+					{"m_vehicleSprite", offsetof(PlayerObject, m_vehicleSprite), sizeof(PlayerObject::m_vehicleSprite)},
+					{"m_vehicleSpriteSecondary", offsetof(PlayerObject, m_vehicleSpriteSecondary), sizeof(PlayerObject::m_vehicleSpriteSecondary)},
+					{"m_birdVehicle", offsetof(PlayerObject, m_birdVehicle), sizeof(PlayerObject::m_birdVehicle)},
+					{"m_vehicleSpriteWhitener", offsetof(PlayerObject, m_vehicleSpriteWhitener), sizeof(PlayerObject::m_vehicleSpriteWhitener)},
+					{"m_vehicleGlow", offsetof(PlayerObject, m_vehicleGlow), sizeof(PlayerObject::m_vehicleGlow)},
+					{"m_swingFireMiddle", offsetof(PlayerObject, m_swingFireMiddle), sizeof(PlayerObject::m_swingFireMiddle)},
+					{"m_swingFireBottom", offsetof(PlayerObject, m_swingFireBottom), sizeof(PlayerObject::m_swingFireBottom)},
+					{"m_swingFireTop", offsetof(PlayerObject, m_swingFireTop), sizeof(PlayerObject::m_swingFireTop)},
+					{"m_dashSpritesContainer", offsetof(PlayerObject, m_dashSpritesContainer), sizeof(PlayerObject::m_dashSpritesContainer)},
+					{"m_regularTrail", offsetof(PlayerObject, m_regularTrail), sizeof(PlayerObject::m_regularTrail)},
+					{"m_shipStreak", offsetof(PlayerObject, m_shipStreak), sizeof(PlayerObject::m_shipStreak)},
+					{"m_waveTrail", offsetof(PlayerObject, m_waveTrail), sizeof(PlayerObject::m_waveTrail)},
+					{"m_speedMultiplier", offsetof(PlayerObject, m_speedMultiplier), sizeof(PlayerObject::m_speedMultiplier)},
+					{"m_yStart", offsetof(PlayerObject, m_yStart), sizeof(PlayerObject::m_yStart)},
+					{"m_gravity", offsetof(PlayerObject, m_gravity), sizeof(PlayerObject::m_gravity)},
+					{"m_trailingParticleLife", offsetof(PlayerObject, m_trailingParticleLife), sizeof(PlayerObject::m_trailingParticleLife)},
+					{"m_unk648", offsetof(PlayerObject, m_unk648), sizeof(PlayerObject::m_unk648)},
+					{"m_gameModeChangedTime", offsetof(PlayerObject, m_gameModeChangedTime), sizeof(PlayerObject::m_gameModeChangedTime)},
+					{"m_padRingRelated", offsetof(PlayerObject, m_padRingRelated), sizeof(PlayerObject::m_padRingRelated)},
+					{"m_maybeReducedEffects", offsetof(PlayerObject, m_maybeReducedEffects), sizeof(PlayerObject::m_maybeReducedEffects)},
+					{"m_maybeIsFalling", offsetof(PlayerObject, m_maybeIsFalling), sizeof(PlayerObject::m_maybeIsFalling)},
+					{"m_shouldTryPlacingCheckpoint", offsetof(PlayerObject, m_shouldTryPlacingCheckpoint), sizeof(PlayerObject::m_shouldTryPlacingCheckpoint)},
+					{"m_playEffects", offsetof(PlayerObject, m_playEffects), sizeof(PlayerObject::m_playEffects)},
+					{"m_maybeCanRunIntoBlocks", offsetof(PlayerObject, m_maybeCanRunIntoBlocks), sizeof(PlayerObject::m_maybeCanRunIntoBlocks)},
+					{"m_hasGroundParticles", offsetof(PlayerObject, m_hasGroundParticles), sizeof(PlayerObject::m_hasGroundParticles)},
+					{"m_hasShipParticles", offsetof(PlayerObject, m_hasShipParticles), sizeof(PlayerObject::m_hasShipParticles)},
+					{"m_isOnGround3", offsetof(PlayerObject, m_isOnGround3), sizeof(PlayerObject::m_isOnGround3)},
+					{"m_checkpointTimeout", offsetof(PlayerObject, m_checkpointTimeout), sizeof(PlayerObject::m_checkpointTimeout)},
+					{"m_lastCheckpointTime", offsetof(PlayerObject, m_lastCheckpointTime), sizeof(PlayerObject::m_lastCheckpointTime)},
+					{"m_lastJumpTime", offsetof(PlayerObject, m_lastJumpTime), sizeof(PlayerObject::m_lastJumpTime)},
+					{"m_lastFlipTime", offsetof(PlayerObject, m_lastFlipTime), sizeof(PlayerObject::m_lastFlipTime)},
+					{"m_flashTime", offsetof(PlayerObject, m_flashTime), sizeof(PlayerObject::m_flashTime)},
+					{"m_flashDuration", offsetof(PlayerObject, m_flashDuration), sizeof(PlayerObject::m_flashDuration)},
+					{"m_flashDelay", offsetof(PlayerObject, m_flashDelay), sizeof(PlayerObject::m_flashDelay)},
+					{"m_flashMainColor", offsetof(PlayerObject, m_flashMainColor), sizeof(PlayerObject::m_flashMainColor)},
+					{"m_flashSecondColor", offsetof(PlayerObject, m_flashSecondColor), sizeof(PlayerObject::m_flashSecondColor)},
+					{"m_lastSpiderFlipTime", offsetof(PlayerObject, m_lastSpiderFlipTime), sizeof(PlayerObject::m_lastSpiderFlipTime)},
+					{"m_unkBool5", offsetof(PlayerObject, m_unkBool5), sizeof(PlayerObject::m_unkBool5)},
+					{"m_maybeIsVehicleGlowing", offsetof(PlayerObject, m_maybeIsVehicleGlowing), sizeof(PlayerObject::m_maybeIsVehicleGlowing)},
+					{"m_switchWaveTrailColor", offsetof(PlayerObject, m_switchWaveTrailColor), sizeof(PlayerObject::m_switchWaveTrailColor)},
+					{"m_practiceDeathEffect", offsetof(PlayerObject, m_practiceDeathEffect), sizeof(PlayerObject::m_practiceDeathEffect)},
+					{"m_accelerationOrSpeed", offsetof(PlayerObject, m_accelerationOrSpeed), sizeof(PlayerObject::m_accelerationOrSpeed)},
+					{"m_snapDistance", offsetof(PlayerObject, m_snapDistance), sizeof(PlayerObject::m_snapDistance)},
+					{"m_ringJumpRelated", offsetof(PlayerObject, m_ringJumpRelated), sizeof(PlayerObject::m_ringJumpRelated)},
+					{"m_ringRelatedSet", offsetof(PlayerObject, m_ringRelatedSet), sizeof(PlayerObject::m_ringRelatedSet)},
+					{"m_objectSnappedTo", offsetof(PlayerObject, m_objectSnappedTo), sizeof(PlayerObject::m_objectSnappedTo)},
+					{"m_pendingCheckpoint", offsetof(PlayerObject, m_pendingCheckpoint), sizeof(PlayerObject::m_pendingCheckpoint)},
+					{"m_onFlyCheckpointTries", offsetof(PlayerObject, m_onFlyCheckpointTries), sizeof(PlayerObject::m_onFlyCheckpointTries)},
+					{"m_robotSprite", offsetof(PlayerObject, m_robotSprite), sizeof(PlayerObject::m_robotSprite)},
+					{"m_spiderSprite", offsetof(PlayerObject, m_spiderSprite), sizeof(PlayerObject::m_spiderSprite)},
+					{"m_maybeSpriteRelated", offsetof(PlayerObject, m_maybeSpriteRelated), sizeof(PlayerObject::m_maybeSpriteRelated)},
+					{"m_playerGroundParticles", offsetof(PlayerObject, m_playerGroundParticles), sizeof(PlayerObject::m_playerGroundParticles)},
+					{"m_trailingParticles", offsetof(PlayerObject, m_trailingParticles), sizeof(PlayerObject::m_trailingParticles)},
+					{"m_shipClickParticles", offsetof(PlayerObject, m_shipClickParticles), sizeof(PlayerObject::m_shipClickParticles)},
+					{"m_vehicleGroundParticles", offsetof(PlayerObject, m_vehicleGroundParticles), sizeof(PlayerObject::m_vehicleGroundParticles)},
+					{"m_ufoClickParticles", offsetof(PlayerObject, m_ufoClickParticles), sizeof(PlayerObject::m_ufoClickParticles)},
+					{"m_robotBurstParticles", offsetof(PlayerObject, m_robotBurstParticles), sizeof(PlayerObject::m_robotBurstParticles)},
+					{"m_dashParticles", offsetof(PlayerObject, m_dashParticles), sizeof(PlayerObject::m_dashParticles)},
+					{"m_swingBurstParticles1", offsetof(PlayerObject, m_swingBurstParticles1), sizeof(PlayerObject::m_swingBurstParticles1)},
+					{"m_swingBurstParticles2", offsetof(PlayerObject, m_swingBurstParticles2), sizeof(PlayerObject::m_swingBurstParticles2)},
+					{"m_useLandParticles0", offsetof(PlayerObject, m_useLandParticles0), sizeof(PlayerObject::m_useLandParticles0)},
+					{"m_landParticles0", offsetof(PlayerObject, m_landParticles0), sizeof(PlayerObject::m_landParticles0)},
+					{"m_landParticles1", offsetof(PlayerObject, m_landParticles1), sizeof(PlayerObject::m_landParticles1)},
+					{"m_landParticlesAngle", offsetof(PlayerObject, m_landParticlesAngle), sizeof(PlayerObject::m_landParticlesAngle)},
+					{"m_landParticleRelatedY", offsetof(PlayerObject, m_landParticleRelatedY), sizeof(PlayerObject::m_landParticleRelatedY)},
+					{"m_playerStreak", offsetof(PlayerObject, m_playerStreak), sizeof(PlayerObject::m_playerStreak)},
+					{"m_streakStrokeWidth", offsetof(PlayerObject, m_streakStrokeWidth), sizeof(PlayerObject::m_streakStrokeWidth)},
+					{"m_disableStreakTint", offsetof(PlayerObject, m_disableStreakTint), sizeof(PlayerObject::m_disableStreakTint)},
+					{"m_alwaysShowStreak", offsetof(PlayerObject, m_alwaysShowStreak), sizeof(PlayerObject::m_alwaysShowStreak)},
+					{"m_shipStreakType", offsetof(PlayerObject, m_shipStreakType), sizeof(PlayerObject::m_shipStreakType)},
+					{"m_slopeRotation", offsetof(PlayerObject, m_slopeRotation), sizeof(PlayerObject::m_slopeRotation)},
+					{"m_currentSlopeYVelocity", offsetof(PlayerObject, m_currentSlopeYVelocity), sizeof(PlayerObject::m_currentSlopeYVelocity)},
+					{"m_unk3d0", offsetof(PlayerObject, m_unk3d0), sizeof(PlayerObject::m_unk3d0)},
+					{"m_blackOrbRelated", offsetof(PlayerObject, m_blackOrbRelated), sizeof(PlayerObject::m_blackOrbRelated)},
+					{"m_unk3e0", offsetof(PlayerObject, m_unk3e0), sizeof(PlayerObject::m_unk3e0)},
+					{"m_unk3e1", offsetof(PlayerObject, m_unk3e1), sizeof(PlayerObject::m_unk3e1)},
+					{"m_isAccelerating", offsetof(PlayerObject, m_isAccelerating), sizeof(PlayerObject::m_isAccelerating)},
+					{"m_isCurrentSlopeTop", offsetof(PlayerObject, m_isCurrentSlopeTop), sizeof(PlayerObject::m_isCurrentSlopeTop)},
+					{"m_collidedTopMinY", offsetof(PlayerObject, m_collidedTopMinY), sizeof(PlayerObject::m_collidedTopMinY)},
+					{"m_collidedBottomMaxY", offsetof(PlayerObject, m_collidedBottomMaxY), sizeof(PlayerObject::m_collidedBottomMaxY)},
+					{"m_collidedLeftMaxX", offsetof(PlayerObject, m_collidedLeftMaxX), sizeof(PlayerObject::m_collidedLeftMaxX)},
+					{"m_collidedRightMinX", offsetof(PlayerObject, m_collidedRightMinX), sizeof(PlayerObject::m_collidedRightMinX)},
+					{"m_fadeOutStreak", offsetof(PlayerObject, m_fadeOutStreak), sizeof(PlayerObject::m_fadeOutStreak)},
+					{"m_canPlaceCheckpoint", offsetof(PlayerObject, m_canPlaceCheckpoint), sizeof(PlayerObject::m_canPlaceCheckpoint)},
+					{"m_originalMainColor", offsetof(PlayerObject, m_originalMainColor), sizeof(PlayerObject::m_originalMainColor)},
+					{"m_originalSecondColor", offsetof(PlayerObject, m_originalSecondColor), sizeof(PlayerObject::m_originalSecondColor)},
+					{"m_hasCustomGlowColor", offsetof(PlayerObject, m_hasCustomGlowColor), sizeof(PlayerObject::m_hasCustomGlowColor)},
+					{"m_glowColor", offsetof(PlayerObject, m_glowColor), sizeof(PlayerObject::m_glowColor)},
+					{"m_maybeIsColliding", offsetof(PlayerObject, m_maybeIsColliding), sizeof(PlayerObject::m_maybeIsColliding)},
+					{"m_jumpBuffered", offsetof(PlayerObject, m_jumpBuffered), sizeof(PlayerObject::m_jumpBuffered)},
+					{"m_stateRingJump", offsetof(PlayerObject, m_stateRingJump), sizeof(PlayerObject::m_stateRingJump)},
+					{"m_wasJumpBuffered", offsetof(PlayerObject, m_wasJumpBuffered), sizeof(PlayerObject::m_wasJumpBuffered)},
+					{"m_wasRobotJump", offsetof(PlayerObject, m_wasRobotJump), sizeof(PlayerObject::m_wasRobotJump)},
+					{"m_stateJumpBuffered", offsetof(PlayerObject, m_stateJumpBuffered), sizeof(PlayerObject::m_stateJumpBuffered)},
+					{"m_stateRingJump2", offsetof(PlayerObject, m_stateRingJump2), sizeof(PlayerObject::m_stateRingJump2)},
+					{"m_touchedRing", offsetof(PlayerObject, m_touchedRing), sizeof(PlayerObject::m_touchedRing)},
+					{"m_touchedCustomRing", offsetof(PlayerObject, m_touchedCustomRing), sizeof(PlayerObject::m_touchedCustomRing)},
+					{"m_touchedGravityPortal", offsetof(PlayerObject, m_touchedGravityPortal), sizeof(PlayerObject::m_touchedGravityPortal)},
+					{"m_maybeTouchedBreakableBlock", offsetof(PlayerObject, m_maybeTouchedBreakableBlock), sizeof(PlayerObject::m_maybeTouchedBreakableBlock)},
+					{"m_jumpRelatedAC2", offsetof(PlayerObject, m_jumpRelatedAC2), sizeof(PlayerObject::m_jumpRelatedAC2)},
+					{"m_touchedPad", offsetof(PlayerObject, m_touchedPad), sizeof(PlayerObject::m_touchedPad)},
+					{"m_yVelocity", offsetof(PlayerObject, m_yVelocity), sizeof(PlayerObject::m_yVelocity)},
+					{"m_fallSpeed", offsetof(PlayerObject, m_fallSpeed), sizeof(PlayerObject::m_fallSpeed)},
+					{"m_isOnSlope", offsetof(PlayerObject, m_isOnSlope), sizeof(PlayerObject::m_isOnSlope)},
+					{"m_wasOnSlope", offsetof(PlayerObject, m_wasOnSlope), sizeof(PlayerObject::m_wasOnSlope)},
+					{"m_slopeVelocity", offsetof(PlayerObject, m_slopeVelocity), sizeof(PlayerObject::m_slopeVelocity)},
+					{"m_maybeUpsideDownSlope", offsetof(PlayerObject, m_maybeUpsideDownSlope), sizeof(PlayerObject::m_maybeUpsideDownSlope)},
+					{"m_isShip", offsetof(PlayerObject, m_isShip), sizeof(PlayerObject::m_isShip)},
+					{"m_isBird", offsetof(PlayerObject, m_isBird), sizeof(PlayerObject::m_isBird)},
+					{"m_isBall", offsetof(PlayerObject, m_isBall), sizeof(PlayerObject::m_isBall)},
+					{"m_isDart", offsetof(PlayerObject, m_isDart), sizeof(PlayerObject::m_isDart)},
+					{"m_isRobot", offsetof(PlayerObject, m_isRobot), sizeof(PlayerObject::m_isRobot)},
+					{"m_isSpider", offsetof(PlayerObject, m_isSpider), sizeof(PlayerObject::m_isSpider)},
+					{"m_isUpsideDown", offsetof(PlayerObject, m_isUpsideDown), sizeof(PlayerObject::m_isUpsideDown)},
+					{"m_isDead", offsetof(PlayerObject, m_isDead), sizeof(PlayerObject::m_isDead)},
+					{"m_isOnGround", offsetof(PlayerObject, m_isOnGround), sizeof(PlayerObject::m_isOnGround)},
+					{"m_isGoingLeft", offsetof(PlayerObject, m_isGoingLeft), sizeof(PlayerObject::m_isGoingLeft)},
+					{"m_isSideways", offsetof(PlayerObject, m_isSideways), sizeof(PlayerObject::m_isSideways)},
+					{"m_isSwing", offsetof(PlayerObject, m_isSwing), sizeof(PlayerObject::m_isSwing)},
+					{"m_reverseRelated", offsetof(PlayerObject, m_reverseRelated), sizeof(PlayerObject::m_reverseRelated)},
+					{"m_maybeReverseSpeed", offsetof(PlayerObject, m_maybeReverseSpeed), sizeof(PlayerObject::m_maybeReverseSpeed)},
+					{"m_maybeReverseAcceleration", offsetof(PlayerObject, m_maybeReverseAcceleration), sizeof(PlayerObject::m_maybeReverseAcceleration)},
+					{"m_xVelocityRelated2", offsetof(PlayerObject, m_xVelocityRelated2), sizeof(PlayerObject::m_xVelocityRelated2)},
+					{"m_isDashing", offsetof(PlayerObject, m_isDashing), sizeof(PlayerObject::m_isDashing)},
+					{"m_dashFireFrame", offsetof(PlayerObject, m_dashFireFrame), sizeof(PlayerObject::m_dashFireFrame)},
+					{"m_groundObjectMaterial", offsetof(PlayerObject, m_groundObjectMaterial), sizeof(PlayerObject::m_groundObjectMaterial)},
+					{"m_vehicleSize", offsetof(PlayerObject, m_vehicleSize), sizeof(PlayerObject::m_vehicleSize)},
+					{"m_playerSpeed", offsetof(PlayerObject, m_playerSpeed), sizeof(PlayerObject::m_playerSpeed)},
+					{"m_shipRotation", offsetof(PlayerObject, m_shipRotation), sizeof(PlayerObject::m_shipRotation)},
+					{"m_lastPortalPos", offsetof(PlayerObject, m_lastPortalPos), sizeof(PlayerObject::m_lastPortalPos)},
+					{"m_unkUnused3", offsetof(PlayerObject, m_unkUnused3), sizeof(PlayerObject::m_unkUnused3)},
+					{"m_isOnGround2", offsetof(PlayerObject, m_isOnGround2), sizeof(PlayerObject::m_isOnGround2)},
+					{"m_lastLandTime", offsetof(PlayerObject, m_lastLandTime), sizeof(PlayerObject::m_lastLandTime)},
+					{"m_platformerVelocityRelated", offsetof(PlayerObject, m_platformerVelocityRelated), sizeof(PlayerObject::m_platformerVelocityRelated)},
+					{"m_maybeIsBoosted", offsetof(PlayerObject, m_maybeIsBoosted), sizeof(PlayerObject::m_maybeIsBoosted)},
+					{"m_scaleXRelatedTime", offsetof(PlayerObject, m_scaleXRelatedTime), sizeof(PlayerObject::m_scaleXRelatedTime)},
+					{"m_decreaseBoostSlide", offsetof(PlayerObject, m_decreaseBoostSlide), sizeof(PlayerObject::m_decreaseBoostSlide)},
+					{"m_unkA29", offsetof(PlayerObject, m_unkA29), sizeof(PlayerObject::m_unkA29)},
+					{"m_isLocked", offsetof(PlayerObject, m_isLocked), sizeof(PlayerObject::m_isLocked)},
+					{"m_controlsDisabled", offsetof(PlayerObject, m_controlsDisabled), sizeof(PlayerObject::m_controlsDisabled)},
+					{"m_lastGroundedPos", offsetof(PlayerObject, m_lastGroundedPos), sizeof(PlayerObject::m_lastGroundedPos)},
+					{"m_touchingRings", offsetof(PlayerObject, m_touchingRings), sizeof(PlayerObject::m_touchingRings)},
+					{"m_touchedRings", offsetof(PlayerObject, m_touchedRings), sizeof(PlayerObject::m_touchedRings)},
+					{"m_lastActivatedPortal", offsetof(PlayerObject, m_lastActivatedPortal), sizeof(PlayerObject::m_lastActivatedPortal)},
+					{"m_hasEverJumped", offsetof(PlayerObject, m_hasEverJumped), sizeof(PlayerObject::m_hasEverJumped)},
+					{"m_hasEverHitRing", offsetof(PlayerObject, m_hasEverHitRing), sizeof(PlayerObject::m_hasEverHitRing)},
+					{"m_playerColor1", offsetof(PlayerObject, m_playerColor1), sizeof(PlayerObject::m_playerColor1)},
+					{"m_playerColor2", offsetof(PlayerObject, m_playerColor2), sizeof(PlayerObject::m_playerColor2)},
+					{"m_position", offsetof(PlayerObject, m_position), sizeof(PlayerObject::m_position)},
+					{"m_isSecondPlayer", offsetof(PlayerObject, m_isSecondPlayer), sizeof(PlayerObject::m_isSecondPlayer)},
+					{"m_unkA99", offsetof(PlayerObject, m_unkA99), sizeof(PlayerObject::m_unkA99)},
+					{"m_totalTime", offsetof(PlayerObject, m_totalTime), sizeof(PlayerObject::m_totalTime)},
+					{"m_isBeingSpawnedByDualPortal", offsetof(PlayerObject, m_isBeingSpawnedByDualPortal), sizeof(PlayerObject::m_isBeingSpawnedByDualPortal)},
+					{"m_audioScale", offsetof(PlayerObject, m_audioScale), sizeof(PlayerObject::m_audioScale)},
+					{"m_unkAngle1", offsetof(PlayerObject, m_unkAngle1), sizeof(PlayerObject::m_unkAngle1)},
+					{"m_yVelocityRelated3", offsetof(PlayerObject, m_yVelocityRelated3), sizeof(PlayerObject::m_yVelocityRelated3)},
+					{"m_defaultMiniIcon", offsetof(PlayerObject, m_defaultMiniIcon), sizeof(PlayerObject::m_defaultMiniIcon)},
+					{"m_swapColors", offsetof(PlayerObject, m_swapColors), sizeof(PlayerObject::m_swapColors)},
+					{"m_switchDashFireColor", offsetof(PlayerObject, m_switchDashFireColor), sizeof(PlayerObject::m_switchDashFireColor)},
+					{"m_followRelated", offsetof(PlayerObject, m_followRelated), sizeof(PlayerObject::m_followRelated)},
+					{"m_playerFollowFloats", offsetof(PlayerObject, m_playerFollowFloats), sizeof(PlayerObject::m_playerFollowFloats)},
+					{"m_unk838", offsetof(PlayerObject, m_unk838), sizeof(PlayerObject::m_unk838)},
+					{"m_stateOnGround", offsetof(PlayerObject, m_stateOnGround), sizeof(PlayerObject::m_stateOnGround)},
+					{"m_stateUnk", offsetof(PlayerObject, m_stateUnk), sizeof(PlayerObject::m_stateUnk)},
+					{"m_stateNoStickX", offsetof(PlayerObject, m_stateNoStickX), sizeof(PlayerObject::m_stateNoStickX)},
+					{"m_stateNoStickY", offsetof(PlayerObject, m_stateNoStickY), sizeof(PlayerObject::m_stateNoStickY)},
+					{"m_stateUnk2", offsetof(PlayerObject, m_stateUnk2), sizeof(PlayerObject::m_stateUnk2)},
+					{"m_stateBoostX", offsetof(PlayerObject, m_stateBoostX), sizeof(PlayerObject::m_stateBoostX)},
+					{"m_stateBoostY", offsetof(PlayerObject, m_stateBoostY), sizeof(PlayerObject::m_stateBoostY)},
+					{"m_maybeStateForce2", offsetof(PlayerObject, m_maybeStateForce2), sizeof(PlayerObject::m_maybeStateForce2)},
+					{"m_stateScale", offsetof(PlayerObject, m_stateScale), sizeof(PlayerObject::m_stateScale)},
+					{"m_platformerXVelocity", offsetof(PlayerObject, m_platformerXVelocity), sizeof(PlayerObject::m_platformerXVelocity)},
+					{"m_holdingRight", offsetof(PlayerObject, m_holdingRight), sizeof(PlayerObject::m_holdingRight)},
+					{"m_holdingLeft", offsetof(PlayerObject, m_holdingLeft), sizeof(PlayerObject::m_holdingLeft)},
+					{"m_leftPressedFirst", offsetof(PlayerObject, m_leftPressedFirst), sizeof(PlayerObject::m_leftPressedFirst)},
+					{"m_scaleXRelated", offsetof(PlayerObject, m_scaleXRelated), sizeof(PlayerObject::m_scaleXRelated)},
+					{"m_maybeHasStopped", offsetof(PlayerObject, m_maybeHasStopped), sizeof(PlayerObject::m_maybeHasStopped)},
+					{"m_xVelocityRelated", offsetof(PlayerObject, m_xVelocityRelated), sizeof(PlayerObject::m_xVelocityRelated)},
+					{"m_maybeGoingCorrectSlopeDirection", offsetof(PlayerObject, m_maybeGoingCorrectSlopeDirection), sizeof(PlayerObject::m_maybeGoingCorrectSlopeDirection)},
+					{"m_isSliding", offsetof(PlayerObject, m_isSliding), sizeof(PlayerObject::m_isSliding)},
+					{"m_maybeSlopeForce", offsetof(PlayerObject, m_maybeSlopeForce), sizeof(PlayerObject::m_maybeSlopeForce)},
+					{"m_isOnIce", offsetof(PlayerObject, m_isOnIce), sizeof(PlayerObject::m_isOnIce)},
+					{"m_physDeltaRelated", offsetof(PlayerObject, m_physDeltaRelated), sizeof(PlayerObject::m_physDeltaRelated)},
+					{"m_isOnGround4", offsetof(PlayerObject, m_isOnGround4), sizeof(PlayerObject::m_isOnGround4)},
+					{"m_maybeSlidingTime", offsetof(PlayerObject, m_maybeSlidingTime), sizeof(PlayerObject::m_maybeSlidingTime)},
+					{"m_maybeSlidingStartTime", offsetof(PlayerObject, m_maybeSlidingStartTime), sizeof(PlayerObject::m_maybeSlidingStartTime)},
+					{"m_changedDirectionsTime", offsetof(PlayerObject, m_changedDirectionsTime), sizeof(PlayerObject::m_changedDirectionsTime)},
+					{"m_slopeEndTime", offsetof(PlayerObject, m_slopeEndTime), sizeof(PlayerObject::m_slopeEndTime)},
+					{"m_isMoving", offsetof(PlayerObject, m_isMoving), sizeof(PlayerObject::m_isMoving)},
+					{"m_platformerMovingLeft", offsetof(PlayerObject, m_platformerMovingLeft), sizeof(PlayerObject::m_platformerMovingLeft)},
+					{"m_platformerMovingRight", offsetof(PlayerObject, m_platformerMovingRight), sizeof(PlayerObject::m_platformerMovingRight)},
+					{"m_isSlidingRight", offsetof(PlayerObject, m_isSlidingRight), sizeof(PlayerObject::m_isSlidingRight)},
+					{"m_maybeChangedDirectionAngle", offsetof(PlayerObject, m_maybeChangedDirectionAngle), sizeof(PlayerObject::m_maybeChangedDirectionAngle)},
+					{"m_unkUnused2", offsetof(PlayerObject, m_unkUnused2), sizeof(PlayerObject::m_unkUnused2)},
+					{"m_isPlatformer", offsetof(PlayerObject, m_isPlatformer), sizeof(PlayerObject::m_isPlatformer)},
+					{"m_stateNoAutoJump", offsetof(PlayerObject, m_stateNoAutoJump), sizeof(PlayerObject::m_stateNoAutoJump)},
+					{"m_stateDartSlide", offsetof(PlayerObject, m_stateDartSlide), sizeof(PlayerObject::m_stateDartSlide)},
+					{"m_stateHitHead", offsetof(PlayerObject, m_stateHitHead), sizeof(PlayerObject::m_stateHitHead)},
+					{"m_stateFlipGravity", offsetof(PlayerObject, m_stateFlipGravity), sizeof(PlayerObject::m_stateFlipGravity)},
+					{"m_gravityMod", offsetof(PlayerObject, m_gravityMod), sizeof(PlayerObject::m_gravityMod)},
+					{"m_stateForce", offsetof(PlayerObject, m_stateForce), sizeof(PlayerObject::m_stateForce)},
+					{"m_stateForceVector", offsetof(PlayerObject, m_stateForceVector), sizeof(PlayerObject::m_stateForceVector)},
+					{"m_affectedByForces", offsetof(PlayerObject, m_affectedByForces), sizeof(PlayerObject::m_affectedByForces)},
+					{"m_jumpPadRelated", offsetof(PlayerObject, m_jumpPadRelated), sizeof(PlayerObject::m_jumpPadRelated)},
+					{"m_lastMovedTime", offsetof(PlayerObject, m_lastMovedTime), sizeof(PlayerObject::m_lastMovedTime)},
+					{"m_playerSpeedAC", offsetof(PlayerObject, m_playerSpeedAC), sizeof(PlayerObject::m_playerSpeedAC)},
+					{"m_fixRobotJump", offsetof(PlayerObject, m_fixRobotJump), sizeof(PlayerObject::m_fixRobotJump)},
+					{"m_holdingButtons", offsetof(PlayerObject, m_holdingButtons), sizeof(PlayerObject::m_holdingButtons)},
+					{"m_inputsLocked", offsetof(PlayerObject, m_inputsLocked), sizeof(PlayerObject::m_inputsLocked)},
+					{"m_currentRobotAnimation", offsetof(PlayerObject, m_currentRobotAnimation), sizeof(PlayerObject::m_currentRobotAnimation)},
+					{"m_gv0123", offsetof(PlayerObject, m_gv0123), sizeof(PlayerObject::m_gv0123)},
+					{"m_iconRequestID", offsetof(PlayerObject, m_iconRequestID), sizeof(PlayerObject::m_iconRequestID)},
+					{"m_robotBatchNode", offsetof(PlayerObject, m_robotBatchNode), sizeof(PlayerObject::m_robotBatchNode)},
+					{"m_spiderBatchNode", offsetof(PlayerObject, m_spiderBatchNode), sizeof(PlayerObject::m_spiderBatchNode)},
+					{"m_unk958", offsetof(PlayerObject, m_unk958), sizeof(PlayerObject::m_unk958)},
+					{"m_robotFire", offsetof(PlayerObject, m_robotFire), sizeof(PlayerObject::m_robotFire)},
+					{"m_unkUnused", offsetof(PlayerObject, m_unkUnused), sizeof(PlayerObject::m_unkUnused)},
+					{"m_gameLayer", offsetof(PlayerObject, m_gameLayer), sizeof(PlayerObject::m_gameLayer)},
+					{"m_parentLayer", offsetof(PlayerObject, m_parentLayer), sizeof(PlayerObject::m_parentLayer)},
+					{"m_actionManager", offsetof(PlayerObject, m_actionManager), sizeof(PlayerObject::m_actionManager)},
+					{"m_isOutOfBounds", offsetof(PlayerObject, m_isOutOfBounds), sizeof(PlayerObject::m_isOutOfBounds)},
+					{"m_fallStartY", offsetof(PlayerObject, m_fallStartY), sizeof(PlayerObject::m_fallStartY)},
+					{"m_disablePlayerSqueeze", offsetof(PlayerObject, m_disablePlayerSqueeze), sizeof(PlayerObject::m_disablePlayerSqueeze)},
+					{"m_robotAnimation1Enabled", offsetof(PlayerObject, m_robotAnimation1Enabled), sizeof(PlayerObject::m_robotAnimation1Enabled)},
+					{"m_robotAnimation2Enabled", offsetof(PlayerObject, m_robotAnimation2Enabled), sizeof(PlayerObject::m_robotAnimation2Enabled)},
+					{"m_spiderAnimationEnabled", offsetof(PlayerObject, m_spiderAnimationEnabled), sizeof(PlayerObject::m_spiderAnimationEnabled)},
+					{"m_ignoreDamage", offsetof(PlayerObject, m_ignoreDamage), sizeof(PlayerObject::m_ignoreDamage)},
+					{"m_enable22Changes", offsetof(PlayerObject, m_enable22Changes), sizeof(PlayerObject::m_enable22Changes)},
+					{"m_enableImpulseFix", offsetof(PlayerObject, m_enableImpulseFix), sizeof(PlayerObject::m_enableImpulseFix)}
+				};
+
+				auto nearestField = [&](size_t off) -> const char* {
+					for (auto const& f : fields)
+						if (off >= f.off && off < f.off + f.size) return f.name;
+					return "";
+				};
+
+				size_t diffBytes = 0, ranges = 0;
+				std::string detail;
+				size_t i = 0;
+				while (i < st.anchorBytes.size()) {
+					if (st.anchorBytes[i] == now[i]) { i++; continue; }
+					const size_t start = i;
+					while (i < st.anchorBytes.size() && st.anchorBytes[i] != now[i]) i++;
+					diffBytes += (i - start);
+					ranges++;
+					if (ranges <= 40) {
+						log::info("    +0x{:04X}..0x{:04X} ({} bytes) {}",
+						          start, i - 1, i - start, nearestField(start));
+					}
+				}
+				log::info("Probe 4a: PlayerObject is {} bytes; {} differ across {} range(s)",
+				          sizeof(PlayerObject), diffBytes, ranges);
+				(void)detail;
+			}
+
+			if (!st.anchorLayerBytes.empty()) {
+				const auto* now = reinterpret_cast<const uint8_t*>(PlayLayer::get());
+				struct LField { const char* name; size_t off; size_t size; };
+				static const LField lfields[] = {
+					{"m_gameState", offsetof(GJBaseGameLayer, m_gameState), sizeof(GJBaseGameLayer::m_gameState)},
+					{"m_level", offsetof(GJBaseGameLayer, m_level), sizeof(GJBaseGameLayer::m_level)},
+					{"m_playbackMode", offsetof(GJBaseGameLayer, m_playbackMode), sizeof(GJBaseGameLayer::m_playbackMode)},
+					{"m_lowDetailMode", offsetof(GJBaseGameLayer, m_lowDetailMode), sizeof(GJBaseGameLayer::m_lowDetailMode)},
+					{"m_extraLDM", offsetof(GJBaseGameLayer, m_extraLDM), sizeof(GJBaseGameLayer::m_extraLDM)},
+					{"m_ignoreDamage", offsetof(GJBaseGameLayer, m_ignoreDamage), sizeof(GJBaseGameLayer::m_ignoreDamage)},
+					{"m_enable22Changes", offsetof(GJBaseGameLayer, m_enable22Changes), sizeof(GJBaseGameLayer::m_enable22Changes)},
+					{"m_allowStaticRotate", offsetof(GJBaseGameLayer, m_allowStaticRotate), sizeof(GJBaseGameLayer::m_allowStaticRotate)},
+					{"m_fixNegativeScale", offsetof(GJBaseGameLayer, m_fixNegativeScale), sizeof(GJBaseGameLayer::m_fixNegativeScale)},
+					{"m_startingFromBeginning", offsetof(GJBaseGameLayer, m_startingFromBeginning), sizeof(GJBaseGameLayer::m_startingFromBeginning)},
+					{"m_activeSfxTriggers", offsetof(GJBaseGameLayer, m_activeSfxTriggers), sizeof(GJBaseGameLayer::m_activeSfxTriggers)},
+					{"m_unk8a0", offsetof(GJBaseGameLayer, m_unk8a0), sizeof(GJBaseGameLayer::m_unk8a0)},
+					{"m_hoverNode", offsetof(GJBaseGameLayer, m_hoverNode), sizeof(GJBaseGameLayer::m_hoverNode)},
+					{"m_areaTransformNode", offsetof(GJBaseGameLayer, m_areaTransformNode), sizeof(GJBaseGameLayer::m_areaTransformNode)},
+					{"m_areaSkewNode", offsetof(GJBaseGameLayer, m_areaSkewNode), sizeof(GJBaseGameLayer::m_areaSkewNode)},
+					{"m_areaScaleNode", offsetof(GJBaseGameLayer, m_areaScaleNode), sizeof(GJBaseGameLayer::m_areaScaleNode)},
+					{"m_areaRotateNode", offsetof(GJBaseGameLayer, m_areaRotateNode), sizeof(GJBaseGameLayer::m_areaRotateNode)},
+					{"m_areaTransformNode2", offsetof(GJBaseGameLayer, m_areaTransformNode2), sizeof(GJBaseGameLayer::m_areaTransformNode2)},
+					{"m_obb2", offsetof(GJBaseGameLayer, m_obb2), sizeof(GJBaseGameLayer::m_obb2)},
+					{"m_spawnRemapTriggers", offsetof(GJBaseGameLayer, m_spawnRemapTriggers), sizeof(GJBaseGameLayer::m_spawnRemapTriggers)},
+					{"m_uiObjectPositions", offsetof(GJBaseGameLayer, m_uiObjectPositions), sizeof(GJBaseGameLayer::m_uiObjectPositions)},
+					{"m_effectManager", offsetof(GJBaseGameLayer, m_effectManager), sizeof(GJBaseGameLayer::m_effectManager)},
+					{"m_gameBlendingLayerT5", offsetof(GJBaseGameLayer, m_gameBlendingLayerT5), sizeof(GJBaseGameLayer::m_gameBlendingLayerT5)},
+					{"m_fireBlendingLayerT5", offsetof(GJBaseGameLayer, m_fireBlendingLayerT5), sizeof(GJBaseGameLayer::m_fireBlendingLayerT5)},
+					{"m_pixelBlendingLayerT5", offsetof(GJBaseGameLayer, m_pixelBlendingLayerT5), sizeof(GJBaseGameLayer::m_pixelBlendingLayerT5)},
+					{"m_particleBlendingLayerT5", offsetof(GJBaseGameLayer, m_particleBlendingLayerT5), sizeof(GJBaseGameLayer::m_particleBlendingLayerT5)},
+					{"m_game2BlendingLayerT5", offsetof(GJBaseGameLayer, m_game2BlendingLayerT5), sizeof(GJBaseGameLayer::m_game2BlendingLayerT5)},
+					{"m_gameLayerT4", offsetof(GJBaseGameLayer, m_gameLayerT4), sizeof(GJBaseGameLayer::m_gameLayerT4)},
+					{"m_gameBlendingLayerT4", offsetof(GJBaseGameLayer, m_gameBlendingLayerT4), sizeof(GJBaseGameLayer::m_gameBlendingLayerT4)},
+					{"m_glowLayerT4", offsetof(GJBaseGameLayer, m_glowLayerT4), sizeof(GJBaseGameLayer::m_glowLayerT4)},
+					{"m_specialLayerT4", offsetof(GJBaseGameLayer, m_specialLayerT4), sizeof(GJBaseGameLayer::m_specialLayerT4)},
+					{"m_textLayerT4", offsetof(GJBaseGameLayer, m_textLayerT4), sizeof(GJBaseGameLayer::m_textLayerT4)},
+					{"m_textBlendingLayerT4", offsetof(GJBaseGameLayer, m_textBlendingLayerT4), sizeof(GJBaseGameLayer::m_textBlendingLayerT4)},
+					{"m_fireLayerT4", offsetof(GJBaseGameLayer, m_fireLayerT4), sizeof(GJBaseGameLayer::m_fireLayerT4)},
+					{"m_fireBlendingLayerT4", offsetof(GJBaseGameLayer, m_fireBlendingLayerT4), sizeof(GJBaseGameLayer::m_fireBlendingLayerT4)},
+					{"m_pixelLayerT4", offsetof(GJBaseGameLayer, m_pixelLayerT4), sizeof(GJBaseGameLayer::m_pixelLayerT4)},
+					{"m_pixelBlendingLayerT4", offsetof(GJBaseGameLayer, m_pixelBlendingLayerT4), sizeof(GJBaseGameLayer::m_pixelBlendingLayerT4)},
+					{"m_particleLayerT4", offsetof(GJBaseGameLayer, m_particleLayerT4), sizeof(GJBaseGameLayer::m_particleLayerT4)},
+					{"m_particleBlendingLayerT4", offsetof(GJBaseGameLayer, m_particleBlendingLayerT4), sizeof(GJBaseGameLayer::m_particleBlendingLayerT4)},
+					{"m_game2LayerT4", offsetof(GJBaseGameLayer, m_game2LayerT4), sizeof(GJBaseGameLayer::m_game2LayerT4)},
+					{"m_game2BlendingLayerT4", offsetof(GJBaseGameLayer, m_game2BlendingLayerT4), sizeof(GJBaseGameLayer::m_game2BlendingLayerT4)},
+					{"m_gameLayerT3", offsetof(GJBaseGameLayer, m_gameLayerT3), sizeof(GJBaseGameLayer::m_gameLayerT3)},
+					{"m_gameBlendingLayerT3", offsetof(GJBaseGameLayer, m_gameBlendingLayerT3), sizeof(GJBaseGameLayer::m_gameBlendingLayerT3)},
+					{"m_glowLayerT3", offsetof(GJBaseGameLayer, m_glowLayerT3), sizeof(GJBaseGameLayer::m_glowLayerT3)},
+					{"m_specialLayerT3", offsetof(GJBaseGameLayer, m_specialLayerT3), sizeof(GJBaseGameLayer::m_specialLayerT3)},
+					{"m_textLayerT3", offsetof(GJBaseGameLayer, m_textLayerT3), sizeof(GJBaseGameLayer::m_textLayerT3)},
+					{"m_textBlendingLayerT3", offsetof(GJBaseGameLayer, m_textBlendingLayerT3), sizeof(GJBaseGameLayer::m_textBlendingLayerT3)},
+					{"m_fireLayerT3", offsetof(GJBaseGameLayer, m_fireLayerT3), sizeof(GJBaseGameLayer::m_fireLayerT3)},
+					{"m_fireBlendingLayerT3", offsetof(GJBaseGameLayer, m_fireBlendingLayerT3), sizeof(GJBaseGameLayer::m_fireBlendingLayerT3)},
+					{"m_pixelLayerT3", offsetof(GJBaseGameLayer, m_pixelLayerT3), sizeof(GJBaseGameLayer::m_pixelLayerT3)},
+					{"m_pixelBlendingLayerT3", offsetof(GJBaseGameLayer, m_pixelBlendingLayerT3), sizeof(GJBaseGameLayer::m_pixelBlendingLayerT3)},
+					{"m_particleLayerT3", offsetof(GJBaseGameLayer, m_particleLayerT3), sizeof(GJBaseGameLayer::m_particleLayerT3)},
+					{"m_particleBlendingLayerT3", offsetof(GJBaseGameLayer, m_particleBlendingLayerT3), sizeof(GJBaseGameLayer::m_particleBlendingLayerT3)},
+					{"m_game2LayerT3", offsetof(GJBaseGameLayer, m_game2LayerT3), sizeof(GJBaseGameLayer::m_game2LayerT3)},
+					{"m_game2BlendingLayerT3", offsetof(GJBaseGameLayer, m_game2BlendingLayerT3), sizeof(GJBaseGameLayer::m_game2BlendingLayerT3)},
+					{"m_gameLayerT2", offsetof(GJBaseGameLayer, m_gameLayerT2), sizeof(GJBaseGameLayer::m_gameLayerT2)},
+					{"m_gameBlendingLayerT2", offsetof(GJBaseGameLayer, m_gameBlendingLayerT2), sizeof(GJBaseGameLayer::m_gameBlendingLayerT2)},
+					{"m_glowLayerT2", offsetof(GJBaseGameLayer, m_glowLayerT2), sizeof(GJBaseGameLayer::m_glowLayerT2)},
+					{"m_specialLayerT2", offsetof(GJBaseGameLayer, m_specialLayerT2), sizeof(GJBaseGameLayer::m_specialLayerT2)},
+					{"m_textLayerT2", offsetof(GJBaseGameLayer, m_textLayerT2), sizeof(GJBaseGameLayer::m_textLayerT2)},
+					{"m_textBlendingLayerT2", offsetof(GJBaseGameLayer, m_textBlendingLayerT2), sizeof(GJBaseGameLayer::m_textBlendingLayerT2)},
+					{"m_fireLayerT2", offsetof(GJBaseGameLayer, m_fireLayerT2), sizeof(GJBaseGameLayer::m_fireLayerT2)},
+					{"m_fireBlendingLayerT2", offsetof(GJBaseGameLayer, m_fireBlendingLayerT2), sizeof(GJBaseGameLayer::m_fireBlendingLayerT2)},
+					{"m_pixelLayerT2", offsetof(GJBaseGameLayer, m_pixelLayerT2), sizeof(GJBaseGameLayer::m_pixelLayerT2)},
+					{"m_pixelBlendingLayerT2", offsetof(GJBaseGameLayer, m_pixelBlendingLayerT2), sizeof(GJBaseGameLayer::m_pixelBlendingLayerT2)},
+					{"m_particleLayerT2", offsetof(GJBaseGameLayer, m_particleLayerT2), sizeof(GJBaseGameLayer::m_particleLayerT2)},
+					{"m_particleBlendingLayerT2", offsetof(GJBaseGameLayer, m_particleBlendingLayerT2), sizeof(GJBaseGameLayer::m_particleBlendingLayerT2)},
+					{"m_game2LayerT2", offsetof(GJBaseGameLayer, m_game2LayerT2), sizeof(GJBaseGameLayer::m_game2LayerT2)},
+					{"m_game2BlendingLayerT2", offsetof(GJBaseGameLayer, m_game2BlendingLayerT2), sizeof(GJBaseGameLayer::m_game2BlendingLayerT2)},
+					{"m_gameLayerT1", offsetof(GJBaseGameLayer, m_gameLayerT1), sizeof(GJBaseGameLayer::m_gameLayerT1)},
+					{"m_gameBlendingLayerT1", offsetof(GJBaseGameLayer, m_gameBlendingLayerT1), sizeof(GJBaseGameLayer::m_gameBlendingLayerT1)},
+					{"m_glowLayerT1", offsetof(GJBaseGameLayer, m_glowLayerT1), sizeof(GJBaseGameLayer::m_glowLayerT1)},
+					{"m_specialLayerT1", offsetof(GJBaseGameLayer, m_specialLayerT1), sizeof(GJBaseGameLayer::m_specialLayerT1)},
+					{"m_textLayerT1", offsetof(GJBaseGameLayer, m_textLayerT1), sizeof(GJBaseGameLayer::m_textLayerT1)},
+					{"m_textBlendingLayerT1", offsetof(GJBaseGameLayer, m_textBlendingLayerT1), sizeof(GJBaseGameLayer::m_textBlendingLayerT1)},
+					{"m_fireLayerT1", offsetof(GJBaseGameLayer, m_fireLayerT1), sizeof(GJBaseGameLayer::m_fireLayerT1)},
+					{"m_fireBlendingLayerT1", offsetof(GJBaseGameLayer, m_fireBlendingLayerT1), sizeof(GJBaseGameLayer::m_fireBlendingLayerT1)},
+					{"m_pixelLayerT1", offsetof(GJBaseGameLayer, m_pixelLayerT1), sizeof(GJBaseGameLayer::m_pixelLayerT1)},
+					{"m_pixelBlendingLayerT1", offsetof(GJBaseGameLayer, m_pixelBlendingLayerT1), sizeof(GJBaseGameLayer::m_pixelBlendingLayerT1)},
+					{"m_particleLayerT1", offsetof(GJBaseGameLayer, m_particleLayerT1), sizeof(GJBaseGameLayer::m_particleLayerT1)},
+					{"m_particleBlendingLayerT1", offsetof(GJBaseGameLayer, m_particleBlendingLayerT1), sizeof(GJBaseGameLayer::m_particleBlendingLayerT1)},
+					{"m_game2LayerT1", offsetof(GJBaseGameLayer, m_game2LayerT1), sizeof(GJBaseGameLayer::m_game2LayerT1)},
+					{"m_game2BlendingLayerT1", offsetof(GJBaseGameLayer, m_game2BlendingLayerT1), sizeof(GJBaseGameLayer::m_game2BlendingLayerT1)},
+					{"m_game2LayerB0", offsetof(GJBaseGameLayer, m_game2LayerB0), sizeof(GJBaseGameLayer::m_game2LayerB0)},
+					{"m_gameBlendingLayerB0", offsetof(GJBaseGameLayer, m_gameBlendingLayerB0), sizeof(GJBaseGameLayer::m_gameBlendingLayerB0)},
+					{"m_fireBlendingLayerB0", offsetof(GJBaseGameLayer, m_fireBlendingLayerB0), sizeof(GJBaseGameLayer::m_fireBlendingLayerB0)},
+					{"m_pixelBlendingLayerB0", offsetof(GJBaseGameLayer, m_pixelBlendingLayerB0), sizeof(GJBaseGameLayer::m_pixelBlendingLayerB0)},
+					{"m_particleBlendingLayerB0", offsetof(GJBaseGameLayer, m_particleBlendingLayerB0), sizeof(GJBaseGameLayer::m_particleBlendingLayerB0)},
+					{"m_game2BlendingLayerB0", offsetof(GJBaseGameLayer, m_game2BlendingLayerB0), sizeof(GJBaseGameLayer::m_game2BlendingLayerB0)},
+					{"m_gameLayerB1", offsetof(GJBaseGameLayer, m_gameLayerB1), sizeof(GJBaseGameLayer::m_gameLayerB1)},
+					{"m_gameBlendingLayerB1", offsetof(GJBaseGameLayer, m_gameBlendingLayerB1), sizeof(GJBaseGameLayer::m_gameBlendingLayerB1)},
+					{"m_glowLayerB1", offsetof(GJBaseGameLayer, m_glowLayerB1), sizeof(GJBaseGameLayer::m_glowLayerB1)},
+					{"m_specialLayerB1", offsetof(GJBaseGameLayer, m_specialLayerB1), sizeof(GJBaseGameLayer::m_specialLayerB1)},
+					{"m_textLayerB1", offsetof(GJBaseGameLayer, m_textLayerB1), sizeof(GJBaseGameLayer::m_textLayerB1)},
+					{"m_textBlendingLayerB1", offsetof(GJBaseGameLayer, m_textBlendingLayerB1), sizeof(GJBaseGameLayer::m_textBlendingLayerB1)},
+					{"m_fireLayerB1", offsetof(GJBaseGameLayer, m_fireLayerB1), sizeof(GJBaseGameLayer::m_fireLayerB1)},
+					{"m_fireBlendingLayerB1", offsetof(GJBaseGameLayer, m_fireBlendingLayerB1), sizeof(GJBaseGameLayer::m_fireBlendingLayerB1)},
+					{"m_pixelLayerB1", offsetof(GJBaseGameLayer, m_pixelLayerB1), sizeof(GJBaseGameLayer::m_pixelLayerB1)},
+					{"m_pixelBlendingLayerB1", offsetof(GJBaseGameLayer, m_pixelBlendingLayerB1), sizeof(GJBaseGameLayer::m_pixelBlendingLayerB1)},
+					{"m_particleLayerB1", offsetof(GJBaseGameLayer, m_particleLayerB1), sizeof(GJBaseGameLayer::m_particleLayerB1)},
+					{"m_particleBlendingLayerB1", offsetof(GJBaseGameLayer, m_particleBlendingLayerB1), sizeof(GJBaseGameLayer::m_particleBlendingLayerB1)},
+					{"m_game2LayerB1", offsetof(GJBaseGameLayer, m_game2LayerB1), sizeof(GJBaseGameLayer::m_game2LayerB1)},
+					{"m_game2BlendingLayerB1", offsetof(GJBaseGameLayer, m_game2BlendingLayerB1), sizeof(GJBaseGameLayer::m_game2BlendingLayerB1)},
+					{"m_gameLayerB2", offsetof(GJBaseGameLayer, m_gameLayerB2), sizeof(GJBaseGameLayer::m_gameLayerB2)},
+					{"m_gameBlendingLayerB2", offsetof(GJBaseGameLayer, m_gameBlendingLayerB2), sizeof(GJBaseGameLayer::m_gameBlendingLayerB2)},
+					{"m_glowLayerB2", offsetof(GJBaseGameLayer, m_glowLayerB2), sizeof(GJBaseGameLayer::m_glowLayerB2)},
+					{"m_specialLayerB2", offsetof(GJBaseGameLayer, m_specialLayerB2), sizeof(GJBaseGameLayer::m_specialLayerB2)},
+					{"m_textLayerB2", offsetof(GJBaseGameLayer, m_textLayerB2), sizeof(GJBaseGameLayer::m_textLayerB2)},
+					{"m_textBlendingLayerB2", offsetof(GJBaseGameLayer, m_textBlendingLayerB2), sizeof(GJBaseGameLayer::m_textBlendingLayerB2)},
+					{"m_fireLayerB2", offsetof(GJBaseGameLayer, m_fireLayerB2), sizeof(GJBaseGameLayer::m_fireLayerB2)},
+					{"m_fireBlendingLayerB2", offsetof(GJBaseGameLayer, m_fireBlendingLayerB2), sizeof(GJBaseGameLayer::m_fireBlendingLayerB2)},
+					{"m_pixelLayerB2", offsetof(GJBaseGameLayer, m_pixelLayerB2), sizeof(GJBaseGameLayer::m_pixelLayerB2)},
+					{"m_pixelBlendingLayerB2", offsetof(GJBaseGameLayer, m_pixelBlendingLayerB2), sizeof(GJBaseGameLayer::m_pixelBlendingLayerB2)},
+					{"m_particleLayerB2", offsetof(GJBaseGameLayer, m_particleLayerB2), sizeof(GJBaseGameLayer::m_particleLayerB2)},
+					{"m_particleBlendingLayerB2", offsetof(GJBaseGameLayer, m_particleBlendingLayerB2), sizeof(GJBaseGameLayer::m_particleBlendingLayerB2)},
+					{"m_game2LayerB2", offsetof(GJBaseGameLayer, m_game2LayerB2), sizeof(GJBaseGameLayer::m_game2LayerB2)},
+					{"m_game2BlendingLayerB2", offsetof(GJBaseGameLayer, m_game2BlendingLayerB2), sizeof(GJBaseGameLayer::m_game2BlendingLayerB2)},
+					{"m_gameLayerB3", offsetof(GJBaseGameLayer, m_gameLayerB3), sizeof(GJBaseGameLayer::m_gameLayerB3)},
+					{"m_gameBlendingLayerB3", offsetof(GJBaseGameLayer, m_gameBlendingLayerB3), sizeof(GJBaseGameLayer::m_gameBlendingLayerB3)},
+					{"m_glowLayerB3", offsetof(GJBaseGameLayer, m_glowLayerB3), sizeof(GJBaseGameLayer::m_glowLayerB3)},
+					{"m_specialLayerB3", offsetof(GJBaseGameLayer, m_specialLayerB3), sizeof(GJBaseGameLayer::m_specialLayerB3)},
+					{"m_textLayerB3", offsetof(GJBaseGameLayer, m_textLayerB3), sizeof(GJBaseGameLayer::m_textLayerB3)},
+					{"m_textBlendingLayerB3", offsetof(GJBaseGameLayer, m_textBlendingLayerB3), sizeof(GJBaseGameLayer::m_textBlendingLayerB3)},
+					{"m_fireLayerB3", offsetof(GJBaseGameLayer, m_fireLayerB3), sizeof(GJBaseGameLayer::m_fireLayerB3)},
+					{"m_fireBlendingLayerB3", offsetof(GJBaseGameLayer, m_fireBlendingLayerB3), sizeof(GJBaseGameLayer::m_fireBlendingLayerB3)},
+					{"m_pixelLayerB3", offsetof(GJBaseGameLayer, m_pixelLayerB3), sizeof(GJBaseGameLayer::m_pixelLayerB3)},
+					{"m_pixelBlendingLayerB3", offsetof(GJBaseGameLayer, m_pixelBlendingLayerB3), sizeof(GJBaseGameLayer::m_pixelBlendingLayerB3)},
+					{"m_particleLayerB3", offsetof(GJBaseGameLayer, m_particleLayerB3), sizeof(GJBaseGameLayer::m_particleLayerB3)},
+					{"m_particleBlendingLayerB3", offsetof(GJBaseGameLayer, m_particleBlendingLayerB3), sizeof(GJBaseGameLayer::m_particleBlendingLayerB3)},
+					{"m_game2LayerB3", offsetof(GJBaseGameLayer, m_game2LayerB3), sizeof(GJBaseGameLayer::m_game2LayerB3)},
+					{"m_game2BlendingLayerB3", offsetof(GJBaseGameLayer, m_game2BlendingLayerB3), sizeof(GJBaseGameLayer::m_game2BlendingLayerB3)},
+					{"m_gameLayerB4", offsetof(GJBaseGameLayer, m_gameLayerB4), sizeof(GJBaseGameLayer::m_gameLayerB4)},
+					{"m_gameBlendingLayerB4", offsetof(GJBaseGameLayer, m_gameBlendingLayerB4), sizeof(GJBaseGameLayer::m_gameBlendingLayerB4)},
+					{"m_glowLayerB4", offsetof(GJBaseGameLayer, m_glowLayerB4), sizeof(GJBaseGameLayer::m_glowLayerB4)},
+					{"m_specialLayerB4", offsetof(GJBaseGameLayer, m_specialLayerB4), sizeof(GJBaseGameLayer::m_specialLayerB4)},
+					{"m_textLayerB4", offsetof(GJBaseGameLayer, m_textLayerB4), sizeof(GJBaseGameLayer::m_textLayerB4)},
+					{"m_textBlendingLayerB4", offsetof(GJBaseGameLayer, m_textBlendingLayerB4), sizeof(GJBaseGameLayer::m_textBlendingLayerB4)},
+					{"m_fireLayerB4", offsetof(GJBaseGameLayer, m_fireLayerB4), sizeof(GJBaseGameLayer::m_fireLayerB4)},
+					{"m_fireBlendingLayerB4", offsetof(GJBaseGameLayer, m_fireBlendingLayerB4), sizeof(GJBaseGameLayer::m_fireBlendingLayerB4)},
+					{"m_pixelLayerB4", offsetof(GJBaseGameLayer, m_pixelLayerB4), sizeof(GJBaseGameLayer::m_pixelLayerB4)},
+					{"m_pixelBlendingLayerB4", offsetof(GJBaseGameLayer, m_pixelBlendingLayerB4), sizeof(GJBaseGameLayer::m_pixelBlendingLayerB4)},
+					{"m_particleLayerB4", offsetof(GJBaseGameLayer, m_particleLayerB4), sizeof(GJBaseGameLayer::m_particleLayerB4)},
+					{"m_particleBlendingLayerB4", offsetof(GJBaseGameLayer, m_particleBlendingLayerB4), sizeof(GJBaseGameLayer::m_particleBlendingLayerB4)},
+					{"m_game2LayerB4", offsetof(GJBaseGameLayer, m_game2LayerB4), sizeof(GJBaseGameLayer::m_game2LayerB4)},
+					{"m_game2BlendingLayerB4", offsetof(GJBaseGameLayer, m_game2BlendingLayerB4), sizeof(GJBaseGameLayer::m_game2BlendingLayerB4)},
+					{"m_gameLayerB5", offsetof(GJBaseGameLayer, m_gameLayerB5), sizeof(GJBaseGameLayer::m_gameLayerB5)},
+					{"m_gameBlendingLayerB5", offsetof(GJBaseGameLayer, m_gameBlendingLayerB5), sizeof(GJBaseGameLayer::m_gameBlendingLayerB5)},
+					{"m_glowLayerB5", offsetof(GJBaseGameLayer, m_glowLayerB5), sizeof(GJBaseGameLayer::m_glowLayerB5)},
+					{"m_specialLayerB5", offsetof(GJBaseGameLayer, m_specialLayerB5), sizeof(GJBaseGameLayer::m_specialLayerB5)},
+					{"m_textLayerB5", offsetof(GJBaseGameLayer, m_textLayerB5), sizeof(GJBaseGameLayer::m_textLayerB5)},
+					{"m_textBlendingLayerB5", offsetof(GJBaseGameLayer, m_textBlendingLayerB5), sizeof(GJBaseGameLayer::m_textBlendingLayerB5)},
+					{"m_fireLayerB5", offsetof(GJBaseGameLayer, m_fireLayerB5), sizeof(GJBaseGameLayer::m_fireLayerB5)},
+					{"m_fireBlendingLayerB5", offsetof(GJBaseGameLayer, m_fireBlendingLayerB5), sizeof(GJBaseGameLayer::m_fireBlendingLayerB5)},
+					{"m_pixelLayerB5", offsetof(GJBaseGameLayer, m_pixelLayerB5), sizeof(GJBaseGameLayer::m_pixelLayerB5)},
+					{"m_pixelBlendingLayerB5", offsetof(GJBaseGameLayer, m_pixelBlendingLayerB5), sizeof(GJBaseGameLayer::m_pixelBlendingLayerB5)},
+					{"m_particleLayerB5", offsetof(GJBaseGameLayer, m_particleLayerB5), sizeof(GJBaseGameLayer::m_particleLayerB5)},
+					{"m_particleBlendingLayerB5", offsetof(GJBaseGameLayer, m_particleBlendingLayerB5), sizeof(GJBaseGameLayer::m_particleBlendingLayerB5)},
+					{"m_game2LayerB5", offsetof(GJBaseGameLayer, m_game2LayerB5), sizeof(GJBaseGameLayer::m_game2LayerB5)},
+					{"m_game2BlendingLayerB5", offsetof(GJBaseGameLayer, m_game2BlendingLayerB5), sizeof(GJBaseGameLayer::m_game2BlendingLayerB5)},
+					{"m_player1", offsetof(GJBaseGameLayer, m_player1), sizeof(GJBaseGameLayer::m_player1)},
+					{"m_player2", offsetof(GJBaseGameLayer, m_player2), sizeof(GJBaseGameLayer::m_player2)},
+					{"m_levelSettings", offsetof(GJBaseGameLayer, m_levelSettings), sizeof(GJBaseGameLayer::m_levelSettings)},
+					{"m_objects", offsetof(GJBaseGameLayer, m_objects), sizeof(GJBaseGameLayer::m_objects)},
+					{"m_collisionBlocks", offsetof(GJBaseGameLayer, m_collisionBlocks), sizeof(GJBaseGameLayer::m_collisionBlocks)},
+					{"m_spawnObjectsArray", offsetof(GJBaseGameLayer, m_spawnObjectsArray), sizeof(GJBaseGameLayer::m_spawnObjectsArray)},
+					{"m_spawnObjects", offsetof(GJBaseGameLayer, m_spawnObjects), sizeof(GJBaseGameLayer::m_spawnObjects)},
+					{"m_unkdd0", offsetof(GJBaseGameLayer, m_unkdd0), sizeof(GJBaseGameLayer::m_unkdd0)},
+					{"m_unkdd8", offsetof(GJBaseGameLayer, m_unkdd8), sizeof(GJBaseGameLayer::m_unkdd8)},
+					{"m_disabledObjects", offsetof(GJBaseGameLayer, m_disabledObjects), sizeof(GJBaseGameLayer::m_disabledObjects)},
+					{"m_unke08", offsetof(GJBaseGameLayer, m_unke08), sizeof(GJBaseGameLayer::m_unke08)},
+					{"m_areaObjects", offsetof(GJBaseGameLayer, m_areaObjects), sizeof(GJBaseGameLayer::m_areaObjects)},
+					{"m_processedAreaObjects", offsetof(GJBaseGameLayer, m_processedAreaObjects), sizeof(GJBaseGameLayer::m_processedAreaObjects)},
+					{"m_visibilityGroups", offsetof(GJBaseGameLayer, m_visibilityGroups), sizeof(GJBaseGameLayer::m_visibilityGroups)},
+					{"m_visibleObjects", offsetof(GJBaseGameLayer, m_visibleObjects), sizeof(GJBaseGameLayer::m_visibleObjects)},
+					{"m_visibleObjectsCount", offsetof(GJBaseGameLayer, m_visibleObjectsCount), sizeof(GJBaseGameLayer::m_visibleObjectsCount)},
+					{"m_visibleObjectsIndex", offsetof(GJBaseGameLayer, m_visibleObjectsIndex), sizeof(GJBaseGameLayer::m_visibleObjectsIndex)},
+					{"m_visibleObjects2", offsetof(GJBaseGameLayer, m_visibleObjects2), sizeof(GJBaseGameLayer::m_visibleObjects2)},
+					{"m_visibleObjects2Count", offsetof(GJBaseGameLayer, m_visibleObjects2Count), sizeof(GJBaseGameLayer::m_visibleObjects2Count)},
+					{"m_visibleObjects2Index", offsetof(GJBaseGameLayer, m_visibleObjects2Index), sizeof(GJBaseGameLayer::m_visibleObjects2Index)},
+					{"m_unked0", offsetof(GJBaseGameLayer, m_unked0), sizeof(GJBaseGameLayer::m_unked0)},
+					{"m_disabledObjectsCount", offsetof(GJBaseGameLayer, m_disabledObjectsCount), sizeof(GJBaseGameLayer::m_disabledObjectsCount)},
+					{"m_unked8", offsetof(GJBaseGameLayer, m_unked8), sizeof(GJBaseGameLayer::m_unked8)},
+					{"m_areaObjectsCount", offsetof(GJBaseGameLayer, m_areaObjectsCount), sizeof(GJBaseGameLayer::m_areaObjectsCount)},
+					{"m_processedAreaObjectsCount", offsetof(GJBaseGameLayer, m_processedAreaObjectsCount), sizeof(GJBaseGameLayer::m_processedAreaObjectsCount)},
+					{"m_unkee4", offsetof(GJBaseGameLayer, m_unkee4), sizeof(GJBaseGameLayer::m_unkee4)},
+					{"m_disabledObjectsIndex", offsetof(GJBaseGameLayer, m_disabledObjectsIndex), sizeof(GJBaseGameLayer::m_disabledObjectsIndex)},
+					{"m_unkeec", offsetof(GJBaseGameLayer, m_unkeec), sizeof(GJBaseGameLayer::m_unkeec)},
+					{"m_areaObjectsIndex", offsetof(GJBaseGameLayer, m_areaObjectsIndex), sizeof(GJBaseGameLayer::m_areaObjectsIndex)},
+					{"m_processedAreaObjectsIndex", offsetof(GJBaseGameLayer, m_processedAreaObjectsIndex), sizeof(GJBaseGameLayer::m_processedAreaObjectsIndex)},
+					{"m_groupDict", offsetof(GJBaseGameLayer, m_groupDict), sizeof(GJBaseGameLayer::m_groupDict)},
+					{"m_staticGroupDict", offsetof(GJBaseGameLayer, m_staticGroupDict), sizeof(GJBaseGameLayer::m_staticGroupDict)},
+					{"m_optimizedGroupDict", offsetof(GJBaseGameLayer, m_optimizedGroupDict), sizeof(GJBaseGameLayer::m_optimizedGroupDict)},
+					{"m_groups", offsetof(GJBaseGameLayer, m_groups), sizeof(GJBaseGameLayer::m_groups)},
+					{"m_staticGroups", offsetof(GJBaseGameLayer, m_staticGroups), sizeof(GJBaseGameLayer::m_staticGroups)},
+					{"m_optimizedGroups", offsetof(GJBaseGameLayer, m_optimizedGroups), sizeof(GJBaseGameLayer::m_optimizedGroups)},
+					{"m_parentGroupsDict", offsetof(GJBaseGameLayer, m_parentGroupsDict), sizeof(GJBaseGameLayer::m_parentGroupsDict)},
+					{"m_parentGroupIDs", offsetof(GJBaseGameLayer, m_parentGroupIDs), sizeof(GJBaseGameLayer::m_parentGroupIDs)},
+					{"m_removedParentGroupIDs", offsetof(GJBaseGameLayer, m_removedParentGroupIDs), sizeof(GJBaseGameLayer::m_removedParentGroupIDs)},
+					{"m_targetGroupsArray", offsetof(GJBaseGameLayer, m_targetGroupsArray), sizeof(GJBaseGameLayer::m_targetGroupsArray)},
+					{"m_targetGroups", offsetof(GJBaseGameLayer, m_targetGroups), sizeof(GJBaseGameLayer::m_targetGroups)},
+					{"m_linkedGroupDict", offsetof(GJBaseGameLayer, m_linkedGroupDict), sizeof(GJBaseGameLayer::m_linkedGroupDict)},
+					{"m_lastUsedLinkedID", offsetof(GJBaseGameLayer, m_lastUsedLinkedID), sizeof(GJBaseGameLayer::m_lastUsedLinkedID)},
+					{"m_objectParent", offsetof(GJBaseGameLayer, m_objectParent), sizeof(GJBaseGameLayer::m_objectParent)},
+					{"m_inShaderParent", offsetof(GJBaseGameLayer, m_inShaderParent), sizeof(GJBaseGameLayer::m_inShaderParent)},
+					{"m_aboveShaderParent", offsetof(GJBaseGameLayer, m_aboveShaderParent), sizeof(GJBaseGameLayer::m_aboveShaderParent)},
+					{"m_objectLayer", offsetof(GJBaseGameLayer, m_objectLayer), sizeof(GJBaseGameLayer::m_objectLayer)},
+					{"m_inShaderObjectLayer", offsetof(GJBaseGameLayer, m_inShaderObjectLayer), sizeof(GJBaseGameLayer::m_inShaderObjectLayer)},
+					{"m_aboveShaderObjectLayer", offsetof(GJBaseGameLayer, m_aboveShaderObjectLayer), sizeof(GJBaseGameLayer::m_aboveShaderObjectLayer)},
+					{"m_background", offsetof(GJBaseGameLayer, m_background), sizeof(GJBaseGameLayer::m_background)},
+					{"m_unk1000", offsetof(GJBaseGameLayer, m_unk1000), sizeof(GJBaseGameLayer::m_unk1000)},
+					{"m_groundLayer", offsetof(GJBaseGameLayer, m_groundLayer), sizeof(GJBaseGameLayer::m_groundLayer)},
+					{"m_groundLayer2", offsetof(GJBaseGameLayer, m_groundLayer2), sizeof(GJBaseGameLayer::m_groundLayer2)},
+					{"m_middleground", offsetof(GJBaseGameLayer, m_middleground), sizeof(GJBaseGameLayer::m_middleground)},
+					{"m_batchNodes", offsetof(GJBaseGameLayer, m_batchNodes), sizeof(GJBaseGameLayer::m_batchNodes)},
+					{"m_objectsToDeactivate", offsetof(GJBaseGameLayer, m_objectsToDeactivate), sizeof(GJBaseGameLayer::m_objectsToDeactivate)},
+					{"m_labelObjects", offsetof(GJBaseGameLayer, m_labelObjects), sizeof(GJBaseGameLayer::m_labelObjects)},
+					{"m_timeLabelObjects", offsetof(GJBaseGameLayer, m_timeLabelObjects), sizeof(GJBaseGameLayer::m_timeLabelObjects)},
+					{"m_spawnTuples", offsetof(GJBaseGameLayer, m_spawnTuples), sizeof(GJBaseGameLayer::m_spawnTuples)},
+					{"m_increasedLayerCapacity", offsetof(GJBaseGameLayer, m_increasedLayerCapacity), sizeof(GJBaseGameLayer::m_increasedLayerCapacity)},
+					{"m_varianceValues", offsetof(GJBaseGameLayer, m_varianceValues), sizeof(GJBaseGameLayer::m_varianceValues)},
+					{"m_destroyObjectValues", offsetof(GJBaseGameLayer, m_destroyObjectValues), sizeof(GJBaseGameLayer::m_destroyObjectValues)},
+					{"m_enterEasingValues", offsetof(GJBaseGameLayer, m_enterEasingValues), sizeof(GJBaseGameLayer::m_enterEasingValues)},
+					{"m_enterEasingIndices", offsetof(GJBaseGameLayer, m_enterEasingIndices), sizeof(GJBaseGameLayer::m_enterEasingIndices)},
+					{"m_enterEasingValuesIndex", offsetof(GJBaseGameLayer, m_enterEasingValuesIndex), sizeof(GJBaseGameLayer::m_enterEasingValuesIndex)},
+					{"m_dualTouchTrigger", offsetof(GJBaseGameLayer, m_dualTouchTrigger), sizeof(GJBaseGameLayer::m_dualTouchTrigger)},
+					{"m_clicks", offsetof(GJBaseGameLayer, m_clicks), sizeof(GJBaseGameLayer::m_clicks)},
+					{"m_attempts", offsetof(GJBaseGameLayer, m_attempts), sizeof(GJBaseGameLayer::m_attempts)},
+					{"m_jumping", offsetof(GJBaseGameLayer, m_jumping), sizeof(GJBaseGameLayer::m_jumping)},
+					{"m_leftSectionIndex", offsetof(GJBaseGameLayer, m_leftSectionIndex), sizeof(GJBaseGameLayer::m_leftSectionIndex)},
+					{"m_rightSectionIndex", offsetof(GJBaseGameLayer, m_rightSectionIndex), sizeof(GJBaseGameLayer::m_rightSectionIndex)},
+					{"m_bottomSectionIndex", offsetof(GJBaseGameLayer, m_bottomSectionIndex), sizeof(GJBaseGameLayer::m_bottomSectionIndex)},
+					{"m_topSectionIndex", offsetof(GJBaseGameLayer, m_topSectionIndex), sizeof(GJBaseGameLayer::m_topSectionIndex)},
+					{"m_isEditor", offsetof(GJBaseGameLayer, m_isEditor), sizeof(GJBaseGameLayer::m_isEditor)},
+					{"m_blending", offsetof(GJBaseGameLayer, m_blending), sizeof(GJBaseGameLayer::m_blending)},
+					{"m_isPlatformer", offsetof(GJBaseGameLayer, m_isPlatformer), sizeof(GJBaseGameLayer::m_isPlatformer)},
+					{"m_player1CollisionBlock", offsetof(GJBaseGameLayer, m_player1CollisionBlock), sizeof(GJBaseGameLayer::m_player1CollisionBlock)},
+					{"m_player2CollisionBlock", offsetof(GJBaseGameLayer, m_player2CollisionBlock), sizeof(GJBaseGameLayer::m_player2CollisionBlock)},
+					{"m_particleCount", offsetof(GJBaseGameLayer, m_particleCount), sizeof(GJBaseGameLayer::m_particleCount)},
+					{"m_customParticleCount", offsetof(GJBaseGameLayer, m_customParticleCount), sizeof(GJBaseGameLayer::m_customParticleCount)},
+					{"m_particleSystemLimit", offsetof(GJBaseGameLayer, m_particleSystemLimit), sizeof(GJBaseGameLayer::m_particleSystemLimit)},
+					{"m_particlesDict", offsetof(GJBaseGameLayer, m_particlesDict), sizeof(GJBaseGameLayer::m_particlesDict)},
+					{"m_customParticles", offsetof(GJBaseGameLayer, m_customParticles), sizeof(GJBaseGameLayer::m_customParticles)},
+					{"m_unclaimedParticles", offsetof(GJBaseGameLayer, m_unclaimedParticles), sizeof(GJBaseGameLayer::m_unclaimedParticles)},
+					{"m_particleCountToParticleString", offsetof(GJBaseGameLayer, m_particleCountToParticleString), sizeof(GJBaseGameLayer::m_particleCountToParticleString)},
+					{"m_claimedParticles", offsetof(GJBaseGameLayer, m_claimedParticles), sizeof(GJBaseGameLayer::m_claimedParticles)},
+					{"m_temporaryParticles", offsetof(GJBaseGameLayer, m_temporaryParticles), sizeof(GJBaseGameLayer::m_temporaryParticles)},
+					{"m_customParticlesUIDs", offsetof(GJBaseGameLayer, m_customParticlesUIDs), sizeof(GJBaseGameLayer::m_customParticlesUIDs)},
+					{"m_gradientLayers", offsetof(GJBaseGameLayer, m_gradientLayers), sizeof(GJBaseGameLayer::m_gradientLayers)},
+					{"m_activeGradients", offsetof(GJBaseGameLayer, m_activeGradients), sizeof(GJBaseGameLayer::m_activeGradients)},
+					{"m_shaderLayer", offsetof(GJBaseGameLayer, m_shaderLayer), sizeof(GJBaseGameLayer::m_shaderLayer)},
+					{"m_objectsDeactivated", offsetof(GJBaseGameLayer, m_objectsDeactivated), sizeof(GJBaseGameLayer::m_objectsDeactivated)},
+					{"m_areaObjectsUpdated", offsetof(GJBaseGameLayer, m_areaObjectsUpdated), sizeof(GJBaseGameLayer::m_areaObjectsUpdated)},
+					{"m_startPosObject", offsetof(GJBaseGameLayer, m_startPosObject), sizeof(GJBaseGameLayer::m_startPosObject)},
+					{"m_useReplay", offsetof(GJBaseGameLayer, m_useReplay), sizeof(GJBaseGameLayer::m_useReplay)},
+					{"m_unk3189", offsetof(GJBaseGameLayer, m_unk3189), sizeof(GJBaseGameLayer::m_unk3189)},
+					{"m_solidCollisionObjectsCount", offsetof(GJBaseGameLayer, m_solidCollisionObjectsCount), sizeof(GJBaseGameLayer::m_solidCollisionObjectsCount)},
+					{"m_solidCollisionObjectsIndex", offsetof(GJBaseGameLayer, m_solidCollisionObjectsIndex), sizeof(GJBaseGameLayer::m_solidCollisionObjectsIndex)},
+					{"m_solidCollisionObjects", offsetof(GJBaseGameLayer, m_solidCollisionObjects), sizeof(GJBaseGameLayer::m_solidCollisionObjects)},
+					{"m_hazardCollisionObjectsCount", offsetof(GJBaseGameLayer, m_hazardCollisionObjectsCount), sizeof(GJBaseGameLayer::m_hazardCollisionObjectsCount)},
+					{"m_hazardCollisionObjectsIndex", offsetof(GJBaseGameLayer, m_hazardCollisionObjectsIndex), sizeof(GJBaseGameLayer::m_hazardCollisionObjectsIndex)},
+					{"m_hazardCollisionObjects", offsetof(GJBaseGameLayer, m_hazardCollisionObjects), sizeof(GJBaseGameLayer::m_hazardCollisionObjects)},
+					{"m_sequenceTriggers", offsetof(GJBaseGameLayer, m_sequenceTriggers), sizeof(GJBaseGameLayer::m_sequenceTriggers)},
+					{"m_isPracticeMode", offsetof(GJBaseGameLayer, m_isPracticeMode), sizeof(GJBaseGameLayer::m_isPracticeMode)},
+					{"m_practiceMusicSync", offsetof(GJBaseGameLayer, m_practiceMusicSync), sizeof(GJBaseGameLayer::m_practiceMusicSync)},
+					{"m_loadingProgress", offsetof(GJBaseGameLayer, m_loadingProgress), sizeof(GJBaseGameLayer::m_loadingProgress)},
+					{"m_flashNode", offsetof(GJBaseGameLayer, m_flashNode), sizeof(GJBaseGameLayer::m_flashNode)},
+					{"m_unk31f8", offsetof(GJBaseGameLayer, m_unk31f8), sizeof(GJBaseGameLayer::m_unk31f8)},
+					{"m_cameraFlip", offsetof(GJBaseGameLayer, m_cameraFlip), sizeof(GJBaseGameLayer::m_cameraFlip)},
+					{"m_cameraWidthOffset", offsetof(GJBaseGameLayer, m_cameraWidthOffset), sizeof(GJBaseGameLayer::m_cameraWidthOffset)},
+					{"m_cameraHeightOffset", offsetof(GJBaseGameLayer, m_cameraHeightOffset), sizeof(GJBaseGameLayer::m_cameraHeightOffset)},
+					{"m_updateGroundShadows", offsetof(GJBaseGameLayer, m_updateGroundShadows), sizeof(GJBaseGameLayer::m_updateGroundShadows)},
+					{"m_collectedItems", offsetof(GJBaseGameLayer, m_collectedItems), sizeof(GJBaseGameLayer::m_collectedItems)},
+					{"m_levelLength", offsetof(GJBaseGameLayer, m_levelLength), sizeof(GJBaseGameLayer::m_levelLength)},
+					{"m_resetActiveObjects", offsetof(GJBaseGameLayer, m_resetActiveObjects), sizeof(GJBaseGameLayer::m_resetActiveObjects)},
+					{"m_skipArtReload", offsetof(GJBaseGameLayer, m_skipArtReload), sizeof(GJBaseGameLayer::m_skipArtReload)},
+					{"m_endPortal", offsetof(GJBaseGameLayer, m_endPortal), sizeof(GJBaseGameLayer::m_endPortal)},
+					{"m_isTestMode", offsetof(GJBaseGameLayer, m_isTestMode), sizeof(GJBaseGameLayer::m_isTestMode)},
+					{"m_freezeStartCamera", offsetof(GJBaseGameLayer, m_freezeStartCamera), sizeof(GJBaseGameLayer::m_freezeStartCamera)},
+					{"m_unk322a", offsetof(GJBaseGameLayer, m_unk322a), sizeof(GJBaseGameLayer::m_unk322a)},
+					{"m_cameraUnzoomedHeightOffset", offsetof(GJBaseGameLayer, m_cameraUnzoomedHeightOffset), sizeof(GJBaseGameLayer::m_cameraUnzoomedHeightOffset)},
+					{"m_targetCameraHeightOffset", offsetof(GJBaseGameLayer, m_targetCameraHeightOffset), sizeof(GJBaseGameLayer::m_targetCameraHeightOffset)},
+					{"m_calculateTargetHeightOffset", offsetof(GJBaseGameLayer, m_calculateTargetHeightOffset), sizeof(GJBaseGameLayer::m_calculateTargetHeightOffset)},
+					{"m_glitterParticles", offsetof(GJBaseGameLayer, m_glitterParticles), sizeof(GJBaseGameLayer::m_glitterParticles)},
+					{"m_staticCameraShake", offsetof(GJBaseGameLayer, m_staticCameraShake), sizeof(GJBaseGameLayer::m_staticCameraShake)},
+					{"m_skipCameraShake", offsetof(GJBaseGameLayer, m_skipCameraShake), sizeof(GJBaseGameLayer::m_skipCameraShake)},
+					{"m_playerDied", offsetof(GJBaseGameLayer, m_playerDied), sizeof(GJBaseGameLayer::m_playerDied)},
+					{"m_extraDelta", offsetof(GJBaseGameLayer, m_extraDelta), sizeof(GJBaseGameLayer::m_extraDelta)},
+					{"m_started", offsetof(GJBaseGameLayer, m_started), sizeof(GJBaseGameLayer::m_started)},
+					{"m_unk3251", offsetof(GJBaseGameLayer, m_unk3251), sizeof(GJBaseGameLayer::m_unk3251)},
+					{"m_cameraWidth", offsetof(GJBaseGameLayer, m_cameraWidth), sizeof(GJBaseGameLayer::m_cameraWidth)},
+					{"m_cameraHeight", offsetof(GJBaseGameLayer, m_cameraHeight), sizeof(GJBaseGameLayer::m_cameraHeight)},
+					{"m_cameraUnzoomedX", offsetof(GJBaseGameLayer, m_cameraUnzoomedX), sizeof(GJBaseGameLayer::m_cameraUnzoomedX)},
+					{"m_halfCameraWidth", offsetof(GJBaseGameLayer, m_halfCameraWidth), sizeof(GJBaseGameLayer::m_halfCameraWidth)},
+					{"m_audioEffectsLayer", offsetof(GJBaseGameLayer, m_audioEffectsLayer), sizeof(GJBaseGameLayer::m_audioEffectsLayer)},
+					{"m_cameraObb2", offsetof(GJBaseGameLayer, m_cameraObb2), sizeof(GJBaseGameLayer::m_cameraObb2)},
+					{"m_activeObjects", offsetof(GJBaseGameLayer, m_activeObjects), sizeof(GJBaseGameLayer::m_activeObjects)},
+					{"m_activeObjectsCount", offsetof(GJBaseGameLayer, m_activeObjectsCount), sizeof(GJBaseGameLayer::m_activeObjectsCount)},
+					{"m_activeObjectsIndex", offsetof(GJBaseGameLayer, m_activeObjectsIndex), sizeof(GJBaseGameLayer::m_activeObjectsIndex)},
+					{"m_lightBGColor", offsetof(GJBaseGameLayer, m_lightBGColor), sizeof(GJBaseGameLayer::m_lightBGColor)},
+					{"m_resumeTimer", offsetof(GJBaseGameLayer, m_resumeTimer), sizeof(GJBaseGameLayer::m_resumeTimer)},
+					{"m_recordInputs", offsetof(GJBaseGameLayer, m_recordInputs), sizeof(GJBaseGameLayer::m_recordInputs)},
+					{"m_unk32a1", offsetof(GJBaseGameLayer, m_unk32a1), sizeof(GJBaseGameLayer::m_unk32a1)},
+					{"m_unk32a2", offsetof(GJBaseGameLayer, m_unk32a2), sizeof(GJBaseGameLayer::m_unk32a2)},
+					{"m_unk32a3", offsetof(GJBaseGameLayer, m_unk32a3), sizeof(GJBaseGameLayer::m_unk32a3)},
+					{"m_unk32a4", offsetof(GJBaseGameLayer, m_unk32a4), sizeof(GJBaseGameLayer::m_unk32a4)},
+					{"m_recordString", offsetof(GJBaseGameLayer, m_recordString), sizeof(GJBaseGameLayer::m_recordString)},
+					{"m_unk32c8", offsetof(GJBaseGameLayer, m_unk32c8), sizeof(GJBaseGameLayer::m_unk32c8)},
+					{"m_unk32d0", offsetof(GJBaseGameLayer, m_unk32d0), sizeof(GJBaseGameLayer::m_unk32d0)},
+					{"m_unk32d4", offsetof(GJBaseGameLayer, m_unk32d4), sizeof(GJBaseGameLayer::m_unk32d4)},
+					{"m_randomSeed", offsetof(GJBaseGameLayer, m_randomSeed), sizeof(GJBaseGameLayer::m_randomSeed)},
+					{"m_unk32e0", offsetof(GJBaseGameLayer, m_unk32e0), sizeof(GJBaseGameLayer::m_unk32e0)},
+					{"m_replayRandSeed", offsetof(GJBaseGameLayer, m_replayRandSeed), sizeof(GJBaseGameLayer::m_replayRandSeed)},
+					{"m_unk32ec", offsetof(GJBaseGameLayer, m_unk32ec), sizeof(GJBaseGameLayer::m_unk32ec)},
+					{"m_currentStep", offsetof(GJBaseGameLayer, m_currentStep), sizeof(GJBaseGameLayer::m_currentStep)},
+					{"m_queuedButtons", offsetof(GJBaseGameLayer, m_queuedButtons), sizeof(GJBaseGameLayer::m_queuedButtons)},
+					{"m_queuedRecordedButtons", offsetof(GJBaseGameLayer, m_queuedRecordedButtons), sizeof(GJBaseGameLayer::m_queuedRecordedButtons)},
+					{"m_unk3330", offsetof(GJBaseGameLayer, m_unk3330), sizeof(GJBaseGameLayer::m_unk3330)},
+					{"m_unk3370", offsetof(GJBaseGameLayer, m_unk3370), sizeof(GJBaseGameLayer::m_unk3370)},
+					{"m_queuedReplayButtons", offsetof(GJBaseGameLayer, m_queuedReplayButtons), sizeof(GJBaseGameLayer::m_queuedReplayButtons)},
+					{"m_unk3390", offsetof(GJBaseGameLayer, m_unk3390), sizeof(GJBaseGameLayer::m_unk3390)},
+					{"m_unk3340", offsetof(GJBaseGameLayer, m_unk3340), sizeof(GJBaseGameLayer::m_unk3340)},
+					{"m_unk3358", offsetof(GJBaseGameLayer, m_unk3358), sizeof(GJBaseGameLayer::m_unk3358)},
+					{"m_queuedRecordedButtonsSize", offsetof(GJBaseGameLayer, m_queuedRecordedButtonsSize), sizeof(GJBaseGameLayer::m_queuedRecordedButtonsSize)},
+					{"m_persistentStateString", offsetof(GJBaseGameLayer, m_persistentStateString), sizeof(GJBaseGameLayer::m_persistentStateString)},
+					{"m_savedPersistentStateString", offsetof(GJBaseGameLayer, m_savedPersistentStateString), sizeof(GJBaseGameLayer::m_savedPersistentStateString)},
+					{"m_savedAttempts", offsetof(GJBaseGameLayer, m_savedAttempts), sizeof(GJBaseGameLayer::m_savedAttempts)},
+					{"m_portalIndicators", offsetof(GJBaseGameLayer, m_portalIndicators), sizeof(GJBaseGameLayer::m_portalIndicators)},
+					{"m_orbIndicators", offsetof(GJBaseGameLayer, m_orbIndicators), sizeof(GJBaseGameLayer::m_orbIndicators)},
+					{"m_indicatorSprites", offsetof(GJBaseGameLayer, m_indicatorSprites), sizeof(GJBaseGameLayer::m_indicatorSprites)},
+					{"m_unk3380", offsetof(GJBaseGameLayer, m_unk3380), sizeof(GJBaseGameLayer::m_unk3380)},
+					{"m_unk3388", offsetof(GJBaseGameLayer, m_unk3388), sizeof(GJBaseGameLayer::m_unk3388)},
+					{"m_unk33a0", offsetof(GJBaseGameLayer, m_unk33a0), sizeof(GJBaseGameLayer::m_unk33a0)},
+					{"m_hideGround", offsetof(GJBaseGameLayer, m_hideGround), sizeof(GJBaseGameLayer::m_hideGround)},
+					{"m_unk33c0", offsetof(GJBaseGameLayer, m_unk33c0), sizeof(GJBaseGameLayer::m_unk33c0)},
+					{"m_objectsToMove", offsetof(GJBaseGameLayer, m_objectsToMove), sizeof(GJBaseGameLayer::m_objectsToMove)},
+					{"m_savePositionObjects", offsetof(GJBaseGameLayer, m_savePositionObjects), sizeof(GJBaseGameLayer::m_savePositionObjects)},
+					{"m_savePositionValues", offsetof(GJBaseGameLayer, m_savePositionValues), sizeof(GJBaseGameLayer::m_savePositionValues)},
+					{"m_keepGroupParents", offsetof(GJBaseGameLayer, m_keepGroupParents), sizeof(GJBaseGameLayer::m_keepGroupParents)},
+					{"m_keyframeGroups", offsetof(GJBaseGameLayer, m_keyframeGroups), sizeof(GJBaseGameLayer::m_keyframeGroups)},
+					{"m_keyframeGroup", offsetof(GJBaseGameLayer, m_keyframeGroup), sizeof(GJBaseGameLayer::m_keyframeGroup)},
+					{"m_uiLayer", offsetof(GJBaseGameLayer, m_uiLayer), sizeof(GJBaseGameLayer::m_uiLayer)},
+					{"m_uiObjects", offsetof(GJBaseGameLayer, m_uiObjects), sizeof(GJBaseGameLayer::m_uiObjects)},
+					{"m_uiObjectLayers", offsetof(GJBaseGameLayer, m_uiObjectLayers), sizeof(GJBaseGameLayer::m_uiObjectLayers)},
+					{"m_uiTriggerUI", offsetof(GJBaseGameLayer, m_uiTriggerUI), sizeof(GJBaseGameLayer::m_uiTriggerUI)},
+					{"m_timePlayed", offsetof(GJBaseGameLayer, m_timePlayed), sizeof(GJBaseGameLayer::m_timePlayed)},
+					{"m_tickIndex", offsetof(GJBaseGameLayer, m_tickIndex), sizeof(GJBaseGameLayer::m_tickIndex)},
+					{"m_clickIndex", offsetof(GJBaseGameLayer, m_clickIndex), sizeof(GJBaseGameLayer::m_clickIndex)},
+					{"m_levelEndAnimationStarted", offsetof(GJBaseGameLayer, m_levelEndAnimationStarted), sizeof(GJBaseGameLayer::m_levelEndAnimationStarted)},
+					{"m_points", offsetof(GJBaseGameLayer, m_points), sizeof(GJBaseGameLayer::m_points)},
+					{"m_pointsString", offsetof(GJBaseGameLayer, m_pointsString), sizeof(GJBaseGameLayer::m_pointsString)},
+					{"m_sections", offsetof(GJBaseGameLayer, m_sections), sizeof(GJBaseGameLayer::m_sections)},
+					{"m_nonEffectObjects", offsetof(GJBaseGameLayer, m_nonEffectObjects), sizeof(GJBaseGameLayer::m_nonEffectObjects)},
+					{"m_collisionBlockSections", offsetof(GJBaseGameLayer, m_collisionBlockSections), sizeof(GJBaseGameLayer::m_collisionBlockSections)},
+					{"m_calcNonEffectObjects", offsetof(GJBaseGameLayer, m_calcNonEffectObjects), sizeof(GJBaseGameLayer::m_calcNonEffectObjects)},
+					{"m_calcNonEffectObjectsSize", offsetof(GJBaseGameLayer, m_calcNonEffectObjectsSize), sizeof(GJBaseGameLayer::m_calcNonEffectObjectsSize)},
+					{"m_calcCollisionBlockObjects", offsetof(GJBaseGameLayer, m_calcCollisionBlockObjects), sizeof(GJBaseGameLayer::m_calcCollisionBlockObjects)},
+					{"m_calcCollisionBlockObjectsSize", offsetof(GJBaseGameLayer, m_calcCollisionBlockObjectsSize), sizeof(GJBaseGameLayer::m_calcCollisionBlockObjectsSize)},
+					{"m_calcCollisionBlockObjects2", offsetof(GJBaseGameLayer, m_calcCollisionBlockObjects2), sizeof(GJBaseGameLayer::m_calcCollisionBlockObjects2)},
+					{"m_calcCollisionBlockObjects2Size", offsetof(GJBaseGameLayer, m_calcCollisionBlockObjects2Size), sizeof(GJBaseGameLayer::m_calcCollisionBlockObjects2Size)},
+					{"m_sectionSizes", offsetof(GJBaseGameLayer, m_sectionSizes), sizeof(GJBaseGameLayer::m_sectionSizes)},
+					{"m_nonEffectObjectsSizes", offsetof(GJBaseGameLayer, m_nonEffectObjectsSizes), sizeof(GJBaseGameLayer::m_nonEffectObjectsSizes)},
+					{"m_collisionBlockSectionSizes", offsetof(GJBaseGameLayer, m_collisionBlockSectionSizes), sizeof(GJBaseGameLayer::m_collisionBlockSectionSizes)},
+					{"m_nonEffectObjectsFlags", offsetof(GJBaseGameLayer, m_nonEffectObjectsFlags), sizeof(GJBaseGameLayer::m_nonEffectObjectsFlags)},
+					{"m_sectionXFactor", offsetof(GJBaseGameLayer, m_sectionXFactor), sizeof(GJBaseGameLayer::m_sectionXFactor)},
+					{"m_sectionYFactor", offsetof(GJBaseGameLayer, m_sectionYFactor), sizeof(GJBaseGameLayer::m_sectionYFactor)},
+					{"m_maxGameplayY", offsetof(GJBaseGameLayer, m_maxGameplayY), sizeof(GJBaseGameLayer::m_maxGameplayY)},
+					{"m_songTriggerInterval", offsetof(GJBaseGameLayer, m_songTriggerInterval), sizeof(GJBaseGameLayer::m_songTriggerInterval)},
+					{"m_stickyGroups", offsetof(GJBaseGameLayer, m_stickyGroups), sizeof(GJBaseGameLayer::m_stickyGroups)},
+					{"m_audioVisualizerBG", offsetof(GJBaseGameLayer, m_audioVisualizerBG), sizeof(GJBaseGameLayer::m_audioVisualizerBG)},
+					{"m_audioVisualizerSFX", offsetof(GJBaseGameLayer, m_audioVisualizerSFX), sizeof(GJBaseGameLayer::m_audioVisualizerSFX)},
+					{"m_showAudioVisualizer", offsetof(GJBaseGameLayer, m_showAudioVisualizer), sizeof(GJBaseGameLayer::m_showAudioVisualizer)},
+					{"m_areaMovedCount", offsetof(GJBaseGameLayer, m_areaMovedCount), sizeof(GJBaseGameLayer::m_areaMovedCount)},
+					{"m_areaScaledCount", offsetof(GJBaseGameLayer, m_areaScaledCount), sizeof(GJBaseGameLayer::m_areaScaledCount)},
+					{"m_areaRotatedCount", offsetof(GJBaseGameLayer, m_areaRotatedCount), sizeof(GJBaseGameLayer::m_areaRotatedCount)},
+					{"m_areaColorCount", offsetof(GJBaseGameLayer, m_areaColorCount), sizeof(GJBaseGameLayer::m_areaColorCount)},
+					{"m_areaMovedCountTotal", offsetof(GJBaseGameLayer, m_areaMovedCountTotal), sizeof(GJBaseGameLayer::m_areaMovedCountTotal)},
+					{"m_areaScaledCountTotal", offsetof(GJBaseGameLayer, m_areaScaledCountTotal), sizeof(GJBaseGameLayer::m_areaScaledCountTotal)},
+					{"m_areaRotatedCountTotal", offsetof(GJBaseGameLayer, m_areaRotatedCountTotal), sizeof(GJBaseGameLayer::m_areaRotatedCountTotal)},
+					{"m_areaColorCountTotal", offsetof(GJBaseGameLayer, m_areaColorCountTotal), sizeof(GJBaseGameLayer::m_areaColorCountTotal)},
+					{"m_movedCount", offsetof(GJBaseGameLayer, m_movedCount), sizeof(GJBaseGameLayer::m_movedCount)},
+					{"m_scaledCount", offsetof(GJBaseGameLayer, m_scaledCount), sizeof(GJBaseGameLayer::m_scaledCount)},
+					{"m_rotatedCount", offsetof(GJBaseGameLayer, m_rotatedCount), sizeof(GJBaseGameLayer::m_rotatedCount)},
+					{"m_followedCount", offsetof(GJBaseGameLayer, m_followedCount), sizeof(GJBaseGameLayer::m_followedCount)},
+					{"m_areaMovedCountDisplay", offsetof(GJBaseGameLayer, m_areaMovedCountDisplay), sizeof(GJBaseGameLayer::m_areaMovedCountDisplay)},
+					{"m_areaScaledCountDisplay", offsetof(GJBaseGameLayer, m_areaScaledCountDisplay), sizeof(GJBaseGameLayer::m_areaScaledCountDisplay)},
+					{"m_areaRotatedCountDisplay", offsetof(GJBaseGameLayer, m_areaRotatedCountDisplay), sizeof(GJBaseGameLayer::m_areaRotatedCountDisplay)},
+					{"m_areaColorCountDisplay", offsetof(GJBaseGameLayer, m_areaColorCountDisplay), sizeof(GJBaseGameLayer::m_areaColorCountDisplay)},
+					{"m_areaMovedCountTotalDisplay", offsetof(GJBaseGameLayer, m_areaMovedCountTotalDisplay), sizeof(GJBaseGameLayer::m_areaMovedCountTotalDisplay)},
+					{"m_areaScaledCountTotalDisplay", offsetof(GJBaseGameLayer, m_areaScaledCountTotalDisplay), sizeof(GJBaseGameLayer::m_areaScaledCountTotalDisplay)},
+					{"m_areaRotatedCountTotalDisplay", offsetof(GJBaseGameLayer, m_areaRotatedCountTotalDisplay), sizeof(GJBaseGameLayer::m_areaRotatedCountTotalDisplay)},
+					{"m_areaColorCountTotalDisplay", offsetof(GJBaseGameLayer, m_areaColorCountTotalDisplay), sizeof(GJBaseGameLayer::m_areaColorCountTotalDisplay)},
+					{"m_movedCountDisplay", offsetof(GJBaseGameLayer, m_movedCountDisplay), sizeof(GJBaseGameLayer::m_movedCountDisplay)},
+					{"m_scaledCountDisplay", offsetof(GJBaseGameLayer, m_scaledCountDisplay), sizeof(GJBaseGameLayer::m_scaledCountDisplay)},
+					{"m_rotatedCountDisplay", offsetof(GJBaseGameLayer, m_rotatedCountDisplay), sizeof(GJBaseGameLayer::m_rotatedCountDisplay)},
+					{"m_followedCountDisplay", offsetof(GJBaseGameLayer, m_followedCountDisplay), sizeof(GJBaseGameLayer::m_followedCountDisplay)},
+					{"m_loadingStartPosition", offsetof(GJBaseGameLayer, m_loadingStartPosition), sizeof(GJBaseGameLayer::m_loadingStartPosition)},
+					{"m_processingAudioTriggers", offsetof(GJBaseGameLayer, m_processingAudioTriggers), sizeof(GJBaseGameLayer::m_processingAudioTriggers)},
+					{"m_audioPaused", offsetof(GJBaseGameLayer, m_audioPaused), sizeof(GJBaseGameLayer::m_audioPaused)},
+					{"m_startOptimization", offsetof(GJBaseGameLayer, m_startOptimization), sizeof(GJBaseGameLayer::m_startOptimization)},
+					{"m_loadingLayer", offsetof(GJBaseGameLayer, m_loadingLayer), sizeof(GJBaseGameLayer::m_loadingLayer)},
+					{"m_debugDrawNode", offsetof(GJBaseGameLayer, m_debugDrawNode), sizeof(GJBaseGameLayer::m_debugDrawNode)},
+					{"m_debugDrawPoints", offsetof(GJBaseGameLayer, m_debugDrawPoints), sizeof(GJBaseGameLayer::m_debugDrawPoints)},
+					{"m_isDebugDrawEnabled", offsetof(GJBaseGameLayer, m_isDebugDrawEnabled), sizeof(GJBaseGameLayer::m_isDebugDrawEnabled)},
+					{"m_disablePlayerHitbox", offsetof(GJBaseGameLayer, m_disablePlayerHitbox), sizeof(GJBaseGameLayer::m_disablePlayerHitbox)},
+					{"m_hitboxesOnDeath", offsetof(GJBaseGameLayer, m_hitboxesOnDeath), sizeof(GJBaseGameLayer::m_hitboxesOnDeath)},
+					{"m_anticheatSpike", offsetof(GJBaseGameLayer, m_anticheatSpike), sizeof(GJBaseGameLayer::m_anticheatSpike)},
+					{"m_timestamp", offsetof(GJBaseGameLayer, m_timestamp), sizeof(GJBaseGameLayer::m_timestamp)},
+					{"m_isBetweenSteps", offsetof(GJBaseGameLayer, m_isBetweenSteps), sizeof(GJBaseGameLayer::m_isBetweenSteps)},
+					{"m_clickBetweenSteps", offsetof(GJBaseGameLayer, m_clickBetweenSteps), sizeof(GJBaseGameLayer::m_clickBetweenSteps)},
+					{"m_clickOnSteps", offsetof(GJBaseGameLayer, m_clickOnSteps), sizeof(GJBaseGameLayer::m_clickOnSteps)}
+				};
+				struct PLField { size_t off, size; const char* name; };
+				static const PLField plfields[] = {
+					{offsetof(PlayLayer, m_unk36c8), sizeof(PlayLayer::m_unk36c8), "m_unk36c8"},
+					{offsetof(PlayLayer, m_unk36cc), sizeof(PlayLayer::m_unk36cc), "m_unk36cc"},
+					{offsetof(PlayLayer, m_unk36cd), sizeof(PlayLayer::m_unk36cd), "m_unk36cd"},
+					{offsetof(PlayLayer, m_unk36ce), sizeof(PlayLayer::m_unk36ce), "m_unk36ce"},
+					{offsetof(PlayLayer, m_unk36cf), sizeof(PlayLayer::m_unk36cf), "m_unk36cf"},
+					{offsetof(PlayLayer, m_damageVerified), sizeof(PlayLayer::m_damageVerified), "m_damageVerified"},
+					{offsetof(PlayLayer, m_passedIntegrity), sizeof(PlayLayer::m_passedIntegrity), "m_passedIntegrity"},
+					{offsetof(PlayLayer, m_objectsCreated), sizeof(PlayLayer::m_objectsCreated), "m_objectsCreated"},
+					{offsetof(PlayLayer, m_unk3768), sizeof(PlayLayer::m_unk3768), "m_unk3768"},
+					{offsetof(PlayLayer, m_platformerRestart), sizeof(PlayLayer::m_platformerRestart), "m_platformerRestart"},
+					{offsetof(PlayLayer, m_unk376d), sizeof(PlayLayer::m_unk376d), "m_unk376d"},
+					{offsetof(PlayLayer, m_isIgnoreDamageEnabled), sizeof(PlayLayer::m_isIgnoreDamageEnabled), "m_isIgnoreDamageEnabled"},
+					{offsetof(PlayLayer, m_unk3778), sizeof(PlayLayer::m_unk3778), "m_unk3778"},
+					{offsetof(PlayLayer, m_unk377c), sizeof(PlayLayer::m_unk377c), "m_unk377c"},
+					{offsetof(PlayLayer, m_unk3780), sizeof(PlayLayer::m_unk3780), "m_unk3780"},
+					{offsetof(PlayLayer, m_unk3784), sizeof(PlayLayer::m_unk3784), "m_unk3784"},
+					{offsetof(PlayLayer, m_unk3788), sizeof(PlayLayer::m_unk3788), "m_unk3788"},
+					{offsetof(PlayLayer, m_unk378c), sizeof(PlayLayer::m_unk378c), "m_unk378c"},
+					{offsetof(PlayLayer, m_endChecked), sizeof(PlayLayer::m_endChecked), "m_endChecked"},
+					{offsetof(PlayLayer, m_endXPosition), sizeof(PlayLayer::m_endXPosition), "m_endXPosition"},
+					{offsetof(PlayLayer, m_unk37b0), sizeof(PlayLayer::m_unk37b0), "m_unk37b0"},
+					{offsetof(PlayLayer, m_unk37b1), sizeof(PlayLayer::m_unk37b1), "m_unk37b1"},
+					{offsetof(PlayLayer, m_isSilent), sizeof(PlayLayer::m_isSilent), "m_isSilent"},
+					{offsetof(PlayLayer, m_unk37cc), sizeof(PlayLayer::m_unk37cc), "m_unk37cc"},
+					{offsetof(PlayLayer, m_unk37e0), sizeof(PlayLayer::m_unk37e0), "m_unk37e0"},
+					{offsetof(PlayLayer, m_pulseRodIndex), sizeof(PlayLayer::m_pulseRodIndex), "m_pulseRodIndex"},
+					{offsetof(PlayLayer, m_maxObjectX), sizeof(PlayLayer::m_maxObjectX), "m_maxObjectX"},
+					{offsetof(PlayLayer, m_decimalPercentage), sizeof(PlayLayer::m_decimalPercentage), "m_decimalPercentage"},
+					{offsetof(PlayLayer, m_hintShown), sizeof(PlayLayer::m_hintShown), "m_hintShown"},
+					{offsetof(PlayLayer, m_progressWidth), sizeof(PlayLayer::m_progressWidth), "m_progressWidth"},
+					{offsetof(PlayLayer, m_progressHeight), sizeof(PlayLayer::m_progressHeight), "m_progressHeight"},
+					{offsetof(PlayLayer, m_totalGravityEffects), sizeof(PlayLayer::m_totalGravityEffects), "m_totalGravityEffects"},
+					{offsetof(PlayLayer, m_activeGravityEffects), sizeof(PlayLayer::m_activeGravityEffects), "m_activeGravityEffects"},
+					{offsetof(PlayLayer, m_gravityEffectIndex), sizeof(PlayLayer::m_gravityEffectIndex), "m_gravityEffectIndex"},
+					{offsetof(PlayLayer, m_doNot), sizeof(PlayLayer::m_doNot), "m_doNot"},
+					{offsetof(PlayLayer, m_unk383c), sizeof(PlayLayer::m_unk383c), "m_unk383c"},
+					{offsetof(PlayLayer, m_skipAudioStep), sizeof(PlayLayer::m_skipAudioStep), "m_skipAudioStep"},
+					{offsetof(PlayLayer, m_jumps), sizeof(PlayLayer::m_jumps), "m_jumps"},
+					{offsetof(PlayLayer, m_hasJumped), sizeof(PlayLayer::m_hasJumped), "m_hasJumped"},
+					{offsetof(PlayLayer, m_uncommittedJumps), sizeof(PlayLayer::m_uncommittedJumps), "m_uncommittedJumps"},
+					{offsetof(PlayLayer, m_showLeaderboardPercentage), sizeof(PlayLayer::m_showLeaderboardPercentage), "m_showLeaderboardPercentage"},
+					{offsetof(PlayLayer, m_hasCompletedLevel), sizeof(PlayLayer::m_hasCompletedLevel), "m_hasCompletedLevel"},
+					{offsetof(PlayLayer, m_inResetDelay), sizeof(PlayLayer::m_inResetDelay), "m_inResetDelay"},
+					{offsetof(PlayLayer, m_lastAttemptPercent), sizeof(PlayLayer::m_lastAttemptPercent), "m_lastAttemptPercent"},
+					{offsetof(PlayLayer, m_endLayerStars), sizeof(PlayLayer::m_endLayerStars), "m_endLayerStars"},
+					{offsetof(PlayLayer, m_orbs), sizeof(PlayLayer::m_orbs), "m_orbs"},
+					{offsetof(PlayLayer, m_diamonds), sizeof(PlayLayer::m_diamonds), "m_diamonds"},
+					{offsetof(PlayLayer, m_secretKey), sizeof(PlayLayer::m_secretKey), "m_secretKey"},
+					{offsetof(PlayLayer, m_recordingStopped), sizeof(PlayLayer::m_recordingStopped), "m_recordingStopped"},
+					{offsetof(PlayLayer, m_unk38b0), sizeof(PlayLayer::m_unk38b0), "m_unk38b0"},
+					{offsetof(PlayLayer, m_unk38b8), sizeof(PlayLayer::m_unk38b8), "m_unk38b8"},
+					{offsetof(PlayLayer, m_unk38c0), sizeof(PlayLayer::m_unk38c0), "m_unk38c0"},
+					{offsetof(PlayLayer, m_unk38c8), sizeof(PlayLayer::m_unk38c8), "m_unk38c8"},
+					{offsetof(PlayLayer, m_unk38cc), sizeof(PlayLayer::m_unk38cc), "m_unk38cc"},
+					{offsetof(PlayLayer, m_unk38d0), sizeof(PlayLayer::m_unk38d0), "m_unk38d0"},
+					{offsetof(PlayLayer, m_attemptTime), sizeof(PlayLayer::m_attemptTime), "m_attemptTime"},
+					{offsetof(PlayLayer, m_bestAttemptTime), sizeof(PlayLayer::m_bestAttemptTime), "m_bestAttemptTime"},
+					{offsetof(PlayLayer, m_pauseTime), sizeof(PlayLayer::m_pauseTime), "m_pauseTime"},
+					{offsetof(PlayLayer, m_currentTime), sizeof(PlayLayer::m_currentTime), "m_currentTime"},
+					{offsetof(PlayLayer, m_pauseDelta), sizeof(PlayLayer::m_pauseDelta), "m_pauseDelta"},
+					{offsetof(PlayLayer, m_unk3900), sizeof(PlayLayer::m_unk3900), "m_unk3900"},
+					{offsetof(PlayLayer, m_glitterEnabled), sizeof(PlayLayer::m_glitterEnabled), "m_glitterEnabled"},
+					{offsetof(PlayLayer, m_bgEffectDisabled), sizeof(PlayLayer::m_bgEffectDisabled), "m_bgEffectDisabled"},
+					{offsetof(PlayLayer, m_unk3906), sizeof(PlayLayer::m_unk3906), "m_unk3906"},
+					{offsetof(PlayLayer, m_isPaused), sizeof(PlayLayer::m_isPaused), "m_isPaused"},
+					{offsetof(PlayLayer, m_disableGravityEffect), sizeof(PlayLayer::m_disableGravityEffect), "m_disableGravityEffect"},
+					{offsetof(PlayLayer, m_nextColorKey), sizeof(PlayLayer::m_nextColorKey), "m_nextColorKey"},
+					{offsetof(PlayLayer, m_tryPlaceCheckpoint), sizeof(PlayLayer::m_tryPlaceCheckpoint), "m_tryPlaceCheckpoint"},
+					{offsetof(PlayLayer, m_musicPrepared), sizeof(PlayLayer::m_musicPrepared), "m_musicPrepared"}
+				};
+				auto nameAt = [&](size_t off) -> const char* {
+					for (auto const& f : lfields)
+						if (off >= f.off && off < f.off + f.size) return f.name;
+					for (auto const& f : plfields)
+						if (off >= f.off && off < f.off + f.size) return f.name;
+					return "";
+				};
+				size_t diffBytes = 0, ranges = 0, i = 0;
+				while (i < st.anchorLayerBytes.size()) {
+					if (st.anchorLayerBytes[i] == now[i]) { i++; continue; }
+					const size_t start = i;
+					while (i < st.anchorLayerBytes.size() && st.anchorLayerBytes[i] != now[i]) i++;
+					diffBytes += (i - start); ranges++;
+					const char* nm = nameAt(start);
+					// Containers and pointers legitimately differ; only scalar
+					// physics fields are actionable, so name them all and let the
+					// list be filtered by hand.
+					if (ranges <= 60)
+						log::info("    L +0x{:04X}..0x{:04X} ({} bytes) {}",
+						          start, i - 1, i - start, nm);
+				}
+				log::info("Probe 4a-layer: PlayLayer is {} bytes (GJBaseGameLayer prefix {}); "
+				          "{} differ across {} range(s)",
+				          sizeof(PlayLayer), sizeof(GJBaseGameLayer), diffBytes, ranges);
+			}
+
 			log::info("Probe 4b: restored, replaying the same {} steps", st.restoreLen);
 			return false;
 		}
@@ -1318,8 +2503,21 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (auto* p = m_player1) {
 			d.airPolicy = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
 		}
-		if (CheckpointObject* cp = pl->createCheckpoint()) { cp->retain(); d.cp = cp; }
+		if (!g_config.noSavestates) {
+			if (CheckpointObject* cp = pl->createCheckpoint()) { cp->retain(); d.cp = cp; }
+		}
 
+		if (auto* pp = m_player1) {
+			d.gameModeChangedTime = pp->m_gameModeChangedTime;
+			d.unkA29              = pp->m_unkA29;
+		}
+		d.layerExtraDelta  = m_extraDelta;
+		d.layerTimePlayed  = m_timePlayed;
+		d.layerTimestamp   = m_timestamp;
+		d.layerTickIndex   = m_tickIndex;
+		d.layerClickIndex  = m_clickIndex;
+		d.layerResumeTimer = m_resumeTimer;
+		d.layerJumping     = m_jumping;
 		d.enteringHold  = sv.hold;
 		d.togglesBefore = d.airPolicy ? sv.togglesUsed : 0;
 
@@ -1396,17 +2594,102 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	// Restore to a decision's captured state. loadFromCheckpoint alone restores
 	// position but does not revive a dead player, so this drives practice
 	// mode's own respawn, which does both.
-	void solverRestoreState(Decision& d) {
+	// Restore, then realign by one physics step.
+	//
+	// MEASURED (Probe 4b): createCheckpoint captures the state after step N, but
+	// the practice respawn returns to the state after step N-1 - segment B was
+	// offset from segment A by exactly one step, with B[n+1] == A[n] bit for
+	// bit on every field. The restore is faithful; it just lands a frame early.
+	//
+	// Uncorrected, every restore shifts the timeline by a frame, so the search
+	// calibrates its input timing to a state one step off from what a clean
+	// replay produces. That is why a 20,425-step solution died at step 1222 on
+	// verification. One forward step reproduces the captured state exactly.
+	void applyExtraState(Solver::PendingExtra const& e) {
+		if (auto* p = m_player1) {
+			p->m_gameModeChangedTime = e.gameModeChangedTime;
+			p->m_unkA29              = e.unkA29;
+		}
+		m_extraDelta  = e.extraDelta;
+		m_timePlayed  = e.timePlayed;
+		m_timestamp   = e.timestamp;
+		m_tickIndex   = e.tickIndex;
+		m_clickIndex  = e.clickIndex;
+		m_resumeTimer = e.resumeTimer;
+		m_jumping     = e.jumping;
+		if (auto* pl2 = PlayLayer::get()) {
+			pl2->m_attemptTime     = e.attemptTime;
+			pl2->m_bestAttemptTime = e.bestAttemptTime;
+			pl2->m_currentTime     = e.currentTime;
+			pl2->m_hasJumped       = e.hasJumped;
+		}
+	}
+
+	void solverRestoreCheckpoint(CheckpointObject* cp, bool realignHold) {
 		auto* pl = PlayLayer::get();
-		if (!pl || !d.cp) return;
+		if (!pl || !cp) return;
 		if (auto* arr = pl->m_checkpointArray) {
 			arr->removeAllObjects();
-			arr->addObject(d.cp);
+			arr->addObject(cp);
 		}
 		auto& ps = ProbeState::get();
 		ps.solverRestoring = true;
 		pl->resetLevel();
 		ps.solverRestoring = false;
+
+		// The checkpoint does NOT store the held-button state, so the respawn
+		// always comes back with the button released - and handleButton takes a
+		// step to take effect. In ship mode hold controls acceleration on every
+		// frame, so the first step after a restore ran with the wrong hold.
+		//
+		// MEASURED: restores were sound at step 480 (cube, mid-air, input
+		// irrelevant) and unsound at 18135 (ship), where segment B differed from
+		// A in yVelocity and m_jumpBuffered at the very first row. pushButton /
+		// releaseButton act on the player directly, with no queue latency.
+		if (auto* p = m_player1) {
+			ps.injecting = true;
+			if (realignHold) p->pushButton(PlayerButton::Jump);
+			else             p->releaseButton(PlayerButton::Jump);
+			ps.injecting  = false;
+			ps.isHolding  = realignHold;
+		}
+
+		applyInput(realignHold);
+		GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+
+		// Apply the dropped fields AFTER the realign step.
+		//
+		// Ordering matters and I had it wrong: capture happens at step S, the
+		// restore lands at S-1, and the realign advances to S. Writing the
+		// step-S values BEFORE the realign meant that step advanced them past S
+		// and ran its physics on rolled-back time - which made the PlayerObject
+		// delta worse, 24 bytes to 99.
+		{
+			auto& sv2 = Solver::get();
+			if (sv2.pendingExtra.valid) {
+				applyExtraState(sv2.pendingExtra);
+				sv2.pendingExtra.valid = false;
+			}
+		}
+	}
+
+	void solverRestoreState(Decision& d) {
+		if (!d.cp) return;
+		Solver::PendingExtra e;
+		e.gameModeChangedTime = d.gameModeChangedTime;
+		e.unkA29      = d.unkA29;
+		e.extraDelta  = d.layerExtraDelta;
+		e.timePlayed  = d.layerTimePlayed;
+		e.timestamp   = d.layerTimestamp;
+		e.tickIndex   = d.layerTickIndex;
+		e.clickIndex  = d.layerClickIndex;
+		e.resumeTimer = d.layerResumeTimer;
+		e.jumping     = d.layerJumping;
+		e.valid       = true;
+		Solver::get().pendingExtra = e;
+		// The input in effect entering this decision is what was applied on the
+		// step being redone.
+		solverRestoreCheckpoint(d.cp, d.enteringHold);
 		Solver::get().restores++;
 	}
 
@@ -1504,6 +2787,25 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				sv.togglesUsed = d.togglesBefore +
 					((d.airPolicy && d.choice != d.enteringHold) ? 1 : 0);
 
+				if (g_config.noSavestates) {
+					// Replay from frame 0 to this decision. Exact by construction:
+					// no checkpoint is involved anywhere in the path.
+					sv.resyncMacro.assign(sv.macro.begin(),
+					                      sv.macro.begin() + std::min<size_t>(d.step, sv.macro.size()));
+					sv.resyncTarget       = static_cast<int>(sv.resyncMacro.size());
+					sv.resyncing          = true;
+					sv.resyncForBacktrack = true;
+					sv.resumeHold         = d.choice;
+					sv.resumeToggles      = d.togglesBefore +
+						((d.airPolicy && d.choice != d.enteringHold) ? 1 : 0);
+					sv.resumeBranch       = d.step;
+					sv.step               = 0;
+					sv.hold               = false;
+					sv.replayBacktracks++;
+					ProbeState::get().resetPending = true;
+					return true;
+				}
+
 				const float xBefore = m_player1 ? m_player1->getPositionX() : -1.f;
 				solverRestoreState(d);
 				const float xAfter = m_player1 ? m_player1->getPositionX() : -1.f;
@@ -1545,10 +2847,111 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// GAME seconds plays back in a fraction of a wall-clock second. Game time
 		// and wall-clock time are not interchangeable here.
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
-		          "steps {}  budget {}  commit {}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
+		          "steps {}  budget {}  commit {}  resync {}/{}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
-		          g_config.toggleBudget, sv.commitDepth, stepsPerSec, stepsPerSec / 240.0,
+		          g_config.toggleBudget, sv.commitDepth, sv.resyncs, sv.resyncFailures, stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
+	}
+
+	// Start re-deriving the current prefix from frame 0 with no savestates.
+	void beginResync() {
+		auto& sv = Solver::get();
+		if (sv.macro.empty() || sv.step <= 0) return;
+
+		sv.resyncMacro.assign(sv.macro.begin(),
+		                      sv.macro.begin() + std::min<size_t>(sv.step, sv.macro.size()));
+
+		// Drop every checkpoint BEFORE the level reset, while the objects they
+		// reference still exist. Releasing them afterwards frees dangling
+		// pointers - which is what crashed the game on the second resync.
+		if (auto* pl = PlayLayer::get()) {
+			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+		}
+		for (auto& d : sv.stack) if (d.cp) d.cp->release();
+		sv.stack.clear();
+		sv.commitDepth = 0;
+		sv.resyncTarget = static_cast<int>(sv.resyncMacro.size());
+		sv.resyncing    = true;
+		sv.step         = 0;
+		sv.hold         = false;
+		sv.togglesUsed  = 0;
+		sv.prevAirMode  = false;
+		sv.prevOnGround = false;
+		log::info("Solver: resync - replaying {} committed steps from frame 0 with no "
+		          "savestates to validate the prefix", sv.resyncTarget);
+		ProbeState::get().resetPending = true;
+	}
+
+	// The prefix replayed clean. Adopt it as ground truth and continue from here.
+	void finishResync() {
+		auto& sv = Solver::get();
+		auto* pl = PlayLayer::get();
+
+		if (sv.resyncForBacktrack) {
+			// Landed back at the decision, by replay rather than restore. Keep
+			// the stack; only the trajectory was re-derived.
+			sv.resyncForBacktrack = false;
+			sv.resyncing   = false;
+			sv.hold        = sv.resumeHold;
+			sv.togglesUsed = sv.resumeToggles;
+			sv.lastBranch  = sv.resumeBranch;
+			sv.macro.resize(static_cast<size_t>(sv.step), 0);
+			return;
+		}
+
+		// Stack was already released in beginResync, before the reset.
+		sv.stack.clear();
+
+		sv.macro         = sv.resyncMacro;
+		sv.lastGoodMacro = sv.resyncMacro;
+		sv.lastGoodStep  = sv.step;
+		sv.lastResyncStep = sv.step;
+		sv.commitDepth   = 0;
+		sv.resyncing     = false;
+		sv.resyncs++;
+
+		// A fresh base decision, captured from a state that is provably
+		// reachable in normal play.
+		solverPushDecision();
+
+		log::info("Solver: resync #{} OK at step {} ({:.2f}%) - prefix verified clean, "
+		          "stack rebased", sv.resyncs, sv.step, pl ? pl->getCurrentPercent() : 0.f);
+	}
+
+	// The prefix did NOT replay clean: accumulated restore error made the search
+	// build on a trajectory that does not exist in normal play. Fall back to the
+	// last prefix that did replay, and re-search forward from there.
+	void failResync(int diedAt) {
+		auto& sv = Solver::get();
+		sv.resyncFailures++;
+		ProbeState::get().lastResyncFailStep = diedAt;
+		log::error("Solver: resync FAILED - the prefix died at step {} of {} in clean "
+		           "replay. Restore drift had corrupted it; falling back to the last "
+		           "verified prefix ({} steps).",
+		           diedAt, sv.resyncTarget, sv.lastGoodStep);
+		log::error("  Probe 4b (F12) will anchor here - this is the exact window where a "
+		           "savestate-derived path stops working in normal play.");
+
+		sv.stack.clear(); // released in beginResync, before the reset
+		sv.macro       = sv.lastGoodMacro;
+		sv.bestPct     = 0.f;   // re-earned from the verified prefix forward
+		sv.bestStep    = sv.lastGoodStep;
+		sv.commitDepth = 0;
+
+		if (sv.lastGoodStep > 0) {
+			sv.resyncMacro  = sv.lastGoodMacro;
+			sv.resyncTarget = sv.lastGoodStep;
+			sv.resyncing    = true;
+			sv.step         = 0;
+			sv.hold         = false;
+			ProbeState::get().resetPending = true;
+		} else {
+			sv.resyncing    = false;
+			sv.step         = 0;
+			sv.hold         = false;
+			sv.lastResyncStep = 0;
+			ProbeState::get().resetPending = true;
+		}
 	}
 
 	// One solver step. Returns false to stop the enclosing per-frame loop
@@ -1557,6 +2960,22 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		auto& sv = Solver::get();
 		auto* pl = PlayLayer::get();
 		if (!pl || !m_player1) return false;
+
+		// Resync: replay the committed prefix with NO savestates and no
+		// branching. This is the validation - if it survives to the target, the
+		// prefix provably works in normal play.
+		if (sv.resyncing) {
+			const size_t idx = static_cast<size_t>(sv.step);
+			const bool pressed = idx < sv.resyncMacro.size() && sv.resyncMacro[idx] != 0;
+			applyInput(pressed);
+			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+			sv.step++;
+			sv.steps++;
+
+			if (m_player1->m_isDead) { failResync(sv.step); return false; }
+			if (ProbeState::get().finished || sv.step >= sv.resyncTarget) finishResync();
+			return true;
+		}
 
 		// A restore is supposed to revive the player. If GD instead requires
 		// its respawn sequence, the search would stall here forever - so say so
@@ -1593,6 +3012,13 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// Record where the frontier reached. The commit floor is derived
 			// from this against the CURRENT stack, never stored as an index.
 			if (sv.step > sv.bestStep) sv.bestStep = sv.step;
+
+			// Far enough past the last validation: re-derive the prefix cleanly.
+			if (g_config.resyncEnabled &&
+			    sv.step > sv.lastResyncStep + g_config.resyncIntervalSteps) {
+				beginResync();
+				return false;
+			}
 		}
 		solverReport(false);
 
@@ -1601,6 +3027,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			log::info("================ SOLVED ================");
 			log::info("  {} steps, {} deaths, {} restores, depth {}",
 			          sv.step, sv.deaths, sv.restores, sv.stack.size());
+			log::info("  {} resyncs ({} failed) - prefix re-derived from frame 0 without "
+			          "savestates {} time(s)", sv.resyncs, sv.resyncFailures, sv.resyncs);
 			solverWriteMacro("solution.txt");
 			log::info("  Verify by replaying from frame 0 - a solution found via "
 			          "savestates only counts if it reproduces in a clean run.");
@@ -1649,6 +3077,25 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					// re-deriving a solved prefix is exactly the waste this fixes.
 					if (!sv.stack.empty()) {
 						Decision& d = sv.stack.back();
+
+						if (g_config.noSavestates) {
+							// No checkpoint exists; reposition by replay, exactly as
+							// backtracking does. Without this the solver carried on
+							// from whatever state the player happened to be in.
+							sv.resyncMacro.assign(sv.macro.begin(),
+								sv.macro.begin() + std::min<size_t>(d.step, sv.macro.size()));
+							sv.resyncTarget       = static_cast<int>(sv.resyncMacro.size());
+							sv.resyncing          = true;
+							sv.resyncForBacktrack = true;
+							sv.resumeHold         = d.choice;
+							sv.resumeToggles      = d.togglesBefore;
+							sv.resumeBranch       = d.step;
+							sv.step               = 0;
+							sv.hold               = false;
+							ProbeState::get().resetPending = true;
+							return false;
+						}
+
 						solverRestoreState(d);
 						sv.step        = d.step;
 						sv.macro.resize(static_cast<size_t>(d.step), 0);
@@ -1794,6 +3241,35 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// Logged once per attempt, never per step.
 			log::debug("attempt start: m_currentStep = {}", m_currentStep);
 		}
+		if (st.mode == Mode::Verify) {
+			const size_t idx = static_cast<size_t>(st.stepCounter);
+			if (idx >= st.scripted.size()) {
+				finishVerify(st.finished, static_cast<int>(idx),
+				             pl->getCurrentPercent());
+				return;
+			}
+			const int steps = g_config.physicsFix ? g_config.stepsPerFrame : 1;
+			for (int i = 0; i < steps; i++) {
+				const size_t k = static_cast<size_t>(st.stepCounter);
+				if (k >= st.scripted.size()) break;
+				applyInput(st.scripted[k] != 0);
+				GJBaseGameLayer::update(g_config.physicsFix
+				                        ? static_cast<float>(kPhysicsDt) : dt);
+				st.stepCounter++;
+				if (st.finished) {
+					finishVerify(true, static_cast<int>(st.stepCounter),
+					             pl->getCurrentPercent());
+					return;
+				}
+				if (m_player1 && m_player1->m_isDead) {
+					finishVerify(false, static_cast<int>(st.stepCounter),
+					             pl->getCurrentPercent());
+					return;
+				}
+			}
+			return;
+		}
+
 		// The solver runs its own loop: as many steps per rendered frame as the
 		// budget allows, rather than real-time pace.
 		if (st.mode == Mode::Solve) {
@@ -1892,9 +3368,33 @@ class $modify(SolverPlayLayer, PlayLayer) {
 
 	bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
 		if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+
+		// A solver left running across a level change would search one level
+		// using another's macro and checkpoints. Tear it down first, while its
+		// checkpoints still reference objects from the level they came from.
+		if (Solver::get().running) {
+			log::warn("Solver: stopping - level changed while a search was running");
+			Solver::get().clear();
+		}
+
 		ProbeState::get().resetPerLevel();
-		log::info("gd-solver: level loaded. F1/F2/F3 = determinism sweep (config a/b/c), "
-		          "F5 = record input, F6 = load input, F7 = dump trace");
+
+		// Namespace this level's files. Sanitised so it is always a safe filename.
+		{
+			std::string key = level ? std::string(level->m_levelName) : std::string();
+			std::string safe;
+			for (char c : key) {
+				if (std::isalnum(static_cast<unsigned char>(c))) safe.push_back(c);
+				else if (c == ' ' || c == '-' || c == '_') safe.push_back('_');
+			}
+			if (safe.empty()) safe = "level";
+			ProbeState::get().levelKey = safe;
+		}
+		log::info("gd-solver: level '{}' loaded - output files are namespaced as {}_*",
+		          ProbeState::get().levelKey, ProbeState::get().levelKey);
+		log::info("  F2 = solve/stop, F4 = verify, F5 = record input, F6 = load input, "
+		          "F7 = dump trace, F8 = toggle resync, F11 = savestate cost, "
+		          "F12 = restore fidelity");
 		return true;
 	}
 
