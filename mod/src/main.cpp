@@ -193,6 +193,16 @@ struct Config {
 	// scalar fields changed nothing. Where fidelity matters more than speed,
 	// replay is the only exact option.
 	bool noSavestates = false;
+
+	// Hybrid restore (measured, Probe 4b sweep across Stereo Madness):
+	//   CUBE-like modes  5/5 anchors bit-identical
+	//   AIR modes        1/3 anchors bit-identical
+	// Air restores are not merely slower to trust, they are UNRELIABLE - one
+	// good sample proves nothing, which is why drift went unnoticed for so long.
+	// So never restore to an air decision: restore the nearest CUBE ancestor
+	// (exact) and replay forward through the air section. Bounded by the section
+	// length rather than the whole prefix.
+	bool hybridRestore = true;
 };
 
 Config g_config;
@@ -331,6 +341,18 @@ struct ProbeState {
 	// Drift-zero at t=0 is necessary but not sufficient. The real question is
 	// whether the SAME input from a restored state produces the same future.
 	RestoreKind  restoreKind   = RestoreKind::Full;
+	// Restore-fidelity sweep: test several anchors in one run and report which
+	// game mode each was in. Soundness has only ever been measured at two points
+	// (exact in cube at step 480, not exact in ship at 18135), and the hybrid
+	// design rests on cube restores being reliably exact. One point is not
+	// enough evidence to build on.
+	struct SweepResult { int anchor; bool air; bool sound; size_t divergeAt; float pct; };
+	std::vector<int>         sweepAnchors;
+	size_t                   sweepIndex = 0;
+	std::vector<SweepResult> sweepResults;
+	bool                     anchorWasAir = false;
+	float                    anchorPct = 0.f;
+
 	int          restorePhase  = 0;   // 0 = running to anchor, 1 = segment A, 2 = segment B
 	int          restoreAnchor = 480; // step at which to capture (2 s in)
 	int          restoreLen    = 600; // steps to simulate per segment
@@ -357,6 +379,14 @@ struct ProbeState {
 	PlayerCheckpoint* playerCp = nullptr;
 
 	void releaseCheckpoints() {
+		// Drop our checkpoint out of GD's array BEFORE releasing it. The restore
+		// path swaps it into m_checkpointArray to drive the practice respawn;
+		// leaving it there across a level reset means the game holds a pointer to
+		// something we freed, and the next cycle's removeAllObjects double-frees
+		// it. That crashed the sweep on its third anchor.
+		if (auto* pl = PlayLayer::get()) {
+			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+		}
 		if (fullCp)   { fullCp->release();   fullCp   = nullptr; }
 		if (playerCp) { playerCp->release(); playerCp = nullptr; }
 	}
@@ -405,6 +435,9 @@ struct ProbeState {
 		humanReferencePercent = 0.f;
 		releaseCheckpoints();
 		restorePhase = 0;
+		sweepAnchors.clear();
+		sweepIndex = 0;
+		sweepResults.clear();
 		segmentA.clear();
 		segmentB.clear();
 		dtSamples.clear();
@@ -961,6 +994,9 @@ struct Solver {
 	int                   resumeToggles  = 0;
 	int                   resumeBranch   = 0;
 	uint64_t              replayBacktracks = 0;
+	bool                  anchorReplaying    = false;
+	int                   anchorReplayTarget = 0;
+	uint64_t              anchorReplays      = 0;
 	int                   resyncTarget   = 0;
 	int                   lastResyncStep = 0;
 	uint64_t              resyncs        = 0;
@@ -988,6 +1024,9 @@ struct Solver {
 		resyncing = false;
 		resyncForBacktrack = false;
 		replayBacktracks = 0;
+		anchorReplaying = false;
+		anchorReplayTarget = 0;
+		anchorReplays = 0;
 		resyncTarget = 0;
 		lastResyncStep = 0;
 		resyncs = resyncFailures = 0;
@@ -1061,7 +1100,22 @@ void startRestoreTest(RestoreKind kind) {
 
 	// Restores were sound at step 480 yet verification still failed at 18855,
 	// so soundness must be checked where it breaks, not only at the opening.
-	if (st.lastResyncFailStep > 400) {
+	// Spread anchors across the macro so we sample both cube and air sections.
+	st.restoreLen = 400;
+	st.sweepAnchors.clear();
+	st.sweepIndex = 0;
+	st.sweepResults.clear();
+	{
+		const int usable = static_cast<int>(st.scripted.size()) - st.restoreLen - 240;
+		if (usable > 1200) {
+			for (int i = 1; i <= 8; i++) st.sweepAnchors.push_back(240 + (usable * i) / 9);
+		}
+	}
+	if (!st.sweepAnchors.empty()) {
+		st.restoreAnchor = st.sweepAnchors[0];
+		log::info("Probe 4b: sweeping {} anchors across the level to map WHERE restores "
+		          "are exact, and against which game mode.", st.sweepAnchors.size());
+	} else if (st.lastResyncFailStep > 400) {
 		// Anchor just BEFORE the failure so the divergence happens inside the
 		// measured window. The resync failure localised the drift to a 183-step
 		// window at the cube->ship transition.
@@ -1113,6 +1167,49 @@ void finishRestoreTest() {
 	log::info("===========================================================");
 
 	st.releaseCheckpoints();
+
+	// Sweeping: record this anchor and move to the next.
+	if (!st.sweepAnchors.empty()) {
+		const bool sound = (at == SIZE_MAX && st.segmentA.size() == st.segmentB.size());
+		st.sweepResults.push_back({st.restoreAnchor, st.anchorWasAir, sound, at, st.anchorPct});
+
+		st.sweepIndex++;
+		if (st.sweepIndex < st.sweepAnchors.size()) {
+			st.restoreAnchor = st.sweepAnchors[st.sweepIndex];
+			st.restorePhase  = 0;
+			st.segmentA.clear();
+			st.segmentB.clear();
+			st.haveAnchorRow = false;
+			st.resetPending  = true;
+			log::info("Probe 4b: next anchor {} ({} of {})",
+			          st.restoreAnchor, st.sweepIndex + 1, st.sweepAnchors.size());
+			return;
+		}
+
+		// Done: the table the hybrid design depends on.
+		int cubeTotal = 0, cubeSound = 0, airTotal = 0, airSound = 0;
+		log::info("============ Probe 4b: restore fidelity by MODE ============");
+		for (auto const& r : st.sweepResults) {
+			log::info("  step {:>6}  {:>6.2f}%  {:<5}  {}", r.anchor, r.pct,
+			          r.air ? "AIR" : "CUBE",
+			          r.sound ? "SOUND" : fmt::format("NOT SOUND (diverges at {})", r.divergeAt));
+			if (r.air) { airTotal++;  if (r.sound) airSound++; }
+			else       { cubeTotal++; if (r.sound) cubeSound++; }
+		}
+		log::info("  ----------------------------------------------------------");
+		log::info("  CUBE-like: {}/{} sound", cubeSound, cubeTotal);
+		log::info("  AIR modes: {}/{} sound", airSound, airTotal);
+		if (cubeTotal > 0 && cubeSound == cubeTotal && airSound < airTotal) {
+			log::info("  => Restores are exact in cube and not in air. The hybrid design "
+			          "is justified: anchor air-mode backtracks on a cube savestate.");
+		} else if (cubeTotal > 0 && cubeSound < cubeTotal) {
+			log::error("  => Cube restores are NOT reliably exact. The hybrid design would "
+			           "be built on a false assumption - anchor on frame 0 instead.");
+		}
+		log::info("===========================================================");
+		st.sweepAnchors.clear();
+	}
+
 	st.mode = Mode::Idle;
 }
 
@@ -1541,6 +1638,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				m_player1->saveToCheckpoint(pc);
 				st.playerCp = pc;
 			}
+			if (auto* pp = m_player1) {
+				st.anchorWasAir = pp->m_isShip || pp->m_isBird || pp->m_isDart || pp->m_isSwing;
+			}
+			st.anchorPct = pl->getCurrentPercent();
 			st.restorePhase = 1;
 			// Snapshot the exact state at capture time, so the state after
 			// restore+realign can be compared against it field by field. This
@@ -2503,7 +2604,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (auto* p = m_player1) {
 			d.airPolicy = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
 		}
-		if (!g_config.noSavestates) {
+		// Skip the checkpoint for air decisions under hybrid restore: they are
+		// never restored to, so capturing one is 22 KB and a createCheckpoint call
+		// wasted per decision - and air sections have the most decisions.
+		const bool needsCheckpoint = !g_config.noSavestates &&
+		                             !(g_config.hybridRestore && d.airPolicy);
+		if (needsCheckpoint) {
 			if (CheckpointObject* cp = pl->createCheckpoint()) { cp->retain(); d.cp = cp; }
 		}
 
@@ -2693,6 +2799,75 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		Solver::get().restores++;
 	}
 
+	// Put the player back at decision `d`, whatever that takes.
+	//
+	// THE single place repositioning is decided. Having this logic inline at each
+	// call site meant it kept getting fixed in one path and not another: the
+	// death gate, then the no-savestate deepening path, then the hybrid deepening
+	// path all broke the same way.
+	//
+	// Returns true if repositioning is still in flight (a replay is running and
+	// the caller should yield); false if the player is already at `d`.
+	bool solverRepositionTo(Decision& d) {
+		auto& sv = Solver::get();
+
+		sv.resumeHold    = d.choice;
+		sv.resumeToggles = d.togglesBefore +
+			((d.airPolicy && d.choice != d.enteringHold) ? 1 : 0);
+		sv.resumeBranch  = d.step;
+		sv.macro.resize(static_cast<size_t>(d.step), 0);
+
+		// A usable checkpoint: cube-mode restores are exact (Probe 4b, 5/5).
+		if (d.cp && !g_config.noSavestates) {
+			solverRestoreState(d);
+			sv.step        = d.step;
+			sv.hold        = sv.resumeHold;
+			sv.togglesUsed = sv.resumeToggles;
+			sv.lastBranch  = sv.resumeBranch;
+			return false;
+		}
+
+		// No usable checkpoint. Prefer the nearest CUBE ancestor plus a forward
+		// replay - bounded by the air section rather than the whole prefix.
+		if (g_config.hybridRestore && !g_config.noSavestates && !sv.stack.empty()) {
+			size_t ai = sv.stack.size() - 1;
+			bool found = false;
+			while (true) {
+				if (!sv.stack[ai].airPolicy && sv.stack[ai].cp) { found = true; break; }
+				if (ai == 0) break;
+				ai--;
+			}
+			if (found) {
+				Decision& anchor = sv.stack[ai];
+				solverRestoreState(anchor);
+				sv.step = anchor.step;
+				if (sv.step < d.step) {
+					sv.anchorReplaying    = true;
+					sv.anchorReplayTarget = d.step;
+					sv.anchorReplays++;
+					return true;
+				}
+				sv.hold        = sv.resumeHold;
+				sv.togglesUsed = sv.resumeToggles;
+				sv.lastBranch  = sv.resumeBranch;
+				return false;
+			}
+		}
+
+		// Last resort: replay from frame 0. Needs no checkpoint at all, so it is
+		// always available and always exact.
+		sv.resyncMacro.assign(sv.macro.begin(),
+			sv.macro.begin() + std::min<size_t>(d.step, sv.macro.size()));
+		sv.resyncTarget       = static_cast<int>(sv.resyncMacro.size());
+		sv.resyncing          = true;
+		sv.resyncForBacktrack = true;
+		sv.step               = 0;
+		sv.hold               = false;
+		sv.replayBacktracks++;
+		ProbeState::get().resetPending = true;
+		return true;
+	}
+
 	// Unwind to the most recent decision with an untried branch and take it.
 	// Returns false when the tree is exhausted.
 	bool solverBacktrack() {
@@ -2787,42 +2962,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				sv.togglesUsed = d.togglesBefore +
 					((d.airPolicy && d.choice != d.enteringHold) ? 1 : 0);
 
-				if (g_config.noSavestates) {
-					// Replay from frame 0 to this decision. Exact by construction:
-					// no checkpoint is involved anywhere in the path.
-					sv.resyncMacro.assign(sv.macro.begin(),
-					                      sv.macro.begin() + std::min<size_t>(d.step, sv.macro.size()));
-					sv.resyncTarget       = static_cast<int>(sv.resyncMacro.size());
-					sv.resyncing          = true;
-					sv.resyncForBacktrack = true;
-					sv.resumeHold         = d.choice;
-					sv.resumeToggles      = d.togglesBefore +
-						((d.airPolicy && d.choice != d.enteringHold) ? 1 : 0);
-					sv.resumeBranch       = d.step;
-					sv.step               = 0;
-					sv.hold               = false;
-					sv.replayBacktracks++;
-					ProbeState::get().resetPending = true;
-					return true;
-				}
-
-				const float xBefore = m_player1 ? m_player1->getPositionX() : -1.f;
-				solverRestoreState(d);
-				const float xAfter = m_player1 ? m_player1->getPositionX() : -1.f;
-
-				// Decisive check that a restore actually moves the player back.
-				// Every death previously cost a full run's worth of steps, which
-				// is what you see when the restore is being overridden.
-				if (sv.restores <= 5) {
-					log::info("Solver: restore #{} to step {} - player X {:.1f} -> {:.1f} "
-					          "(dead before: {}, after: {})",
-					          sv.restores, d.step, xBefore, xAfter,
-					          sv.diedAtX, m_player1 && m_player1->m_isDead ? "yes" : "no");
-				}
-				sv.step = d.step;
-				sv.macro.resize(static_cast<size_t>(d.step), 0);
-				sv.hold       = d.choice;
-				sv.lastBranch = d.step;
+				if (solverRepositionTo(d)) return true;
+				sv.togglesUsed = sv.resumeToggles;
 				return true;
 			}
 
@@ -2847,9 +2988,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// GAME seconds plays back in a fraction of a wall-clock second. Game time
 		// and wall-clock time are not interchangeable here.
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
-		          "steps {}  budget {}  commit {}  resync {}/{}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
+		          "steps {}  budget {}  commit {}  resync {}/{}  anchorReplays {}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
-		          g_config.toggleBudget, sv.commitDepth, sv.resyncs, sv.resyncFailures, stepsPerSec, stepsPerSec / 240.0,
+		          g_config.toggleBudget, sv.commitDepth, sv.resyncs, sv.resyncFailures,
+		          sv.anchorReplays, stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
 	}
 
@@ -2961,6 +3103,35 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		auto* pl = PlayLayer::get();
 		if (!pl || !m_player1) return false;
 
+		// Hybrid anchor replay: we restored an exact cube checkpoint and are now
+		// replaying the macro forward through the air section to the decision.
+		// No savestate is involved past the cube anchor, so this is exact.
+		if (sv.anchorReplaying) {
+			const size_t idx = static_cast<size_t>(sv.step);
+			const bool pressed = idx < sv.macro.size() && sv.macro[idx] != 0;
+			applyInput(pressed);
+			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+			sv.step++;
+			sv.steps++;
+
+			if (m_player1->m_isDead) {
+				// The replayed prefix should not die - if it does, the macro and
+				// the anchor disagree, so drop back to the frontier and continue.
+				log::warn("Solver: anchor replay died at step {} (target {}) - "
+				          "macro and anchor disagree", sv.step, sv.anchorReplayTarget);
+				sv.anchorReplaying = false;
+				return false;
+			}
+			if (sv.step >= sv.anchorReplayTarget) {
+				sv.anchorReplaying = false;
+				sv.hold        = sv.resumeHold;
+				sv.togglesUsed = sv.resumeToggles;
+				sv.lastBranch  = sv.resumeBranch;
+				sv.macro.resize(static_cast<size_t>(sv.step), 0);
+			}
+			return true;
+		}
+
 		// Resync: replay the committed prefix with NO savestates and no
 		// branching. This is the validation - if it survives to the target, the
 		// prefix provably works in normal play.
@@ -2984,9 +3155,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			static bool warned = false;
 			if (!warned) {
 				warned = true;
-				log::error("Solver: player still dead after a restore. "
-				           "loadFromCheckpoint does not revive on its own; the search "
-				           "cannot continue without a respawn path. Stopping.");
+				log::error("Solver: player still dead after repositioning at step {}. "
+				           "Some path reached solverStep without restoring or replaying - "
+				           "reposition and step are out of sync. Stopping.", sv.step);
 			}
 			solverReport(true);
 			solverWriteMacro("partial.txt");
@@ -3076,33 +3247,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					// Resume from the committed prefix, not from level start:
 					// re-deriving a solved prefix is exactly the waste this fixes.
 					if (!sv.stack.empty()) {
+						// Same repositioning as backtracking, via the shared path.
 						Decision& d = sv.stack.back();
-
-						if (g_config.noSavestates) {
-							// No checkpoint exists; reposition by replay, exactly as
-							// backtracking does. Without this the solver carried on
-							// from whatever state the player happened to be in.
-							sv.resyncMacro.assign(sv.macro.begin(),
-								sv.macro.begin() + std::min<size_t>(d.step, sv.macro.size()));
-							sv.resyncTarget       = static_cast<int>(sv.resyncMacro.size());
-							sv.resyncing          = true;
-							sv.resyncForBacktrack = true;
-							sv.resumeHold         = d.choice;
-							sv.resumeToggles      = d.togglesBefore;
-							sv.resumeBranch       = d.step;
-							sv.step               = 0;
-							sv.hold               = false;
-							ProbeState::get().resetPending = true;
-							return false;
-						}
-
-						solverRestoreState(d);
-						sv.step        = d.step;
-						sv.macro.resize(static_cast<size_t>(d.step), 0);
-						sv.hold        = d.choice;
-						sv.lastBranch  = d.step;
-						sv.togglesUsed = d.togglesBefore +
-							((d.airPolicy && d.choice != d.enteringHold) ? 1 : 0);
+						solverRepositionTo(d);
+						sv.togglesUsed  = sv.resumeToggles;
 						sv.deathsAtBest = sv.deaths;
 						// Reopen the frontier above the floor at the new budget.
 						for (auto& e : sv.stack) {
