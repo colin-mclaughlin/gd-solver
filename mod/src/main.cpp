@@ -859,6 +859,7 @@ void onAttemptEnded() {
 	else                 finishDeterminismSweep();
 }
 
+
 // ---------------------------------------------------------------------------
 // Verification: does the macro reproduce in a clean run?
 // ---------------------------------------------------------------------------
@@ -867,12 +868,12 @@ void onAttemptEnded() {
 // with no restores and no practice mode. This is the check that makes an
 // unsound restore impossible to mistake for a success.
 
-void startVerify(bool practiceMode) {
+void startVerify(bool practiceMode, const char* file = "solution.txt") {
 	auto& st = ProbeState::get();
 	auto* pl = PlayLayer::get();
 	if (!pl) { log::warn("Verify: not in a level"); return; }
 
-	std::string path = levelFilePath("solution.txt");
+	std::string path = levelFilePath(file);
 	bool fileFix = false;
 	if (!loadMacroFile(path, st.scripted, &fileFix) || st.scripted.empty()) {
 		log::error("Verify: no macro at {}", path);
@@ -889,9 +890,9 @@ void startVerify(bool practiceMode) {
 	// both, practice mode is innocent and restore soundness is the suspect.
 	st.mode = Mode::Verify;
 	st.resetPending = true;
-	log::info("Verify: replaying {} steps from frame 0, practice mode {}, "
+	log::info("Verify: replaying {} ({} steps) from frame 0, practice mode {}, "
 	          "no savestates, no restores. physics_fix={}",
-	          st.scripted.size(), practiceMode ? "ON" : "OFF", fileFix ? 1 : 0);
+	          file, st.scripted.size(), practiceMode ? "ON" : "OFF", fileFix ? 1 : 0);
 }
 
 void finishVerify(bool completed, int atStep, float pct) {
@@ -1037,6 +1038,11 @@ struct Decision {
 
 int decisionCost(Decision const& d, bool choice) {
 	switch (d.modeClass) {
+		// A tap costs 1. Charging per RHYTHM CHANGE instead (cheap bursts,
+		// expensive isolated taps) was tried and regressed Theory of Everything
+		// from 78.90% to 32.49% - the first UFO section needs scattered single
+		// taps, which doubled in price. Neither model dominates; per-tap is the
+		// one that demonstrably clears more.
 		case ModeClass::Tap:    return choice ? 1 : 0;
 		case ModeClass::Hold:   return (choice != d.enteringHold) ? 1 : 0;
 		case ModeClass::Ground: default: return 0;
@@ -1087,6 +1093,8 @@ struct Solver {
 	int                   resumeToggles  = 0;
 	int                   resumeBranch   = 0;
 	uint64_t              replayBacktracks = 0;
+	bool                  tapping            = false; // rhythm state (persists)
+	bool                  resumeTapping      = false;
 	int                   tapRemaining       = 0;   // steps left in the current tap
 	bool                  anchorReplaying    = false;
 	int                   anchorReplayTarget = 0;
@@ -1097,6 +1105,9 @@ struct Solver {
 	uint64_t              resyncFailures = 0;
 	std::vector<uint8_t>  resyncMacro;      // prefix being validated
 	std::vector<uint8_t>  lastGoodMacro;    // last prefix that replayed clean
+	// The furthest-reaching path found so far, kept so a stalled search can be
+	// WATCHED rather than inferred from counters. Written to <level>_best.txt.
+	std::vector<uint8_t>  bestMacro;
 	int                   lastGoodStep   = 0;
 
 	void clear() {
@@ -1118,6 +1129,8 @@ struct Solver {
 		resyncing = false;
 		resyncForBacktrack = false;
 		replayBacktracks = 0;
+		tapping = false;
+		resumeTapping = false;
 		tapRemaining = 0;
 		anchorReplaying = false;
 		anchorReplayTarget = 0;
@@ -1127,6 +1140,7 @@ struct Solver {
 		resyncs = resyncFailures = 0;
 		resyncMacro.clear();
 		lastGoodMacro.clear();
+		bestMacro.clear();
 		lastGoodStep = 0;
 		prevAirMode = false;
 		prevOnGround = false;
@@ -1143,6 +1157,10 @@ struct Solver {
 	static Solver& get() { static Solver s; return s; }
 };
 
+// Write the furthest-reaching path, so a stall can be replayed and watched at
+// normal speed instead of diagnosed from death counts.
+void solverWriteBestMacro();
+
 void solverWriteMacro(const char* name) {
 	auto& sv = Solver::get();
 	std::string path = levelFilePath(name);
@@ -1156,6 +1174,27 @@ void solverWriteMacro(const char* name) {
 		std::fputc('\n', f);
 		std::fclose(f);
 		log::info("Solver: macro written to {}", path);
+	}
+}
+
+// Write the furthest-reaching path the search has found. When the solver stalls,
+// the counters say WHERE it stops but never WHY - this lets the best attempt be
+// replayed and watched at normal speed instead of inferred from death counts.
+void solverWriteBestMacro() {
+	auto& sv = Solver::get();
+	if (sv.bestMacro.empty()) return;
+	std::string path = levelFilePath("best.txt");
+	if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+		std::fprintf(f, "# gd-solver best-progress path, %zu steps, physics_fix=%d, 240Hz\n",
+		             sv.bestMacro.size(), g_config.physicsFix ? 1 : 0);
+		for (size_t i = 0; i < sv.bestMacro.size(); i++) {
+			std::fputc(sv.bestMacro[i] ? '1' : '0', f);
+			if ((i + 1) % 80 == 0) std::fputc('\n', f);
+		}
+		std::fputc('\n', f);
+		std::fclose(f);
+		log::info("Solver: best path ({} steps, {:.2f}%) written to {} - press F9 to "
+		          "watch it at normal speed", sv.bestMacro.size(), sv.bestPct, path);
 	}
 }
 
@@ -1531,6 +1570,15 @@ void pollHotkeys() {
 		}
 	}
 
+	// Watch the best path the search has found, at normal speed. When the solver
+	// stalls, the counters say WHERE it stops but not WHY - this replays the
+	// furthest-reaching attempt so the failure can actually be seen.
+	if (keyPressedEdge(VK_F9)) {
+		auto& sv = Solver::get();
+		if (sv.running) { solverWriteBestMacro(); }
+		startVerify(false, "best.txt");
+	}
+
 	// Player-only checkpoints are deliberately NOT offered. PlayerCheckpoint
 	// carries no level state, so restoring one discards trigger and
 	// moving-object state - fine on a 2013 level, wrong everywhere this project
@@ -1546,6 +1594,7 @@ void pollHotkeys() {
 		if (sv.running) {
 			log::info("Solver: stopped by user at best {:.2f}%", sv.bestPct);
 			solverWriteMacro("partial.txt");
+			solverWriteBestMacro();
 			sv.clear();
 			st.mode = Mode::Idle;
 		} else if (PlayLayer::get()) {
@@ -2698,9 +2747,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	void applyDecisionChoice(Decision const& d) {
 		auto& sv = Solver::get();
 		if (d.modeClass == ModeClass::Tap) {
+			sv.tapping      = d.choice;
 			sv.tapRemaining = d.choice ? g_config.tapLengthSteps : 0;
 			sv.hold         = d.choice;
 		} else {
+			sv.tapping      = false;
 			sv.tapRemaining = 0;
 			sv.hold         = d.choice;
 		}
@@ -2945,6 +2996,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		sv.resumeHold    = d.choice;
 		sv.resumeTap     = (d.modeClass == ModeClass::Tap && d.choice)
 		                 ? g_config.tapLengthSteps : 0;
+		sv.resumeTapping = (d.modeClass == ModeClass::Tap) ? d.choice : false;
 		sv.resumeToggles = d.togglesBefore + decisionCost(d, d.choice);
 		sv.resumeBranch  = d.step;
 		sv.macro.resize(static_cast<size_t>(d.step), 0);
@@ -2954,6 +3006,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			solverRestoreState(d);
 			sv.step        = d.step;
 			sv.hold         = sv.resumeHold;
+			sv.tapping      = sv.resumeTapping;
 			sv.tapRemaining = sv.resumeTap;
 			sv.togglesUsed  = sv.resumeToggles;
 			sv.lastBranch   = sv.resumeBranch;
@@ -2981,6 +3034,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					return true;
 				}
 				sv.hold         = sv.resumeHold;
+				sv.tapping      = sv.resumeTapping;
 				sv.tapRemaining = sv.resumeTap;
 				sv.togglesUsed  = sv.resumeToggles;
 				sv.lastBranch   = sv.resumeBranch;
@@ -3205,6 +3259,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			sv.resyncForBacktrack = false;
 			sv.resyncing   = false;
 			sv.hold         = sv.resumeHold;
+			sv.tapping      = sv.resumeTapping;
 			sv.tapRemaining = sv.resumeTap;
 			sv.togglesUsed  = sv.resumeToggles;
 			sv.lastBranch   = sv.resumeBranch;
@@ -3354,6 +3409,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// Record where the frontier reached. The commit floor is derived
 			// from this against the CURRENT stack, never stored as an index.
 			if (sv.step > sv.bestStep) sv.bestStep = sv.step;
+			sv.bestMacro.assign(sv.macro.begin(),
+			                    sv.macro.begin() + std::min<size_t>(sv.step, sv.macro.size()));
 
 			// Progress: the window was wide enough, so return to the cheap
 			// default. A permanently wide window would keep the whole tail of the
