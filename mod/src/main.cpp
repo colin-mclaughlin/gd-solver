@@ -398,11 +398,18 @@ struct ProbeState {
 	// (exact in cube at step 480, not exact in ship at 18135), and the hybrid
 	// design rests on cube restores being reliably exact. One point is not
 	// enough evidence to build on.
-	struct SweepResult { int anchor; bool air; bool sound; size_t divergeAt; float pct; };
+	// `mode` is the specific game mode, not just air-vs-cube. Lumping ship, UFO
+	// and wave together as "AIR" hid the fact that every air anchor ever tested
+	// was ship or wave: no restore had been measured inside a UFO at all until
+	// Theory of Everything, and UFO is the one mode where a click adds impulse
+	// mid-arc, so its restore behaviour is not implied by ship's.
+	struct SweepResult { int anchor; bool air; bool sound; size_t divergeAt; float pct;
+	                     const char* mode; };
 	std::vector<int>         sweepAnchors;
 	size_t                   sweepIndex = 0;
 	std::vector<SweepResult> sweepResults;
 	bool                     anchorWasAir = false;
+	const char*              anchorMode = "CUBE";
 	float                    anchorPct = 0.f;
 
 	int          restorePhase  = 0;   // 0 = running to anchor, 1 = segment A, 2 = segment B
@@ -1606,6 +1613,13 @@ struct Solver {
 	bool                         pathTraceFull = false;
 	bool                         pendingPostRestore = false;
 
+	// best.txt used to be written ONLY by F9. A stalled run therefore left the
+	// file holding whatever an earlier, unrelated run had produced - and F10
+	// silently swept anchors across that stale path, reporting results for a
+	// section of the level the current search had never reached. Flag the macro
+	// dirty on every improvement and flush it from the throttled report.
+	bool                         bestMacroDirty = false;
+
 	void clear() {
 		// Drop our checkpoints out of GD's reach first. Releasing one while the
 		// game still references it leaves a dangling pointer, which is a
@@ -1636,6 +1650,7 @@ struct Solver {
 		pathTrace.clear();
 		pathTraceFull = false;
 		pendingPostRestore = false;
+		bestMacroDirty = false;
 		lastGoodStep = 0;
 		prevAirMode = false;
 		prevOnGround = false;
@@ -1718,6 +1733,16 @@ void startRestoreTest(RestoreKind kind) {
 	bool loaded = loadMacroFile(levelFilePath("solution.txt"), st.scripted, &fix);
 	if (loaded && !st.scripted.empty()) {
 		log::info("Probe 4b: using solution.txt ({} steps)", st.scripted.size());
+	} else if (loadMacroFile(levelFilePath("best.txt"), st.scripted, &fix) &&
+	           !st.scripted.empty()) {
+		// A STALLED level has no solution, which used to make this probe useless
+		// on exactly the levels that need it most. The best path is still a real
+		// trajectory the search flew, so restore fidelity can be measured along
+		// it - including in sections no solved level contains. Theory of
+		// Everything's UFO is the first UFO the restore has ever been tested in.
+		log::info("Probe 4b: no solution.txt - using best.txt ({} steps). This is the "
+		          "furthest the search reached, so anchors sample the section it is "
+		          "stuck in.", st.scripted.size());
 	} else if (loadInput(st.scripted, &fix) && !st.scripted.empty()) {
 		log::warn("Probe 4b: no solution.txt, falling back to input.txt - note this "
 		          "recording is known not to replay faithfully, so a divergence may "
@@ -1808,10 +1833,11 @@ void finishRestoreTest() {
 	log::info("  segment B (restored): {} rows, hash {:016X}", st.segmentB.size(), hB);
 
 	if (at == SIZE_MAX && st.segmentA.size() == st.segmentB.size()) {
-		log::info("  RESTORE IS SOUND - {} steps after restore are bit-identical.",
-		          st.segmentA.size());
+		log::info("  RESTORE IS SOUND - {} steps after restore are bit-identical.  "
+		          "[{} at {:.2f}%]", st.segmentA.size(), st.anchorMode, st.anchorPct);
 	} else {
-		log::error("  RESTORE IS NOT SOUND - diverges {} step(s) after the restore point.", at);
+		log::error("  RESTORE IS NOT SOUND - diverges {} step(s) after the restore "
+		           "point.  [{} at {:.2f}%]", at, st.anchorMode, st.anchorPct);
 		std::string base = st.restoreKind == RestoreKind::Full ? "probe4b_full" : "probe4b_playeronly";
 		st.segmentA.writeCsv(probe::outputPath(base + "_A.csv"));
 		st.segmentB.writeCsv(probe::outputPath(base + "_B.csv"));
@@ -1824,7 +1850,8 @@ void finishRestoreTest() {
 	// Sweeping: record this anchor and move to the next.
 	if (!st.sweepAnchors.empty()) {
 		const bool sound = (at == SIZE_MAX && st.segmentA.size() == st.segmentB.size());
-		st.sweepResults.push_back({st.restoreAnchor, st.anchorWasAir, sound, at, st.anchorPct});
+		st.sweepResults.push_back({st.restoreAnchor, st.anchorWasAir, sound, at,
+		                           st.anchorPct, st.anchorMode});
 
 		st.sweepIndex++;
 		if (st.sweepIndex < st.sweepAnchors.size()) {
@@ -1843,8 +1870,7 @@ void finishRestoreTest() {
 		int cubeTotal = 0, cubeSound = 0, airTotal = 0, airSound = 0;
 		log::info("============ Probe 4b: restore fidelity by MODE ============");
 		for (auto const& r : st.sweepResults) {
-			log::info("  step {:>6}  {:>6.2f}%  {:<5}  {}", r.anchor, r.pct,
-			          r.air ? "AIR" : "CUBE",
+			log::info("  step {:>6}  {:>6.2f}%  {:<6}  {}", r.anchor, r.pct, r.mode,
 			          r.sound ? "SOUND" : fmt::format("NOT SOUND (diverges at {})", r.divergeAt));
 			if (r.air) { airTotal++;  if (r.sound) airSound++; }
 			else       { cubeTotal++; if (r.sound) cubeSound++; }
@@ -2382,6 +2408,21 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		const int since = st.stepCounter - st.restoreAnchor;
 
 		if (st.restorePhase == 0) {
+			// The macro must actually REACH the anchor. best.txt is a
+			// savestate-derived path that has never been verified from frame 0,
+			// so it can die anywhere - and when it did, this probe silently
+			// looped forever on a reset instead of saying so, discarding the
+			// anchors it had already measured.
+			if (m_player1 && m_player1->m_isDead) {
+				log::error("Probe 4b: the macro DIED at step {} ({:.2f}%) before reaching "
+				           "anchor {}. Everything above this line is still valid; "
+				           "anchors beyond it were never measured.",
+				           st.stepCounter, pl->getCurrentPercent(), st.restoreAnchor);
+				log::error("  A best.txt path is not verified to replay from frame 0. "
+				           "Solve the level and use solution.txt for a full sweep.");
+				finishRestoreTest();
+				return false;
+			}
 			if (st.stepCounter < st.restoreAnchor) return true;
 
 			// Reached the anchor: capture with BOTH mechanisms so the same run
@@ -2394,6 +2435,14 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			}
 			if (auto* pp = m_player1) {
 				st.anchorWasAir = pp->m_isShip || pp->m_isBird || pp->m_isDart || pp->m_isSwing;
+				st.anchorMode = pp->m_isShip   ? "SHIP"
+				              : pp->m_isBird   ? "UFO"
+				              : pp->m_isDart   ? "WAVE"
+				              : pp->m_isSwing  ? "SWING"
+				              : pp->m_isBall   ? "BALL"
+				              : pp->m_isRobot  ? "ROBOT"
+				              : pp->m_isSpider ? "SPIDER"
+				              :                  "CUBE";
 			}
 			st.anchorPct = pl->getCurrentPercent();
 			st.restorePhase = 1;
@@ -3996,6 +4045,14 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (!force && probe::ticksToMicros(now - sv.lastReport) < 2'000'000.0) return;
 		sv.lastReport = now;
 
+		// Flush the best path here rather than on every improvement: this is
+		// already throttled to once every two seconds, and file I/O has no place
+		// in the stepping path.
+		if (sv.bestMacroDirty) {
+			sv.bestMacroDirty = false;
+			solverWriteBestMacro();
+		}
+
 		const double secs = probe::ticksToMicros(now - sv.startTicks) / 1e6;
 		const double stepsPerSec = secs > 0 ? sv.steps / secs : 0.0;
 
@@ -4193,6 +4250,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		const float pct = pl->getCurrentPercent();
 		if (pct > sv.bestPct) {
 			sv.bestPct      = pct;
+			sv.bestMacroDirty = true;
 			sv.deathsAtBest = sv.deaths; // progress: reset the stall counter
 
 			// Record where the frontier reached. The commit floor is derived
