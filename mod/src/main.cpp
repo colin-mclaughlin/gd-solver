@@ -248,15 +248,6 @@ struct Config {
 	// replay is the only exact option.
 	bool noSavestates = false;
 
-	// Hybrid restore (measured, Probe 4b sweep across Stereo Madness):
-	//   CUBE-like modes  5/5 anchors bit-identical
-	//   AIR modes        1/3 anchors bit-identical
-	// Air restores are not merely slower to trust, they are UNRELIABLE - one
-	// good sample proves nothing, which is why drift went unnoticed for so long.
-	// So never restore to an air decision: restore the nearest CUBE ancestor
-	// (exact) and replay forward through the air section. Bounded by the section
-	// length rather than the whole prefix.
-	bool hybridRestore = true;
 };
 
 Config g_config;
@@ -276,8 +267,9 @@ enum class Mode {
 
 // Which save/restore mechanism the restore test exercises.
 enum class RestoreKind {
-	Full,        // PlayLayer::createCheckpoint / loadFromCheckpoint
-	PlayerOnly,  // PlayerObject::saveToCheckpoint / loadFromCheckpoint
+	Full,        // createCheckpoint + m_checkpointArray + resetLevel (practice respawn)
+	PlayerOnly,  // PlayerObject::saveToCheckpoint / loadFromCheckpoint - no level state
+	DirectLoad,  // createCheckpoint + PlayLayer::loadFromCheckpoint called DIRECTLY
 };
 
 struct ProbeState {
@@ -391,6 +383,12 @@ struct ProbeState {
 	// solver's per-attempt bookkeeping.
 	bool solverRestoring = false;
 
+	// Suppresses PlayLayer::destroyPlayer outright. The direct-load restore path
+	// needs the player never to die, because loadFromCheckpoint repositions but
+	// does not revive - a separate problem that is why this path was abandoned
+	// before its FIDELITY was ever measured.
+	bool suppressDeath = false;
+
 	// --- Probe 4b: restore fidelity ---
 	// Drift-zero at t=0 is necessary but not sufficient. The real question is
 	// whether the SAME input from a restored state produces the same future.
@@ -429,6 +427,25 @@ struct ProbeState {
 	bool   aJumping = false;
 	double aAttemptTime = 0.0, aBestAttemptTime = 0.0, aCurrentTime = 0.0;
 	bool   aHasJumped = false;
+
+	// Fields loadFromCheckpoint does NOT write. Identified by byte-diff, not
+	// guessed: they stayed stale through both a bare direct load and a
+	// reset-then-load, because nothing in the restore path ever assigns them.
+	// Under the practice respawn they do not differ, so the respawn writes them.
+	//
+	// m_position is a PlayerObject member distinct from the CCNode position -
+	// getPositionX() reads EXACT while this differs, which is how a "perfect"
+	// boundary check can still diverge on the very next step.
+	std::vector<PlayerButtonCommand> aQueuedButtons; // layer input queue at the anchor
+	cocos2d::CCPoint aNodePos   = {0.f, 0.f}; // cocos transform at the anchor
+	float         aCameraFlip      = 0.f; // mirror transition progress at the anchor
+	float         aCameraUnzoomedX = 0.f;
+	bool          aUnk322a         = false;
+	bool          aUnk3251         = false;
+	bool          aHoldingJump  = false; // m_holdingButtons[Jump] at the anchor
+	bool          aIsHolding    = false; // our injection bookkeeping at the anchor
+	double        aLastJumpTime = 0.0;
+	cocos2d::CCPoint aPlayerPos = {0.f, 0.f};
 	CheckpointObject* fullCp   = nullptr;
 	PlayerCheckpoint* playerCp = nullptr;
 
@@ -438,12 +455,40 @@ struct ProbeState {
 		// leaving it there across a level reset means the game holds a pointer to
 		// something we freed, and the next cycle's removeAllObjects double-frees
 		// it. That crashed the sweep on its third anchor.
+		// The direct-load path never puts the object in the array at all, but may
+		// leave m_currentCheckpoint pointing at it, so clear that too.
 		if (auto* pl = PlayLayer::get()) {
 			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+			if (fullCp && pl->m_currentCheckpoint == fullCp) pl->m_currentCheckpoint = nullptr;
 		}
 		if (fullCp)   { fullCp->release();   fullCp   = nullptr; }
 		if (playerCp) { playerCp->release(); playerCp = nullptr; }
 	}
+
+	// --- solve-vs-verify divergence (Probe 8) ---------------------------
+	//
+	// The verify only ever reported where the player DIED. That is not where the
+	// path went wrong: a restore can leave the run on a slightly different
+	// trajectory that survives for thousands of steps before it finally clips
+	// something. Stereo Madness died at step 18855 while every restore the F10
+	// sweep sampled was bit-identical - eight samples out of 1466 restores.
+	//
+	// So keep the trajectory the solver actually flew, and have the clean replay
+	// compare against it step by step. The first step that differs is the real
+	// defect; the decision at or before it is the restore to suspect.
+	std::vector<probe::TraceRow> solvePathTrace;
+	std::vector<int>             solveDecisionSteps;
+
+	// The replay's own trajectory, so both can be dumped side by side. Latching
+	// only the FIRST divergence was not enough: a single bit that flips and
+	// immediately re-converges says something completely different from one that
+	// never recovers, and the first version of this could not tell them apart.
+	std::vector<probe::TraceRow> verifyPathTrace;
+	int  verifyDivergeStep     = -1;  // first step that differs at all
+	int  verifyPersistStep     = -1;  // start of the run of differences that never ends
+	int  verifyReconvergeStep  = -1;  // where the first divergence healed, if it did
+	int  verifyDivergeCount    = 0;   // total differing steps
+	bool verifyDivergeLogged   = false;
 
 	// --- determinism sweep (spans attempts; cleared when a sweep starts) ---
 	int  runIndex    = 0;
@@ -890,9 +935,135 @@ void startVerify(bool practiceMode, const char* file = "solution.txt") {
 	// both, practice mode is innocent and restore soundness is the suspect.
 	st.mode = Mode::Verify;
 	st.resetPending = true;
+	st.verifyDivergeStep    = -1;
+	st.verifyPersistStep    = -1;
+	st.verifyReconvergeStep = -1;
+	st.verifyDivergeCount   = 0;
+	st.verifyDivergeLogged  = false;
+	st.verifyPathTrace.clear();
+	st.verifyPathTrace.reserve(st.scripted.size() + 256);
 	log::info("Verify: replaying {} ({} steps) from frame 0, practice mode {}, "
 	          "no savestates, no restores. physics_fix={}",
 	          file, st.scripted.size(), practiceMode ? "ON" : "OFF", fileFix ? 1 : 0);
+	if (!st.solvePathTrace.empty()) {
+		log::info("  Comparing against the solver's own trajectory ({} steps). The "
+		          "first differing step is where the run actually went wrong - the "
+		          "death is only where it finally showed.", st.solvePathTrace.size());
+	}
+}
+
+// Dump both trajectories side by side so the difference can be read directly
+// instead of inferred from one latched step. Raw bits for every numeric field:
+// a decimal rendering can compare equal while the doubles differ in the low
+// bits, which is exactly the divergence being hunted.
+void writeVerifyDiff() {
+	auto& st = ProbeState::get();
+	if (st.solvePathTrace.empty() || st.verifyPathTrace.empty()) return;
+
+	const std::string path = levelFilePath("verify_diff.csv");
+	std::FILE* f = std::fopen(path.c_str(), "wb");
+	if (!f) { log::error("  could not write {}", path); return; }
+
+	std::fprintf(f,
+		"step,differs,"
+		"s_x,v_x,s_y,v_y,s_rot,v_rot,s_speed,v_speed,"
+		"s_yvel,v_yvel,s_grav,v_grav,s_flags,v_flags,flag_diff,post_restore,s_pct,v_pct\n");
+
+	const size_t n = std::min(st.solvePathTrace.size(), st.verifyPathTrace.size());
+	const uint32_t keep = ~(probe::kInputSourceMask | probe::kSolverOnlyMask);
+	for (size_t i = 0; i < n; i++) {
+		auto const& a = st.solvePathTrace[i];
+		auto const& b = st.verifyPathTrace[i];
+		const bool same =
+			a.x == b.x && a.y == b.y && a.rotation == b.rotation &&
+			a.playerSpeed == b.playerSpeed && a.yVelocity == b.yVelocity &&
+			a.gravity == b.gravity && (a.flags & keep) == (b.flags & keep);
+		std::fprintf(f,
+			"%zu,%d,"
+			"%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
+			"%.17g,%.17g,%.17g,%.17g,%08X,%08X,%08X,%d,%.4f,%.4f\n",
+			i, same ? 0 : 1,
+			(double)probe::asFloat(a.x),           (double)probe::asFloat(b.x),
+			(double)probe::asFloat(a.y),           (double)probe::asFloat(b.y),
+			(double)probe::asFloat(a.rotation),    (double)probe::asFloat(b.rotation),
+			(double)probe::asFloat(a.playerSpeed), (double)probe::asFloat(b.playerSpeed),
+			probe::asDouble(a.yVelocity),          probe::asDouble(b.yVelocity),
+			probe::asDouble(a.gravity),            probe::asDouble(b.gravity),
+			a.flags & keep, b.flags & keep, (a.flags ^ b.flags) & keep,
+			(a.flags & probe::FlagPostRestore) ? 1 : 0,
+			(double)probe::asFloat(a.percent),     (double)probe::asFloat(b.percent));
+	}
+	std::fclose(f);
+	log::info("  Wrote {} rows of solver-vs-replay trajectory to {}", n, path);
+}
+
+// Reports where the clean replay departed from the solver's own trajectory.
+//
+// Shared by BOTH outcomes on purpose. `endStep` is the death step on a failure
+// and the final step on a pass; `passed` only changes the wording.
+void reportDivergence(int endStep, bool passed) {
+	auto& st = ProbeState::get();
+	const char* what = passed ? "end of the run" : "death";
+
+	if (st.solvePathTrace.empty()) {
+		log::error("  No solver trajectory recorded, so the divergence step is "
+		           "unknown. Run F2 to a solve in this session first, then F4.");
+		return;
+	}
+	if (st.verifyDivergeStep < 0) {
+		if (!passed) {
+			log::error("  ... but the replay NEVER diverged from the solver's own "
+			           "trajectory. The path is identical and still dies, so the "
+			           "restores are innocent: practice mode or injection timing "
+			           "differs between the search and the replay.");
+		}
+		return;
+	}
+
+	const int dv = st.verifyDivergeStep;
+	log::error("  FIRST divergence at step {} ({} of {} steps differ in total).",
+	           dv, st.verifyDivergeCount, endStep);
+	if (st.verifyReconvergeStep >= 0) {
+		log::error("  ... and it HEALED at step {}. A divergence that recovers is not "
+		           "what killed the run; look at the permanent one.",
+		           st.verifyReconvergeStep);
+	}
+
+	// Whether the FIRST divergence follows a restore matters even when it heals:
+	// a transient that follows a restore is still a restore defect, just one the
+	// level geometry forgave.
+	const bool firstWasRestore =
+		static_cast<size_t>(dv) < st.solvePathTrace.size() &&
+		(st.solvePathTrace[dv].flags & probe::FlagPostRestore) != 0;
+	log::error("  That first divergence {} the first step after a restore.",
+	           firstWasRestore ? "IS" : "is NOT");
+
+	if (st.verifyPersistStep >= 0) {
+		const int pv = st.verifyPersistStep;
+		int suspect = -1;
+		for (int ds : st.solveDecisionSteps) if (ds <= pv && ds > suspect) suspect = ds;
+		log::error("  PERMANENT divergence begins at step {}, {} steps ({:.2f} s) before "
+		           "the {} - the run never recovered from this one.",
+		           pv, endStep - pv, (endStep - pv) / 240.0, what);
+		const bool wasRestore =
+			static_cast<size_t>(pv) < st.solvePathTrace.size() &&
+			(st.solvePathTrace[pv].flags & probe::FlagPostRestore) != 0;
+		log::error("  That step {} the first step after a restore.",
+		           wasRestore ? "IS" : "is NOT");
+		if (!wasRestore) {
+			log::error("  So this is NOT a restore-fidelity defect: the solver and the "
+			           "replay ran the same input from the same state and got "
+			           "different answers.");
+		}
+		if (suspect >= 0) {
+			log::error("  (Nearest decision at or before it: step {}, {} steps earlier "
+			           "- decisions are dense, so this alone means little.)",
+			           suspect, pv - suspect);
+		}
+	} else {
+		log::error("  Every divergence healed - the two runs agreed at the final step.");
+	}
+	writeVerifyDiff();
 }
 
 void finishVerify(bool completed, int atStep, float pct) {
@@ -901,9 +1072,25 @@ void finishVerify(bool completed, int atStep, float pct) {
 	log::info("================ VERIFICATION (practice {}) ================",
 	          plv && plv->m_isPracticeMode ? "ON" : "OFF");
 	if (completed) {
-		log::info("  PASSED - the macro clears the level from frame 0 in normal mode.");
-		log::info("  {} steps, reached {:.2f}%", atStep, pct);
-		log::info("  This is an independently reproducible solution, not a savestate artifact.");
+		if (st.verifyDivergeStep >= 0) {
+			// A pass is not the same as a match. The search flew one trajectory and
+			// the macro reproduces a different one; this run survived anyway, which
+			// makes it luck rather than correctness. Reporting divergence only on
+			// failure hid precisely this case - Time Machine passed while diverging
+			// and said nothing about it.
+			log::warn("  PASSED, BUT DIVERGED - the macro clears the level, yet the "
+			          "replay did not follow the solver's own trajectory.");
+			log::info("  {} steps, reached {:.2f}%", atStep, pct);
+			log::warn("  A surviving divergence is a restore defect that happened not "
+			          "to be fatal here. Treat this as a bug, not a pass.");
+			reportDivergence(atStep, true);
+		} else {
+			log::info("  PASSED - the macro clears the level from frame 0 in normal mode.");
+			log::info("  {} steps, reached {:.2f}%", atStep, pct);
+			log::info("  Zero diverging steps: the clean replay reproduced the solver's "
+			          "trajectory exactly. This is an independently reproducible "
+			          "solution, not a savestate artifact.");
+		}
 	} else {
 		st.lastVerifyFailStep = atStep;
 
@@ -918,10 +1105,8 @@ void finishVerify(bool completed, int atStep, float pct) {
 
 		log::error("  FAILED - died at step {} of {} ({:.2f}%).",
 		           atStep, st.scripted.size(), pct);
-		log::error("  Probe 4b (F12) will now anchor near this step to test whether "
-		           "restores are still sound this late in the level.");
-		log::error("  The macro does not reproduce. Either a restore was unsound, or "
-		           "practice mode differs from normal play, or injection timing differs.");
+
+		reportDivergence(atStep, false);
 	}
 	log::info("==============================================");
 	st.mode = Mode::Idle;
@@ -967,6 +1152,218 @@ bool isDecisionPoint(PlayerObject* p, int stepsSinceLast) {
 	return onGround || onRing;
 }
 
+// Fields written back after a direct loadFromCheckpoint.
+//
+// loadFromCheckpoint assigns only a SUBSET of PlayerObject, leaving the rest at
+// whatever value it already held - and a reset beforehand only changes WHICH
+// wrong value that is, since nothing assigns the captured one. Enumerating the
+// complement two fields at a time found m_lastJumpTime and m_position, then
+// m_lastPortalPos and m_isOnGround2; this ends that by writing all of them.
+//
+// Generated from bindings/2.2081. Pointers, containers, and cosmetic or
+// anti-cheat fields (particles, streaks, glow, SeedValueRSV) are excluded - the
+// latter re-seed on every access, so forcing them is meaningless and their raw
+// bytes always differ.
+struct PlayerFieldSpan { size_t off, size; };
+static const PlayerFieldSpan kPlayerFields[] = {
+	{offsetof(PlayerObject, m_wasTeleported), sizeof(PlayerObject::m_wasTeleported)},
+	{offsetof(PlayerObject, m_fixGravityBug), sizeof(PlayerObject::m_fixGravityBug)},
+	{offsetof(PlayerObject, m_reverseSync), sizeof(PlayerObject::m_reverseSync)},
+	{offsetof(PlayerObject, m_yVelocityBeforeSlope), sizeof(PlayerObject::m_yVelocityBeforeSlope)},
+	{offsetof(PlayerObject, m_dashX), sizeof(PlayerObject::m_dashX)},
+	{offsetof(PlayerObject, m_dashY), sizeof(PlayerObject::m_dashY)},
+	{offsetof(PlayerObject, m_dashAngle), sizeof(PlayerObject::m_dashAngle)},
+	{offsetof(PlayerObject, m_dashStartTime), sizeof(PlayerObject::m_dashStartTime)},
+	{offsetof(PlayerObject, m_slopeStartTime), sizeof(PlayerObject::m_slopeStartTime)},
+	{offsetof(PlayerObject, m_lastCollisionBottom), sizeof(PlayerObject::m_lastCollisionBottom)},
+	{offsetof(PlayerObject, m_lastCollisionTop), sizeof(PlayerObject::m_lastCollisionTop)},
+	{offsetof(PlayerObject, m_lastCollisionLeft), sizeof(PlayerObject::m_lastCollisionLeft)},
+	{offsetof(PlayerObject, m_lastCollisionRight), sizeof(PlayerObject::m_lastCollisionRight)},
+	{offsetof(PlayerObject, m_unk50C), sizeof(PlayerObject::m_unk50C)},
+	{offsetof(PlayerObject, m_unk510), sizeof(PlayerObject::m_unk510)},
+	{offsetof(PlayerObject, m_slopeAngle), sizeof(PlayerObject::m_slopeAngle)},
+	{offsetof(PlayerObject, m_slopeSlidingMaybeRotated), sizeof(PlayerObject::m_slopeSlidingMaybeRotated)},
+	{offsetof(PlayerObject, m_quickCheckpointMode), sizeof(PlayerObject::m_quickCheckpointMode)},
+	{offsetof(PlayerObject, m_maybeSavedPlayerFrame), sizeof(PlayerObject::m_maybeSavedPlayerFrame)},
+	{offsetof(PlayerObject, m_scaleXRelated2), sizeof(PlayerObject::m_scaleXRelated2)},
+	{offsetof(PlayerObject, m_groundYVelocity), sizeof(PlayerObject::m_groundYVelocity)},
+	{offsetof(PlayerObject, m_yVelocityRelated), sizeof(PlayerObject::m_yVelocityRelated)},
+	{offsetof(PlayerObject, m_scaleXRelated3), sizeof(PlayerObject::m_scaleXRelated3)},
+	{offsetof(PlayerObject, m_scaleXRelated4), sizeof(PlayerObject::m_scaleXRelated4)},
+	{offsetof(PlayerObject, m_scaleXRelated5), sizeof(PlayerObject::m_scaleXRelated5)},
+	{offsetof(PlayerObject, m_isCollidingWithSlope), sizeof(PlayerObject::m_isCollidingWithSlope)},
+	{offsetof(PlayerObject, m_isBallRotating), sizeof(PlayerObject::m_isBallRotating)},
+	{offsetof(PlayerObject, m_unk669), sizeof(PlayerObject::m_unk669)},
+	{offsetof(PlayerObject, m_collidingWithSlopeId), sizeof(PlayerObject::m_collidingWithSlopeId)},
+	{offsetof(PlayerObject, m_slopeFlipGravityRelated), sizeof(PlayerObject::m_slopeFlipGravityRelated)},
+	{offsetof(PlayerObject, m_slopeAngleRadians), sizeof(PlayerObject::m_slopeAngleRadians)},
+	{offsetof(PlayerObject, m_rotationSpeed), sizeof(PlayerObject::m_rotationSpeed)},
+	{offsetof(PlayerObject, m_rotateSpeed), sizeof(PlayerObject::m_rotateSpeed)},
+	{offsetof(PlayerObject, m_isRotating), sizeof(PlayerObject::m_isRotating)},
+	{offsetof(PlayerObject, m_isBallRotating2), sizeof(PlayerObject::m_isBallRotating2)},
+	{offsetof(PlayerObject, m_isHidden), sizeof(PlayerObject::m_isHidden)},
+	{offsetof(PlayerObject, m_speedMultiplier), sizeof(PlayerObject::m_speedMultiplier)},
+	{offsetof(PlayerObject, m_yStart), sizeof(PlayerObject::m_yStart)},
+	{offsetof(PlayerObject, m_gravity), sizeof(PlayerObject::m_gravity)},
+	{offsetof(PlayerObject, m_unk648), sizeof(PlayerObject::m_unk648)},
+	{offsetof(PlayerObject, m_gameModeChangedTime), sizeof(PlayerObject::m_gameModeChangedTime)},
+	{offsetof(PlayerObject, m_padRingRelated), sizeof(PlayerObject::m_padRingRelated)},
+	{offsetof(PlayerObject, m_maybeReducedEffects), sizeof(PlayerObject::m_maybeReducedEffects)},
+	{offsetof(PlayerObject, m_maybeIsFalling), sizeof(PlayerObject::m_maybeIsFalling)},
+	{offsetof(PlayerObject, m_shouldTryPlacingCheckpoint), sizeof(PlayerObject::m_shouldTryPlacingCheckpoint)},
+	{offsetof(PlayerObject, m_playEffects), sizeof(PlayerObject::m_playEffects)},
+	{offsetof(PlayerObject, m_maybeCanRunIntoBlocks), sizeof(PlayerObject::m_maybeCanRunIntoBlocks)},
+	{offsetof(PlayerObject, m_isOnGround3), sizeof(PlayerObject::m_isOnGround3)},
+	{offsetof(PlayerObject, m_checkpointTimeout), sizeof(PlayerObject::m_checkpointTimeout)},
+	{offsetof(PlayerObject, m_lastCheckpointTime), sizeof(PlayerObject::m_lastCheckpointTime)},
+	{offsetof(PlayerObject, m_lastJumpTime), sizeof(PlayerObject::m_lastJumpTime)},
+	{offsetof(PlayerObject, m_lastFlipTime), sizeof(PlayerObject::m_lastFlipTime)},
+	{offsetof(PlayerObject, m_flashTime), sizeof(PlayerObject::m_flashTime)},
+	{offsetof(PlayerObject, m_flashDuration), sizeof(PlayerObject::m_flashDuration)},
+	{offsetof(PlayerObject, m_flashDelay), sizeof(PlayerObject::m_flashDelay)},
+	{offsetof(PlayerObject, m_lastSpiderFlipTime), sizeof(PlayerObject::m_lastSpiderFlipTime)},
+	{offsetof(PlayerObject, m_unkBool5), sizeof(PlayerObject::m_unkBool5)},
+	{offsetof(PlayerObject, m_practiceDeathEffect), sizeof(PlayerObject::m_practiceDeathEffect)},
+	{offsetof(PlayerObject, m_accelerationOrSpeed), sizeof(PlayerObject::m_accelerationOrSpeed)},
+	{offsetof(PlayerObject, m_snapDistance), sizeof(PlayerObject::m_snapDistance)},
+	{offsetof(PlayerObject, m_ringJumpRelated), sizeof(PlayerObject::m_ringJumpRelated)},
+	{offsetof(PlayerObject, m_onFlyCheckpointTries), sizeof(PlayerObject::m_onFlyCheckpointTries)},
+	{offsetof(PlayerObject, m_slopeRotation), sizeof(PlayerObject::m_slopeRotation)},
+	{offsetof(PlayerObject, m_currentSlopeYVelocity), sizeof(PlayerObject::m_currentSlopeYVelocity)},
+	{offsetof(PlayerObject, m_unk3d0), sizeof(PlayerObject::m_unk3d0)},
+	{offsetof(PlayerObject, m_blackOrbRelated), sizeof(PlayerObject::m_blackOrbRelated)},
+	{offsetof(PlayerObject, m_unk3e0), sizeof(PlayerObject::m_unk3e0)},
+	{offsetof(PlayerObject, m_unk3e1), sizeof(PlayerObject::m_unk3e1)},
+	{offsetof(PlayerObject, m_isAccelerating), sizeof(PlayerObject::m_isAccelerating)},
+	{offsetof(PlayerObject, m_isCurrentSlopeTop), sizeof(PlayerObject::m_isCurrentSlopeTop)},
+	{offsetof(PlayerObject, m_collidedTopMinY), sizeof(PlayerObject::m_collidedTopMinY)},
+	{offsetof(PlayerObject, m_collidedBottomMaxY), sizeof(PlayerObject::m_collidedBottomMaxY)},
+	{offsetof(PlayerObject, m_collidedLeftMaxX), sizeof(PlayerObject::m_collidedLeftMaxX)},
+	{offsetof(PlayerObject, m_collidedRightMinX), sizeof(PlayerObject::m_collidedRightMinX)},
+	{offsetof(PlayerObject, m_canPlaceCheckpoint), sizeof(PlayerObject::m_canPlaceCheckpoint)},
+	{offsetof(PlayerObject, m_maybeIsColliding), sizeof(PlayerObject::m_maybeIsColliding)},
+	{offsetof(PlayerObject, m_jumpBuffered), sizeof(PlayerObject::m_jumpBuffered)},
+	{offsetof(PlayerObject, m_stateRingJump), sizeof(PlayerObject::m_stateRingJump)},
+	{offsetof(PlayerObject, m_wasJumpBuffered), sizeof(PlayerObject::m_wasJumpBuffered)},
+	{offsetof(PlayerObject, m_wasRobotJump), sizeof(PlayerObject::m_wasRobotJump)},
+	{offsetof(PlayerObject, m_stateJumpBuffered), sizeof(PlayerObject::m_stateJumpBuffered)},
+	{offsetof(PlayerObject, m_stateRingJump2), sizeof(PlayerObject::m_stateRingJump2)},
+	{offsetof(PlayerObject, m_touchedRing), sizeof(PlayerObject::m_touchedRing)},
+	{offsetof(PlayerObject, m_touchedCustomRing), sizeof(PlayerObject::m_touchedCustomRing)},
+	{offsetof(PlayerObject, m_touchedGravityPortal), sizeof(PlayerObject::m_touchedGravityPortal)},
+	{offsetof(PlayerObject, m_maybeTouchedBreakableBlock), sizeof(PlayerObject::m_maybeTouchedBreakableBlock)},
+	{offsetof(PlayerObject, m_touchedPad), sizeof(PlayerObject::m_touchedPad)},
+	{offsetof(PlayerObject, m_yVelocity), sizeof(PlayerObject::m_yVelocity)},
+	{offsetof(PlayerObject, m_fallSpeed), sizeof(PlayerObject::m_fallSpeed)},
+	{offsetof(PlayerObject, m_isOnSlope), sizeof(PlayerObject::m_isOnSlope)},
+	{offsetof(PlayerObject, m_wasOnSlope), sizeof(PlayerObject::m_wasOnSlope)},
+	{offsetof(PlayerObject, m_slopeVelocity), sizeof(PlayerObject::m_slopeVelocity)},
+	{offsetof(PlayerObject, m_maybeUpsideDownSlope), sizeof(PlayerObject::m_maybeUpsideDownSlope)},
+	{offsetof(PlayerObject, m_isShip), sizeof(PlayerObject::m_isShip)},
+	{offsetof(PlayerObject, m_isBird), sizeof(PlayerObject::m_isBird)},
+	{offsetof(PlayerObject, m_isBall), sizeof(PlayerObject::m_isBall)},
+	{offsetof(PlayerObject, m_isDart), sizeof(PlayerObject::m_isDart)},
+	{offsetof(PlayerObject, m_isRobot), sizeof(PlayerObject::m_isRobot)},
+	{offsetof(PlayerObject, m_isSpider), sizeof(PlayerObject::m_isSpider)},
+	{offsetof(PlayerObject, m_isUpsideDown), sizeof(PlayerObject::m_isUpsideDown)},
+	{offsetof(PlayerObject, m_isDead), sizeof(PlayerObject::m_isDead)},
+	{offsetof(PlayerObject, m_isOnGround), sizeof(PlayerObject::m_isOnGround)},
+	{offsetof(PlayerObject, m_isGoingLeft), sizeof(PlayerObject::m_isGoingLeft)},
+	{offsetof(PlayerObject, m_isSideways), sizeof(PlayerObject::m_isSideways)},
+	{offsetof(PlayerObject, m_isSwing), sizeof(PlayerObject::m_isSwing)},
+	{offsetof(PlayerObject, m_reverseRelated), sizeof(PlayerObject::m_reverseRelated)},
+	{offsetof(PlayerObject, m_maybeReverseSpeed), sizeof(PlayerObject::m_maybeReverseSpeed)},
+	{offsetof(PlayerObject, m_maybeReverseAcceleration), sizeof(PlayerObject::m_maybeReverseAcceleration)},
+	{offsetof(PlayerObject, m_xVelocityRelated2), sizeof(PlayerObject::m_xVelocityRelated2)},
+	{offsetof(PlayerObject, m_isDashing), sizeof(PlayerObject::m_isDashing)},
+	{offsetof(PlayerObject, m_dashFireFrame), sizeof(PlayerObject::m_dashFireFrame)},
+	{offsetof(PlayerObject, m_groundObjectMaterial), sizeof(PlayerObject::m_groundObjectMaterial)},
+	{offsetof(PlayerObject, m_vehicleSize), sizeof(PlayerObject::m_vehicleSize)},
+	{offsetof(PlayerObject, m_playerSpeed), sizeof(PlayerObject::m_playerSpeed)},
+	{offsetof(PlayerObject, m_shipRotation), sizeof(PlayerObject::m_shipRotation)},
+	{offsetof(PlayerObject, m_lastPortalPos), sizeof(PlayerObject::m_lastPortalPos)},
+	{offsetof(PlayerObject, m_unkUnused3), sizeof(PlayerObject::m_unkUnused3)},
+	{offsetof(PlayerObject, m_isOnGround2), sizeof(PlayerObject::m_isOnGround2)},
+	{offsetof(PlayerObject, m_lastLandTime), sizeof(PlayerObject::m_lastLandTime)},
+	{offsetof(PlayerObject, m_platformerVelocityRelated), sizeof(PlayerObject::m_platformerVelocityRelated)},
+	{offsetof(PlayerObject, m_maybeIsBoosted), sizeof(PlayerObject::m_maybeIsBoosted)},
+	{offsetof(PlayerObject, m_scaleXRelatedTime), sizeof(PlayerObject::m_scaleXRelatedTime)},
+	{offsetof(PlayerObject, m_decreaseBoostSlide), sizeof(PlayerObject::m_decreaseBoostSlide)},
+	{offsetof(PlayerObject, m_unkA29), sizeof(PlayerObject::m_unkA29)},
+	{offsetof(PlayerObject, m_isLocked), sizeof(PlayerObject::m_isLocked)},
+	{offsetof(PlayerObject, m_controlsDisabled), sizeof(PlayerObject::m_controlsDisabled)},
+	{offsetof(PlayerObject, m_lastGroundedPos), sizeof(PlayerObject::m_lastGroundedPos)},
+	{offsetof(PlayerObject, m_hasEverJumped), sizeof(PlayerObject::m_hasEverJumped)},
+	{offsetof(PlayerObject, m_hasEverHitRing), sizeof(PlayerObject::m_hasEverHitRing)},
+	{offsetof(PlayerObject, m_position), sizeof(PlayerObject::m_position)},
+	{offsetof(PlayerObject, m_isSecondPlayer), sizeof(PlayerObject::m_isSecondPlayer)},
+	{offsetof(PlayerObject, m_unkA99), sizeof(PlayerObject::m_unkA99)},
+	{offsetof(PlayerObject, m_totalTime), sizeof(PlayerObject::m_totalTime)},
+	{offsetof(PlayerObject, m_isBeingSpawnedByDualPortal), sizeof(PlayerObject::m_isBeingSpawnedByDualPortal)},
+	{offsetof(PlayerObject, m_audioScale), sizeof(PlayerObject::m_audioScale)},
+	{offsetof(PlayerObject, m_unkAngle1), sizeof(PlayerObject::m_unkAngle1)},
+	{offsetof(PlayerObject, m_yVelocityRelated3), sizeof(PlayerObject::m_yVelocityRelated3)},
+	{offsetof(PlayerObject, m_defaultMiniIcon), sizeof(PlayerObject::m_defaultMiniIcon)},
+	{offsetof(PlayerObject, m_swapColors), sizeof(PlayerObject::m_swapColors)},
+	{offsetof(PlayerObject, m_switchDashFireColor), sizeof(PlayerObject::m_switchDashFireColor)},
+	{offsetof(PlayerObject, m_followRelated), sizeof(PlayerObject::m_followRelated)},
+	{offsetof(PlayerObject, m_unk838), sizeof(PlayerObject::m_unk838)},
+	{offsetof(PlayerObject, m_stateOnGround), sizeof(PlayerObject::m_stateOnGround)},
+	{offsetof(PlayerObject, m_stateUnk), sizeof(PlayerObject::m_stateUnk)},
+	{offsetof(PlayerObject, m_stateNoStickX), sizeof(PlayerObject::m_stateNoStickX)},
+	{offsetof(PlayerObject, m_stateNoStickY), sizeof(PlayerObject::m_stateNoStickY)},
+	{offsetof(PlayerObject, m_stateUnk2), sizeof(PlayerObject::m_stateUnk2)},
+	{offsetof(PlayerObject, m_stateBoostX), sizeof(PlayerObject::m_stateBoostX)},
+	{offsetof(PlayerObject, m_stateBoostY), sizeof(PlayerObject::m_stateBoostY)},
+	{offsetof(PlayerObject, m_maybeStateForce2), sizeof(PlayerObject::m_maybeStateForce2)},
+	{offsetof(PlayerObject, m_stateScale), sizeof(PlayerObject::m_stateScale)},
+	{offsetof(PlayerObject, m_platformerXVelocity), sizeof(PlayerObject::m_platformerXVelocity)},
+	{offsetof(PlayerObject, m_holdingRight), sizeof(PlayerObject::m_holdingRight)},
+	{offsetof(PlayerObject, m_holdingLeft), sizeof(PlayerObject::m_holdingLeft)},
+	{offsetof(PlayerObject, m_leftPressedFirst), sizeof(PlayerObject::m_leftPressedFirst)},
+	{offsetof(PlayerObject, m_scaleXRelated), sizeof(PlayerObject::m_scaleXRelated)},
+	{offsetof(PlayerObject, m_maybeHasStopped), sizeof(PlayerObject::m_maybeHasStopped)},
+	{offsetof(PlayerObject, m_xVelocityRelated), sizeof(PlayerObject::m_xVelocityRelated)},
+	{offsetof(PlayerObject, m_maybeGoingCorrectSlopeDirection), sizeof(PlayerObject::m_maybeGoingCorrectSlopeDirection)},
+	{offsetof(PlayerObject, m_isSliding), sizeof(PlayerObject::m_isSliding)},
+	{offsetof(PlayerObject, m_maybeSlopeForce), sizeof(PlayerObject::m_maybeSlopeForce)},
+	{offsetof(PlayerObject, m_isOnIce), sizeof(PlayerObject::m_isOnIce)},
+	{offsetof(PlayerObject, m_physDeltaRelated), sizeof(PlayerObject::m_physDeltaRelated)},
+	{offsetof(PlayerObject, m_isOnGround4), sizeof(PlayerObject::m_isOnGround4)},
+	{offsetof(PlayerObject, m_maybeSlidingTime), sizeof(PlayerObject::m_maybeSlidingTime)},
+	{offsetof(PlayerObject, m_maybeSlidingStartTime), sizeof(PlayerObject::m_maybeSlidingStartTime)},
+	{offsetof(PlayerObject, m_changedDirectionsTime), sizeof(PlayerObject::m_changedDirectionsTime)},
+	{offsetof(PlayerObject, m_slopeEndTime), sizeof(PlayerObject::m_slopeEndTime)},
+	{offsetof(PlayerObject, m_isMoving), sizeof(PlayerObject::m_isMoving)},
+	{offsetof(PlayerObject, m_platformerMovingLeft), sizeof(PlayerObject::m_platformerMovingLeft)},
+	{offsetof(PlayerObject, m_platformerMovingRight), sizeof(PlayerObject::m_platformerMovingRight)},
+	{offsetof(PlayerObject, m_isSlidingRight), sizeof(PlayerObject::m_isSlidingRight)},
+	{offsetof(PlayerObject, m_maybeChangedDirectionAngle), sizeof(PlayerObject::m_maybeChangedDirectionAngle)},
+	{offsetof(PlayerObject, m_unkUnused2), sizeof(PlayerObject::m_unkUnused2)},
+	{offsetof(PlayerObject, m_isPlatformer), sizeof(PlayerObject::m_isPlatformer)},
+	{offsetof(PlayerObject, m_stateNoAutoJump), sizeof(PlayerObject::m_stateNoAutoJump)},
+	{offsetof(PlayerObject, m_stateDartSlide), sizeof(PlayerObject::m_stateDartSlide)},
+	{offsetof(PlayerObject, m_stateHitHead), sizeof(PlayerObject::m_stateHitHead)},
+	{offsetof(PlayerObject, m_stateFlipGravity), sizeof(PlayerObject::m_stateFlipGravity)},
+	{offsetof(PlayerObject, m_gravityMod), sizeof(PlayerObject::m_gravityMod)},
+	{offsetof(PlayerObject, m_stateForce), sizeof(PlayerObject::m_stateForce)},
+	{offsetof(PlayerObject, m_stateForceVector), sizeof(PlayerObject::m_stateForceVector)},
+	{offsetof(PlayerObject, m_affectedByForces), sizeof(PlayerObject::m_affectedByForces)},
+	{offsetof(PlayerObject, m_lastMovedTime), sizeof(PlayerObject::m_lastMovedTime)},
+	{offsetof(PlayerObject, m_playerSpeedAC), sizeof(PlayerObject::m_playerSpeedAC)},
+	{offsetof(PlayerObject, m_fixRobotJump), sizeof(PlayerObject::m_fixRobotJump)},
+	{offsetof(PlayerObject, m_inputsLocked), sizeof(PlayerObject::m_inputsLocked)},
+	{offsetof(PlayerObject, m_gv0123), sizeof(PlayerObject::m_gv0123)},
+	{offsetof(PlayerObject, m_iconRequestID), sizeof(PlayerObject::m_iconRequestID)},
+	{offsetof(PlayerObject, m_unkUnused), sizeof(PlayerObject::m_unkUnused)},
+	{offsetof(PlayerObject, m_isOutOfBounds), sizeof(PlayerObject::m_isOutOfBounds)},
+	{offsetof(PlayerObject, m_fallStartY), sizeof(PlayerObject::m_fallStartY)},
+	{offsetof(PlayerObject, m_disablePlayerSqueeze), sizeof(PlayerObject::m_disablePlayerSqueeze)},
+	{offsetof(PlayerObject, m_ignoreDamage), sizeof(PlayerObject::m_ignoreDamage)},
+	{offsetof(PlayerObject, m_enable22Changes), sizeof(PlayerObject::m_enable22Changes)},
+	{offsetof(PlayerObject, m_enableImpulseFix), sizeof(PlayerObject::m_enableImpulseFix)}
+};
+
 // Input semantics differ fundamentally by mode, and lumping them together made
 // UFO structurally unsolvable in tight sections (plan section 6.3):
 //   Ground  cube/ball/spider/robot - act only on contact with a surface or orb
@@ -991,6 +1388,23 @@ ModeClass classifyMode(PlayerObject* p) {
 //          the two it cost when taps were expressed as toggle-on plus toggle-off.
 struct Decision;
 int decisionCost(Decision const& d, bool choice);
+
+// Release a checkpoint, first detaching it from anything GD still points at.
+//
+// The old restore put our checkpoint INTO m_checkpointArray and let the practice
+// respawn consume it, so clearing the array was enough. The direct load takes
+// the object straight and may leave PlayLayer::m_currentCheckpoint pointing at
+// it, so releasing without clearing that leaves a dangling pointer for the next
+// reset or level exit to walk into. Checkpoint lifetime has already caused three
+// separate crashes here, and every air decision now holds one.
+inline void releaseCheckpoint(CheckpointObject*& cp) {
+	if (!cp) return;
+	if (auto* pl = PlayLayer::get()) {
+		if (pl->m_currentCheckpoint == cp) pl->m_currentCheckpoint = nullptr;
+	}
+	cp->release();
+	cp = nullptr;
+}
 
 struct Decision {
 	CheckpointObject* cp        = nullptr; // state entering this decision
@@ -1034,6 +1448,61 @@ struct Decision {
 	// earlier byte comparison was blind to. Restoring the full forced set here
 	// made a transition-window restore bit-identical, and these are the
 	// time-carrying fields in that region.
+	double layerAttemptTime     = 0.0;
+	double layerBestAttemptTime = 0.0;
+	double layerCurrentTime     = 0.0;
+	bool   layerHasJumped       = false;
+
+	// The ACTUAL held-button state at capture, not the input we intended.
+	//
+	// m_holdingButtons is a gd::map, so it is outside the PlayerObject field
+	// table the restore writes back, and the restore used to rebuild it by
+	// calling pushButton/releaseButton with `enteringHold`. That is the solver's
+	// INTENDED input; the container reflects input that has already been through
+	// handleButton's one-step latency. The two are out of phase, so every restore
+	// near an input change rebuilt the button state one step wrong.
+	//
+	// MEASURED: at step 18608 of Stereo Madness - a ship section, where hold
+	// controls acceleration on every frame - the clean replay held the button and
+	// the restored search did not. yVelocity split -4.308 vs -4.485 on that step
+	// and the two trajectories never re-converged; the run died 247 steps later.
+	bool holdingJump   = false; // m_holdingButtons[Jump]
+	bool probeIsHolding = false; // our own injection bookkeeping
+
+	// GJBaseGameLayer's pending input queue. Not in any checkpoint, and cleared
+	// by resetLevel, so without this a restore either loses a command that was
+	// in flight or - worse - leaves one from before the rewind to be drained on
+	// the first step after, delaying the real input by exactly one step.
+	std::vector<PlayerButtonCommand> queuedButtons;
+
+	// The COCOS node transform. PlayerObject::m_position is in the field table
+	// and is what physics reads; getPositionX() reads CCNode::m_obPosition,
+	// which is inherited from cocos and therefore outside an enumeration of
+	// PlayerObject's own members. Nothing restored it.
+	//
+	// MEASURED (Time Machine, step 13071): after a restore the node position
+	// still held the position where the player DIED, ~149 units further along,
+	// and then crept back over 46 steps while y, rotation, velocity and every
+	// flag stayed bit-identical. Physics was correct throughout - only the node
+	// lagged - so the level still cleared, which is exactly why this survived
+	// eleven levels unnoticed. It still feeds rendering, the camera and the
+	// percent readout, and a restore is supposed to be exact.
+	cocos2d::CCPoint nodePos = {0.f, 0.f};
+
+	// Mirror/camera transition state - see Solver::PendingExtra.
+	float layerCameraFlip      = 0.f;
+	float layerCameraUnzoomedX = 0.f;
+	bool  layerUnk322a         = false;
+	bool  layerUnk3251         = false;
+
+	// Full PlayerObject image at capture, from which kPlayerFields is written
+	// back after loadFromCheckpoint. The direct load assigns only a subset, and
+	// a reset beforehand only changes WHICH wrong value the rest hold; this is
+	// the half of the restore that makes AIR modes exact (Probe 4b, 8/8).
+	//
+	// Stored whole rather than packed to the 196 spans so the solver reproduces
+	// the validated probe path byte for byte. ~2 KB against a 22 KB checkpoint.
+	std::vector<uint8_t> playerBytes;
 };
 
 int decisionCost(Decision const& d, bool choice) {
@@ -1082,6 +1551,28 @@ struct Solver {
 		bool   jumping = false;
 		double attemptTime = 0.0, bestAttemptTime = 0.0, currentTime = 0.0;
 		bool   hasJumped = false;
+
+		// The mirror/camera group. GD implements mirror mode as a CAMERA FLIP,
+		// and m_cameraFlip is a FLOAT, not a flag - it is the progress of an
+		// animated transition (toggleFlipped takes a `noEffects` argument
+		// precisely because the default path animates).
+		//
+		// MEASURED (Time Machine, step 13071, a blue un-mirror portal): a restore
+		// landing inside that transition left m_cameraFlip at a different value,
+		// and the reported player x then swept smoothly from +146.7 to -150.0
+		// over the 95 steps of the transition before snapping back into
+		// agreement. y, rotation, velocity, gravity and every flag stayed
+		// bit-identical throughout, which is why the level still cleared and why
+		// this hid behind eleven passing levels: the flip is presentational, so
+		// it corrupts the reported position without corrupting the physics.
+		//
+		// It only bites when a restore lands INSIDE a transition window, which is
+		// why one flip diverged and the level's other flips did not.
+		float  cameraFlip = 0.f;
+		float  cameraUnzoomedX = 0.f;
+		bool   unk322a = false;
+		bool   unk3251 = false;
+
 		bool   valid = false;
 	};
 	PendingExtra          pendingExtra{};
@@ -1096,9 +1587,6 @@ struct Solver {
 	bool                  tapping            = false; // rhythm state (persists)
 	bool                  resumeTapping      = false;
 	int                   tapRemaining       = 0;   // steps left in the current tap
-	bool                  anchorReplaying    = false;
-	int                   anchorReplayTarget = 0;
-	uint64_t              anchorReplays      = 0;
 	int                   resyncTarget   = 0;
 	int                   lastResyncStep = 0;
 	uint64_t              resyncs        = 0;
@@ -1110,15 +1598,22 @@ struct Solver {
 	std::vector<uint8_t>  bestMacro;
 	int                   lastGoodStep   = 0;
 
+	// The trajectory of the path currently on the stack, truncated on every
+	// restore exactly as `macro` is. Preallocated and never grown in the
+	// stepping path: a realloc there is an unbounded stall, so an overrun stops
+	// recording and says so rather than reallocating.
+	std::vector<probe::TraceRow> pathTrace;
+	bool                         pathTraceFull = false;
+	bool                         pendingPostRestore = false;
+
 	void clear() {
-		// Drop our checkpoint out of GD's array first. We swap our own object
-		// into m_checkpointArray to drive the practice respawn; releasing ours
-		// while the game still references it leaves a dangling pointer, which
-		// is a plausible cause of the crashes on returning to the level screen.
+		// Drop our checkpoints out of GD's reach first. Releasing one while the
+		// game still references it leaves a dangling pointer, which is a
+		// plausible cause of the crashes on returning to the level screen.
 		if (auto* pl = PlayLayer::get()) {
 			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
 		}
-		for (auto& d : stack) if (d.cp) d.cp->release();
+		for (auto& d : stack) releaseCheckpoint(d.cp);
 		stack.clear();
 		macro.clear();
 		running = false;
@@ -1132,15 +1627,15 @@ struct Solver {
 		tapping = false;
 		resumeTapping = false;
 		tapRemaining = 0;
-		anchorReplaying = false;
-		anchorReplayTarget = 0;
-		anchorReplays = 0;
 		resyncTarget = 0;
 		lastResyncStep = 0;
 		resyncs = resyncFailures = 0;
 		resyncMacro.clear();
 		lastGoodMacro.clear();
 		bestMacro.clear();
+		pathTrace.clear();
+		pathTraceFull = false;
+		pendingPostRestore = false;
 		lastGoodStep = 0;
 		prevAirMode = false;
 		prevOnGround = false;
@@ -1203,8 +1698,12 @@ void solverWriteBestMacro() {
 // ---------------------------------------------------------------------------
 
 const char* restoreKindName(RestoreKind k) {
-	return k == RestoreKind::Full ? "FULL (PlayLayer checkpoint)"
-	                              : "PLAYER-ONLY (PlayerObject checkpoint)";
+	switch (k) {
+		case RestoreKind::Full:       return "FULL (practice respawn)";
+		case RestoreKind::PlayerOnly: return "PLAYER-ONLY (no level state)";
+		case RestoreKind::DirectLoad: return "DIRECT loadFromCheckpoint (no respawn)";
+	}
+	return "?";
 }
 
 void startRestoreTest(RestoreKind kind) {
@@ -1243,7 +1742,23 @@ void startRestoreTest(RestoreKind kind) {
 	st.sweepAnchors.clear();
 	st.sweepIndex = 0;
 	st.sweepResults.clear();
-	{
+	// A recorded divergence beats a blind sweep. The eight spread anchors are for
+	// MAPPING where restores are exact; once a verification has localised a real
+	// divergence to one step, anchor exactly there instead - the whole point of
+	// the layer byte-diff below is to run at a step that is known to be wrong.
+	//
+	// This is what the verification failure message has always promised ("Probe
+	// 4b will now anchor near this step") and never actually did, because the
+	// sweep branch was tested first and always won.
+	if (st.verifyDivergeStep >= 240 &&
+	    st.verifyDivergeStep < static_cast<int>(st.scripted.size()) - 240) {
+		st.restoreAnchor = st.verifyDivergeStep;
+		st.restoreLen    = 400;
+		log::info("Probe 4b: anchoring EXACTLY at step {} - the step a verification "
+		          "measured as the first divergence. The PlayLayer byte-diff will "
+		          "name whatever layer state the restore fails to reproduce there.",
+		          st.restoreAnchor);
+	} else {
 		const int usable = static_cast<int>(st.scripted.size()) - st.restoreLen - 240;
 		if (usable > 1200) {
 			for (int i = 1; i <= 8; i++) st.sweepAnchors.push_back(240 + (usable * i) / 9);
@@ -1624,6 +2139,13 @@ void pollHotkeys() {
 				          "forward WITHOUT savestates - every branch replays from frame 0, "
 				          "so the result is exact by construction.", sv.resyncTarget);
 			}
+			// Preallocated once, here, so nothing in the stepping path ever
+			// reallocates. 64k rows covers every main level with room to spare
+			// (Stereo Madness is ~20k steps) at 48 bytes a row, about 3 MB.
+			sv.pathTrace.clear();
+			sv.pathTrace.reserve(65536);
+			sv.pathTraceFull = false;
+
 			log::info("Solver: starting DFS. air branch interval {} steps, "
 			          "release-before-hold ordering. F2 again to stop.",
 			          g_config.airBranchInterval);
@@ -1632,6 +2154,7 @@ void pollHotkeys() {
 
 	if (keyPressedEdge(VK_F11)) runProbe5(1000);
 	if (keyPressedEdge(VK_F12)) startRestoreTest(RestoreKind::Full);
+	if (keyPressedEdge(VK_F10)) startRestoreTest(RestoreKind::DirectLoad);
 	if (keyPressedEdge(VK_F4))  startVerify(false); // normal mode
 	if (keyPressedEdge(VK_F3))  startVerify(true);  // practice mode
 
@@ -1720,11 +2243,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	// the absolute m_currentStep. Traces are compared byte-for-byte across
 	// runs, so an absolute counter that happens to start at a different value
 	// would make two physically identical runs hash differently.
-	void recordStep(bool pressed, int relStep) {
+	// Built once and used by three consumers: the probe trace, the solver's path
+	// trace, and the verify comparison. They MUST agree field for field or the
+	// divergence report compares two different notions of state.
+	probe::TraceRow makeTraceRow(bool pressed, int relStep) {
 		auto& st = ProbeState::get();
 		auto* p  = m_player1;
-		if (!p) return;
-
 		auto* pl = PlayLayer::get();
 
 		probe::TraceRow row{};
@@ -1759,10 +2283,92 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (st.srcPushButton)   f |= probe::FlagSrcPushButton;
 		if (st.srcHoldingMap)   f |= probe::FlagSrcHoldingMap;
 		if (st.srcAsyncKey)     f |= probe::FlagSrcAsyncKey;
+		{
+			auto it = p->m_holdingButtons.find(kJumpButton);
+			if (it != p->m_holdingButtons.end() && it->second) f |= probe::FlagHoldingJump;
+		}
+		if (!m_queuedButtons.empty()) f |= probe::FlagQueuedButtons;
 		f |= probe::packRingCount(p->m_touchingRings ? p->m_touchingRings->count() : 0);
 		row.flags = f;
+		return row;
+	}
 
-		st.trace.push(row);
+	void recordStep(bool pressed, int relStep) {
+		if (!m_player1) return;
+		ProbeState::get().trace.push(makeTraceRow(pressed, relStep));
+	}
+
+	// Compare the clean replay against the solver's own trajectory, one step at
+	// a time, and latch the first step that differs.
+	//
+	// The input-source observer bits are masked: they are suppressed while we
+	// inject, so they differ by construction even when the physics match. Only
+	// physics state is compared, and the first mismatch is reported field by
+	// field with both values - a divergence in y alone reads very differently
+	// from one in yVelocity alone.
+	void compareAgainstSolvePath(bool pressed, size_t k) {
+		auto& st = ProbeState::get();
+		if (!m_player1) return;
+
+		const probe::TraceRow b = makeTraceRow(pressed, static_cast<int>(k));
+		if (st.verifyPathTrace.size() == k &&
+		    st.verifyPathTrace.size() < st.verifyPathTrace.capacity())
+			st.verifyPathTrace.push_back(b);
+
+		if (st.solvePathTrace.empty() || k >= st.solvePathTrace.size()) return;
+		const probe::TraceRow a = st.solvePathTrace[k];   // solver
+
+		const uint32_t keep = ~(probe::kInputSourceMask | probe::kSolverOnlyMask);
+		const bool same =
+			a.x == b.x && a.y == b.y && a.rotation == b.rotation &&
+			a.playerSpeed == b.playerSpeed && a.yVelocity == b.yVelocity &&
+			a.gravity == b.gravity && (a.flags & keep) == (b.flags & keep);
+
+		if (same) {
+			// A run of differences just ended. Anything before this healed, so
+			// it cannot be what killed the run at the end of the level.
+			if (st.verifyPersistStep >= 0) {
+				if (st.verifyReconvergeStep < 0)
+					st.verifyReconvergeStep = static_cast<int>(k);
+				st.verifyPersistStep = -1;
+			}
+			return;
+		}
+
+		st.verifyDivergeCount++;
+		if (st.verifyPersistStep < 0) st.verifyPersistStep = static_cast<int>(k);
+		if (st.verifyDivergeStep < 0) st.verifyDivergeStep = static_cast<int>(k);
+		if (st.verifyDivergeLogged) return;
+		st.verifyDivergeLogged = true;
+
+		// Logged exactly once, on the single step it happens. Not in the hot
+		// path of a search - this runs only during a verification replay.
+		log::error("Verify: FIRST DIVERGENCE at step {} - solver vs clean replay:", k);
+		if (a.x != b.x)
+			log::error("    x           {:.9g}  vs  {:.9g}   (bits {:08X} vs {:08X})",
+			           probe::asFloat(a.x), probe::asFloat(b.x), a.x, b.x);
+		if (a.y != b.y)
+			log::error("    y           {:.9g}  vs  {:.9g}   (bits {:08X} vs {:08X})",
+			           probe::asFloat(a.y), probe::asFloat(b.y), a.y, b.y);
+		if (a.rotation != b.rotation)
+			log::error("    rotation    {:.9g}  vs  {:.9g}",
+			           probe::asFloat(a.rotation), probe::asFloat(b.rotation));
+		if (a.playerSpeed != b.playerSpeed)
+			log::error("    playerSpeed {:.9g}  vs  {:.9g}",
+			           probe::asFloat(a.playerSpeed), probe::asFloat(b.playerSpeed));
+		if (a.yVelocity != b.yVelocity)
+			log::error("    yVelocity   {:.17g}  vs  {:.17g}   (bits {:016X} vs {:016X})",
+			           probe::asDouble(a.yVelocity), probe::asDouble(b.yVelocity),
+			           a.yVelocity, b.yVelocity);
+		if (a.gravity != b.gravity)
+			log::error("    gravity     {:.17g}  vs  {:.17g}",
+			           probe::asDouble(a.gravity), probe::asDouble(b.gravity));
+		if ((a.flags & keep) != (b.flags & keep))
+			log::error("    flags       {:08X}  vs  {:08X}   (differing bits {:08X})",
+			           a.flags & keep, b.flags & keep,
+			           (a.flags ^ b.flags) & keep);
+		log::error("    percent     {:.2f}%  vs  {:.2f}%",
+		           probe::asFloat(a.percent), probe::asFloat(b.percent));
 	}
 
 	// Advances the Probe 4b state machine one step. Returns false when the
@@ -1802,8 +2408,25 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (m_player1) {
 				const auto* raw = reinterpret_cast<const uint8_t*>(m_player1);
 				st.anchorBytes.assign(raw, raw + sizeof(PlayerObject));
+				{
+					// The REAL button state, not the scripted input for this step -
+					// they are one step out of phase through handleButton, and
+					// rebuilding the container from the script is what made the
+					// solver's restores wrong in ship mode.
+					auto it = m_player1->m_holdingButtons.find(kJumpButton);
+					st.aHoldingJump = it != m_player1->m_holdingButtons.end() && it->second;
+					st.aIsHolding   = st.isHolding;
+					st.aQueuedButtons.assign(m_queuedButtons.begin(), m_queuedButtons.end());
+					st.aNodePos = m_player1->getPosition();
+					st.aCameraFlip      = m_cameraFlip;
+					st.aCameraUnzoomedX = m_cameraUnzoomedX;
+					st.aUnk322a         = m_unk322a;
+					st.aUnk3251         = m_unk3251;
+				}
 				st.anchorGameModeChangedTime = m_player1->m_gameModeChangedTime;
 				st.anchorUnkA29              = m_player1->m_unkA29;
+				st.aLastJumpTime             = m_player1->m_lastJumpTime;
+				st.aPlayerPos                = m_player1->m_position;
 				// sizeof(GJBaseGameLayer) is 14240 but PlayLayer is larger, so
 				// everything in PlayLayer's own region - m_attemptTime among it -
 				// was never being compared at all.
@@ -1835,15 +2458,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (since < st.restoreLen) return true;
 
 		if (st.restorePhase == 1) {
-			// Restore and replay the identical input from the anchor.
-			if (st.restoreKind == RestoreKind::Full) {
-				// The practice-respawn path, exactly as the solver restores.
-				// Testing loadFromCheckpoint instead would measure a path the
-				// solver never takes.
-				const size_t prev = st.restoreAnchor > 0
-				                  ? static_cast<size_t>(st.restoreAnchor - 1) : 0;
-				const bool realign = prev < st.scripted.size() && st.scripted[prev] != 0;
-				// Exercise the same extra-state restoration the solver uses.
+			// Built once, for whichever mechanism runs. Previously this lived
+			// inside the Full branch, so DirectLoad silently read a stale,
+			// invalid struct and restored none of it - making the comparison
+			// meaningless rather than merely unfavourable.
+			{
 				Solver::PendingExtra e;
 				e.gameModeChangedTime = st.anchorGameModeChangedTime;
 				e.unkA29      = st.anchorUnkA29;
@@ -1858,8 +2477,91 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				e.bestAttemptTime = st.aBestAttemptTime;
 				e.currentTime     = st.aCurrentTime;
 				e.hasJumped       = st.aHasJumped;
+				e.cameraFlip      = st.aCameraFlip;
+				e.cameraUnzoomedX = st.aCameraUnzoomedX;
+				e.unk322a         = st.aUnk322a;
+				e.unk3251         = st.aUnk3251;
 				e.valid       = true;
 				Solver::get().pendingExtra = e;
+			}
+
+			// Restore and replay the identical input from the anchor.
+			if (st.restoreKind == RestoreKind::DirectLoad) {
+				// No respawn, no death: reposition by writing the checkpoint back
+				// directly. Level state still comes from the full CheckpointObject,
+				// so triggers and moving objects are preserved.
+				//
+				// NOTE: no realign step. The respawn path lands one frame EARLY and
+				// needs a forward correction; a direct load lands exactly on the
+				// captured state, which is the first evidence that the ship/UFO/wave
+				// approximation lives in the respawn rather than in the checkpoint.
+				if (st.fullCp) {
+					st.suppressDeath = true;
+
+					// Reset to canonical FIRST, then apply the checkpoint directly.
+					//
+					// The two mechanisms have complementary flaws: the practice
+					// respawn wipes everything via resetLevel but then places the
+					// player with a fudge (a frame early, and "a set distance behind
+					// the icon" in air modes); a bare loadFromCheckpoint places
+					// exactly but applies on top of whatever the last 400 steps
+					// left dirty - which is why m_lastJumpTime and m_position were
+					// still stale.
+					//
+					// Emptying the checkpoint array makes resetLevel go to level
+					// start rather than respawning to a checkpoint, so we get the
+					// full wipe with none of the respawn's positioning logic, and
+					// then write the exact captured state on top of a clean slate.
+					if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+					st.solverRestoring = true;
+					pl->resetLevel();
+					st.solverRestoring = false;
+
+					pl->loadFromCheckpoint(st.fullCp);
+					st.suppressDeath = false;
+
+					// Button state FIRST - see solverRestoreState. pushButton and
+					// releaseButton run game logic, so they must not follow the
+					// snapshot. This probe missed the resulting m_jumpBuffered
+					// corruption at all 8 anchors purely because none of them
+					// landed on a step with a jump buffered; the solver hit it on
+					// its first restore.
+					if (auto* p = m_player1) {
+						st.injecting = true;
+						if (st.aHoldingJump) p->pushButton(PlayerButton::Jump);
+						else                 p->releaseButton(PlayerButton::Jump);
+						st.injecting = false;
+					}
+
+					// Write back everything the restore leaves untouched.
+					if (auto* p = m_player1 ; p && !st.anchorBytes.empty()) {
+						auto* dst = reinterpret_cast<uint8_t*>(p);
+						for (auto const& f : kPlayerFields)
+							std::memcpy(dst + f.off, st.anchorBytes.data() + f.off, f.size);
+					}
+
+					// The container the field table cannot reach.
+					if (auto* p = m_player1) p->m_holdingButtons[kJumpButton] = st.aHoldingJump;
+					st.isHolding = st.aIsHolding;
+					m_queuedButtons.clear();
+					for (auto const& c : st.aQueuedButtons) m_queuedButtons.push_back(c);
+					if (auto* p = m_player1) p->setPosition(st.aNodePos);
+
+					// Apply the same extra state the respawn path restores, or this
+					// is being compared against a mechanism doing strictly more work.
+					auto& sv2 = Solver::get();
+					if (sv2.pendingExtra.valid) {
+						applyExtraState(sv2.pendingExtra);
+						sv2.pendingExtra.valid = false;
+					}
+				}
+			} else if (st.restoreKind == RestoreKind::Full) {
+				// The practice-respawn path, exactly as the solver restores.
+				// Testing loadFromCheckpoint instead would measure a path the
+				// solver never takes.
+				const size_t prev = st.restoreAnchor > 0
+				                  ? static_cast<size_t>(st.restoreAnchor - 1) : 0;
+				const bool realign = prev < st.scripted.size() && st.scripted[prev] != 0;
 				solverRestoreCheckpoint(st.fullCp, realign);
 			} else {
 				if (st.playerCp) m_player1->loadFromCheckpoint(st.playerCp);
@@ -2768,13 +3470,27 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			d.modeClass = classifyMode(p);
 			d.airPolicy = d.modeClass != ModeClass::Ground;
 		}
-		// Skip the checkpoint for air decisions under hybrid restore: they are
-		// never restored to, so capturing one is 22 KB and a createCheckpoint call
-		// wasted per decision - and air sections have the most decisions.
-		const bool needsCheckpoint = !g_config.noSavestates &&
-		                             !(g_config.hybridRestore && d.airPolicy);
-		if (needsCheckpoint) {
-			if (CheckpointObject* cp = pl->createCheckpoint()) { cp->retain(); d.cp = cp; }
+		// EVERY decision gets a checkpoint now, air included. Air decisions used
+		// to be skipped because restoring to one was unreliable (Probe 4b under
+		// the practice respawn: AIR 1/3 bit-identical), so they were reached by
+		// replaying forward from the nearest cube ancestor. The direct-load
+		// restore is exact in every mode (8/8), so that replay is pure cost:
+		// backtracking into a ship or UFO section is now O(1) instead of
+		// re-simulating the whole section. The price is ~22 KB per air decision.
+		if (!g_config.noSavestates) {
+			if (CheckpointObject* cp = pl->createCheckpoint()) {
+				cp->retain();
+				d.cp = cp;
+				if (auto* pp = m_player1) {
+					auto const* raw = reinterpret_cast<uint8_t const*>(pp);
+					d.playerBytes.assign(raw, raw + sizeof(PlayerObject));
+					auto it = pp->m_holdingButtons.find(kJumpButton);
+					d.holdingJump = it != pp->m_holdingButtons.end() && it->second;
+					d.probeIsHolding = ProbeState::get().isHolding;
+					d.queuedButtons.assign(m_queuedButtons.begin(), m_queuedButtons.end());
+					d.nodePos = pp->getPosition();
+				}
+			}
 		}
 
 		if (auto* pp = m_player1) {
@@ -2788,6 +3504,19 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		d.layerClickIndex  = m_clickIndex;
 		d.layerResumeTimer = m_resumeTimer;
 		d.layerJumping     = m_jumping;
+		d.layerCameraFlip      = m_cameraFlip;
+		d.layerCameraUnzoomedX = m_cameraUnzoomedX;
+		d.layerUnk322a         = m_unk322a;
+		d.layerUnk3251         = m_unk3251;
+		// PlayLayer's own region, above sizeof(GJBaseGameLayer). The respawn path
+		// restored these as zeros because nothing ever captured them; the probe
+		// found they matter enough to be part of the validated restore.
+		if (pl) {
+			d.layerAttemptTime     = pl->m_attemptTime;
+			d.layerBestAttemptTime = pl->m_bestAttemptTime;
+			d.layerCurrentTime     = pl->m_currentTime;
+			d.layerHasJumped       = pl->m_hasJumped;
+		}
 		d.enteringHold  = sv.hold;
 		d.togglesBefore = d.airPolicy ? sv.togglesUsed : 0;
 
@@ -2879,20 +3608,29 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		return std::min(floorIdx, maxFloor);
 	}
 
-	// Restore to a decision's captured state. loadFromCheckpoint alone restores
-	// position but does not revive a dead player, so this drives practice
-	// mode's own respawn, which does both.
-	// Restore, then realign by one physics step.
+	// Restore to a decision's captured state.
 	//
-	// MEASURED (Probe 4b): createCheckpoint captures the state after step N, but
-	// the practice respawn returns to the state after step N-1 - segment B was
-	// offset from segment A by exactly one step, with B[n+1] == A[n] bit for
-	// bit on every field. The restore is faithful; it just lands a frame early.
+	// HISTORY, because the shape of this function is not obvious. It used to
+	// drive practice mode's own respawn (checkpoint into m_checkpointArray, then
+	// resetLevel), which revives a dead player and repositions in one call - but
+	// the respawn lands one step EARLY and needed a forward correction step, and
+	// in ship/UFO/wave it is approximate BY DESIGN: the GD wiki states air-mode
+	// checkpoints are generated "a set distance behind the icon" to account for
+	// momentum. Probe 4b measured exactly that: CUBE 5/5 bit-identical, AIR 1/3.
 	//
-	// Uncorrected, every restore shifts the timeline by a frame, so the search
-	// calibrates its input timing to a state one step off from what a clean
-	// replay produces. That is why a 20,425-step solution died at step 1222 on
-	// verification. One forward step reproduces the captured state exactly.
+	// The replacement resets to level start (checkpoint array emptied, so the
+	// respawn logic is never involved), calls loadFromCheckpoint DIRECTLY, and
+	// then writes back the 196 PlayerObject fields the direct load leaves
+	// untouched. Exact in every mode: Probe 4b re-run gave CUBE 5/5, AIR 3/3.
+	//
+	// The reset is retained deliberately. It is what revives the dead player the
+	// solver is always backtracking from, and it is what returns LEVEL state -
+	// objects, triggers, the effect manager - to canonical before the checkpoint
+	// is applied on top. loadFromCheckpoint is sparse over PlayLayer's tracked
+	// object lists and no vanilla path ever calls it without a preceding reset;
+	// dropping it is a measurable speedup (restore cost scales with level size,
+	// 1.06 ms on Stereo Madness against 40.9 ms on Hypersonic) but it has not
+	// been validated on a level with triggers or moving objects.
 	void applyExtraState(Solver::PendingExtra const& e) {
 		if (auto* p = m_player1) {
 			p->m_gameModeChangedTime = e.gameModeChangedTime;
@@ -2905,6 +3643,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		m_clickIndex  = e.clickIndex;
 		m_resumeTimer = e.resumeTimer;
 		m_jumping     = e.jumping;
+		m_cameraFlip      = e.cameraFlip;
+		m_cameraUnzoomedX = e.cameraUnzoomedX;
+		m_unk322a         = e.unk322a;
+		m_unk3251         = e.unk3251;
 		if (auto* pl2 = PlayLayer::get()) {
 			pl2->m_attemptTime     = e.attemptTime;
 			pl2->m_bestAttemptTime = e.bestAttemptTime;
@@ -2913,6 +3655,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		}
 	}
 
+	// PROBE ONLY. The practice-respawn restore, kept as the control arm of the
+	// F12 sweep so the direct-load path can be measured against the mechanism it
+	// replaced. The solver no longer uses it - see solverRestoreState below.
 	void solverRestoreCheckpoint(CheckpointObject* cp, bool realignHold) {
 		auto* pl = PlayLayer::get();
 		if (!pl || !cp) return;
@@ -2929,11 +3674,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// always comes back with the button released - and handleButton takes a
 		// step to take effect. In ship mode hold controls acceleration on every
 		// frame, so the first step after a restore ran with the wrong hold.
-		//
-		// MEASURED: restores were sound at step 480 (cube, mid-air, input
-		// irrelevant) and unsound at 18135 (ship), where segment B differed from
-		// A in yVelocity and m_jumpBuffered at the very first row. pushButton /
-		// releaseButton act on the player directly, with no queue latency.
 		if (auto* p = m_player1) {
 			ps.injecting = true;
 			if (realignHold) p->pushButton(PlayerButton::Jump);
@@ -2942,16 +3682,17 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			ps.isHolding  = realignHold;
 		}
 
+		// The respawn lands one step EARLY - segment B was offset from segment A
+		// by exactly one step, with B[n+1] == A[n] bit for bit. One forward step
+		// reproduces the captured state. The direct-load path needs no such
+		// correction, which is the cleanest evidence that the air-mode
+		// approximation lives in the respawn rather than in the checkpoint.
 		applyInput(realignHold);
 		GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
 
-		// Apply the dropped fields AFTER the realign step.
-		//
-		// Ordering matters and I had it wrong: capture happens at step S, the
-		// restore lands at S-1, and the realign advances to S. Writing the
-		// step-S values BEFORE the realign meant that step advanced them past S
-		// and ran its physics on rolled-back time - which made the PlayerObject
-		// delta worse, 24 bytes to 99.
+		// Applied AFTER the realign: writing the step-S values BEFORE it meant
+		// that step advanced them past S and ran its physics on rolled-back
+		// time, which made the PlayerObject delta worse, 24 bytes to 99.
 		{
 			auto& sv2 = Solver::get();
 			if (sv2.pendingExtra.valid) {
@@ -2962,31 +3703,107 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	}
 
 	void solverRestoreState(Decision& d) {
-		if (!d.cp) return;
-		Solver::PendingExtra e;
-		e.gameModeChangedTime = d.gameModeChangedTime;
-		e.unkA29      = d.unkA29;
-		e.extraDelta  = d.layerExtraDelta;
-		e.timePlayed  = d.layerTimePlayed;
-		e.timestamp   = d.layerTimestamp;
-		e.tickIndex   = d.layerTickIndex;
-		e.clickIndex  = d.layerClickIndex;
-		e.resumeTimer = d.layerResumeTimer;
-		e.jumping     = d.layerJumping;
-		e.valid       = true;
-		Solver::get().pendingExtra = e;
-		// The input in effect entering this decision is what was applied on the
-		// step being redone.
-		solverRestoreCheckpoint(d.cp, d.enteringHold);
+		auto* pl = PlayLayer::get();
+		if (!pl || !d.cp) return;
+		auto& ps = ProbeState::get();
+
+		// Nothing may die during the restore: the reset and the load both move
+		// the player, and a death mid-restore would drag the practice respawn -
+		// the approximate mechanism this path exists to avoid - back in.
+		ps.suppressDeath = true;
+
+		// Emptying the checkpoint array makes resetLevel go to level START
+		// rather than respawning to a checkpoint, so we get the full wipe with
+		// none of the respawn's positioning fudge, and revive the dead player.
+		if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+		ps.solverRestoring = true;
+		pl->resetLevel();
+		ps.solverRestoring = false;
+
+		pl->loadFromCheckpoint(d.cp);
+		ps.suppressDeath = false;
+
+		// The held-button state, which no checkpoint stores. The captured state
+		// is the one AFTER the step that ran with `enteringHold` applied, so that
+		// is the button state it must come back with.
+		//
+		// THIS MUST RUN BEFORE THE FIELD WRITE-BACK. pushButton and releaseButton
+		// are not passive setters - they execute game logic. Running them after
+		// the snapshot was stamped meant releaseButton cleared m_jumpBuffered on
+		// every restore that entered on a release, so a jump buffered at capture
+		// time was silently dropped. MEASURED: the first divergence between the
+		// search and a clean replay of its own solution was exactly that bit, at
+		// the very first step after a restore, and the run then flew a subtly
+		// wrong trajectory for 18,473 further steps before it hit anything.
+		//
+		// Calling it first and stamping the snapshot on top gives both halves:
+		// m_holdingButtons (a container, so outside the field table) is set by
+		// the real call, and every scalar it touches is then overwritten with
+		// the captured value.
+		if (auto* p = m_player1) {
+			ps.injecting = true;
+			if (d.enteringHold) p->pushButton(PlayerButton::Jump);
+			else                p->releaseButton(PlayerButton::Jump);
+			ps.injecting = false;
+			ps.isHolding = d.enteringHold;
+		}
+
+		// Everything the direct load leaves untouched. Authoritative: this is the
+		// last thing to write PlayerObject, so nothing above can corrupt it.
+		if (auto* p = m_player1; p && !d.playerBytes.empty()) {
+			auto* dst = reinterpret_cast<uint8_t*>(p);
+			for (auto const& f : kPlayerFields)
+				std::memcpy(dst + f.off, d.playerBytes.data() + f.off, f.size);
+		}
+
+		// And the containers the field table cannot reach, written directly so no
+		// game logic gets a chance to re-derive them from the wrong phase.
+		if (auto* p = m_player1) p->m_holdingButtons[kJumpButton] = d.holdingJump;
+		ps.isHolding = d.probeIsHolding;
+
+		// The layer's pending input queue. resetLevel cleared it and nothing else
+		// puts it back, so restore it to exactly what was in flight at capture.
+		m_queuedButtons.clear();
+		for (auto const& c : d.queuedButtons) m_queuedButtons.push_back(c);
+
+		// The cocos node transform, which no field table can reach.
+		if (auto* p = m_player1) p->setPosition(d.nodePos);
+
+		// Layer and PlayLayer state no checkpoint carries. Applied directly
+		// rather than deferred through pendingExtra: the respawn path had to
+		// wait for its realign step to finish, and there is no realign step now.
+		{
+			Solver::PendingExtra e;
+			e.gameModeChangedTime = d.gameModeChangedTime;
+			e.unkA29          = d.unkA29;
+			e.extraDelta      = d.layerExtraDelta;
+			e.timePlayed      = d.layerTimePlayed;
+			e.timestamp       = d.layerTimestamp;
+			e.tickIndex       = d.layerTickIndex;
+			e.clickIndex      = d.layerClickIndex;
+			e.resumeTimer     = d.layerResumeTimer;
+			e.jumping         = d.layerJumping;
+			e.attemptTime     = d.layerAttemptTime;
+			e.bestAttemptTime = d.layerBestAttemptTime;
+			e.currentTime     = d.layerCurrentTime;
+			e.hasJumped       = d.layerHasJumped;
+			e.cameraFlip      = d.layerCameraFlip;
+			e.cameraUnzoomedX = d.layerCameraUnzoomedX;
+			e.unk322a         = d.layerUnk322a;
+			e.unk3251         = d.layerUnk3251;
+			applyExtraState(e);
+		}
+
 		Solver::get().restores++;
+		Solver::get().pendingPostRestore = true;
 	}
 
 	// Put the player back at decision `d`, whatever that takes.
 	//
 	// THE single place repositioning is decided. Having this logic inline at each
 	// call site meant it kept getting fixed in one path and not another: the
-	// death gate, then the no-savestate deepening path, then the hybrid deepening
-	// path all broke the same way.
+	// death gate, then the no-savestate deepening path, then the (now removed)
+	// hybrid deepening path all broke the same way.
 	//
 	// Returns true if repositioning is still in flight (a replay is running and
 	// the caller should yield); false if the player is already at `d`.
@@ -3000,8 +3817,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		sv.resumeToggles = d.togglesBefore + decisionCost(d, d.choice);
 		sv.resumeBranch  = d.step;
 		sv.macro.resize(static_cast<size_t>(d.step), 0);
+		if (sv.pathTrace.size() > static_cast<size_t>(d.step))
+			sv.pathTrace.resize(static_cast<size_t>(d.step));
 
-		// A usable checkpoint: cube-mode restores are exact (Probe 4b, 5/5).
+		// A usable checkpoint. Exact in every mode now (Probe 4b, 8/8), so this
+		// is the path taken for essentially every backtrack.
 		if (d.cp && !g_config.noSavestates) {
 			solverRestoreState(d);
 			sv.step        = d.step;
@@ -3013,37 +3833,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			return false;
 		}
 
-		// No usable checkpoint. Prefer the nearest CUBE ancestor plus a forward
-		// replay - bounded by the air section rather than the whole prefix.
-		if (g_config.hybridRestore && !g_config.noSavestates && !sv.stack.empty()) {
-			size_t ai = sv.stack.size() - 1;
-			bool found = false;
-			while (true) {
-				if (!sv.stack[ai].airPolicy && sv.stack[ai].cp) { found = true; break; }
-				if (ai == 0) break;
-				ai--;
-			}
-			if (found) {
-				Decision& anchor = sv.stack[ai];
-				solverRestoreState(anchor);
-				sv.step = anchor.step;
-				if (sv.step < d.step) {
-					sv.anchorReplaying    = true;
-					sv.anchorReplayTarget = d.step;
-					sv.anchorReplays++;
-					return true;
-				}
-				sv.hold         = sv.resumeHold;
-				sv.tapping      = sv.resumeTapping;
-				sv.tapRemaining = sv.resumeTap;
-				sv.togglesUsed  = sv.resumeToggles;
-				sv.lastBranch   = sv.resumeBranch;
-				return false;
-			}
-		}
-
-		// Last resort: replay from frame 0. Needs no checkpoint at all, so it is
-		// always available and always exact.
+		// No checkpoint: only reachable with noSavestates set, or if
+		// createCheckpoint failed. Replay from frame 0 - needs no checkpoint at
+		// all, so it is always available and always exact.
 		sv.resyncMacro.assign(sv.macro.begin(),
 			sv.macro.begin() + std::min<size_t>(d.step, sv.macro.size()));
 		sv.resyncTarget       = static_cast<int>(sv.resyncMacro.size());
@@ -3088,7 +3880,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 			const size_t drop = std::min(static_cast<size_t>(g_config.escapeJump), maxDrop);
 			for (size_t i = 0; i < drop; i++) {
-				if (sv.stack.back().cp) sv.stack.back().cp->release();
+				releaseCheckpoint(sv.stack.back().cp);
 				sv.stack.pop_back();
 			}
 			sv.escapes++;
@@ -3171,7 +3963,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				                       ? sv.stack[floor].togglesBefore : 0;
 				const int spent = d.togglesBefore - floorToggles;
 				if (wouldToggle && spent >= g_config.toggleBudget) {
-					if (d.cp) d.cp->release();
+					releaseCheckpoint(d.cp);
 					sv.stack.pop_back();
 					continue;
 				}
@@ -3191,7 +3983,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				return true;
 			}
 
-			if (d.cp) d.cp->release();
+			releaseCheckpoint(d.cp);
 			sv.stack.pop_back();
 		}
 		return false;
@@ -3212,10 +4004,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// GAME seconds plays back in a fraction of a wall-clock second. Game time
 		// and wall-clock time are not interchangeable here.
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
-		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  anchorReplays {}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
+		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
 		          g_config.toggleBudget, sv.commitDepth, sv.lookbackSteps, sv.resyncs, sv.resyncFailures,
-		          sv.anchorReplays, stepsPerSec, stepsPerSec / 240.0,
+		          stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
 	}
 
@@ -3233,7 +4025,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (auto* pl = PlayLayer::get()) {
 			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
 		}
-		for (auto& d : sv.stack) if (d.cp) d.cp->release();
+		for (auto& d : sv.stack) releaseCheckpoint(d.cp);
 		sv.stack.clear();
 		sv.commitDepth = 0;
 		sv.resyncTarget = static_cast<int>(sv.resyncMacro.size());
@@ -3322,41 +4114,36 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		}
 	}
 
+	// Append the state after the step just simulated, at index sv.step-1.
+	//
+	// Backtracking rewinds sv.step, so the tail is dropped first - exactly what
+	// happens to `macro`. Recording is abandoned rather than reallocating if the
+	// buffer fills or the index desyncs, because a wrong-index row would make
+	// the divergence report lie about WHERE the paths parted.
+	void solverRecordPath(bool pressed) {
+		auto& sv = Solver::get();
+		if (sv.pathTraceFull || sv.step <= 0) return;
+		const size_t idx = static_cast<size_t>(sv.step) - 1;
+		if (sv.pathTrace.size() > idx) sv.pathTrace.resize(idx);
+		if (sv.pathTrace.size() != idx ||
+		    sv.pathTrace.size() >= sv.pathTrace.capacity()) {
+			sv.pathTraceFull = true;
+			return;
+		}
+		probe::TraceRow row = makeTraceRow(pressed, static_cast<int>(idx));
+		if (sv.pendingPostRestore) {
+			row.flags |= probe::FlagPostRestore;
+			sv.pendingPostRestore = false;
+		}
+		sv.pathTrace.push_back(row);
+	}
+
 	// One solver step. Returns false to stop the enclosing per-frame loop
 	// (a restore moved the player, so stepping again this frame is invalid).
 	bool solverStep() {
 		auto& sv = Solver::get();
 		auto* pl = PlayLayer::get();
 		if (!pl || !m_player1) return false;
-
-		// Hybrid anchor replay: we restored an exact cube checkpoint and are now
-		// replaying the macro forward through the air section to the decision.
-		// No savestate is involved past the cube anchor, so this is exact.
-		if (sv.anchorReplaying) {
-			const size_t idx = static_cast<size_t>(sv.step);
-			const bool pressed = idx < sv.macro.size() && sv.macro[idx] != 0;
-			applyInput(pressed);
-			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
-			sv.step++;
-			sv.steps++;
-
-			if (m_player1->m_isDead) {
-				// The replayed prefix should not die - if it does, the macro and
-				// the anchor disagree, so drop back to the frontier and continue.
-				log::warn("Solver: anchor replay died at step {} (target {}) - "
-				          "macro and anchor disagree", sv.step, sv.anchorReplayTarget);
-				sv.anchorReplaying = false;
-				return false;
-			}
-			if (sv.step >= sv.anchorReplayTarget) {
-				sv.anchorReplaying = false;
-				sv.hold        = sv.resumeHold;
-				sv.togglesUsed = sv.resumeToggles;
-				sv.lastBranch  = sv.resumeBranch;
-				sv.macro.resize(static_cast<size_t>(sv.step), 0);
-			}
-			return true;
-		}
 
 		// Resync: replay the committed prefix with NO savestates and no
 		// branching. This is the validation - if it survives to the target, the
@@ -3368,6 +4155,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
 			sv.step++;
 			sv.steps++;
+			solverRecordPath(pressed);
 
 			if (m_player1->m_isDead) { failResync(sv.step); return false; }
 			if (ProbeState::get().finished || sv.step >= sv.resyncTarget) finishResync();
@@ -3400,6 +4188,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
 		sv.step++;
 		sv.steps++;
+		solverRecordPath(sv.hold);
 
 		const float pct = pl->getCurrentPercent();
 		if (pct > sv.bestPct) {
@@ -3442,6 +4231,27 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			log::info("  {} resyncs ({} failed) - prefix re-derived from frame 0 without "
 			          "savestates {} time(s)", sv.resyncs, sv.resyncFailures, sv.resyncs);
 			solverWriteMacro("solution.txt");
+
+			// Hand the winning trajectory to the verifier. Done here, outside the
+			// stepping path, so the copy costs nothing that matters.
+			{
+				auto& ps = ProbeState::get();
+				if (sv.pathTraceFull) {
+					ps.solvePathTrace.clear();
+					log::warn("  Path trace overran its buffer - the verify cannot "
+					          "report where the paths diverge for this run.");
+				} else {
+					ps.solvePathTrace = sv.pathTrace;
+					ps.solveDecisionSteps.clear();
+					ps.solveDecisionSteps.reserve(sv.stack.size());
+					for (auto const& d : sv.stack) ps.solveDecisionSteps.push_back(d.step);
+					log::info("  Recorded {} steps of the winning trajectory across {} "
+					          "decisions. F4 will report the first step where a clean "
+					          "replay departs from it.",
+					          ps.solvePathTrace.size(), ps.solveDecisionSteps.size());
+				}
+			}
+
 			log::info("  Verify by replaying from frame 0 - a solution found via "
 			          "savestates only counts if it reproduces in a clean run.");
 			log::info("========================================");
@@ -3674,10 +4484,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			for (int i = 0; i < steps; i++) {
 				const size_t k = static_cast<size_t>(st.stepCounter);
 				if (k >= st.scripted.size()) break;
-				applyInput(st.scripted[k] != 0);
+				const bool pressed = st.scripted[k] != 0;
+				applyInput(pressed);
 				GJBaseGameLayer::update(g_config.physicsFix
 				                        ? static_cast<float>(kPhysicsDt) : dt);
 				st.stepCounter++;
+				compareAgainstSolvePath(pressed, k);
 				if (st.finished) {
 					finishVerify(true, static_cast<int>(st.stepCounter),
 					             pl->getCurrentPercent());
@@ -3858,6 +4670,15 @@ class $modify(SolverPlayLayer, PlayLayer) {
 			m_randomSeed     = kForcedSeed;
 			m_replayRandSeed = kForcedSeed;
 		}
+	}
+
+	// Suppressing the death entirely is what makes a direct loadFromCheckpoint
+	// usable: nothing dies, so nothing needs reviving, and the practice respawn -
+	// which the wiki says places ship/UFO/wave checkpoints "a set distance behind
+	// the icon" - is never involved.
+	void destroyPlayer(PlayerObject* player, GameObject* object) {
+		if (ProbeState::get().suppressDeath) return;
+		PlayLayer::destroyPlayer(player, object);
 	}
 
 	// Both completion signals are hooked so Probe 7 can see which fires first

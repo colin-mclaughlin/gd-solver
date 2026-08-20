@@ -664,6 +664,12 @@ The macro is in `solution.txt`. Every input in it was chosen by search.
 
 ### 13.8 GD's practice checkpoints are approximate BY DESIGN — do not fight this
 
+> **PARTLY OVERTURNED by §13.11 (2026-08-20).** What follows is true of the
+> practice **respawn**, not of the `CheckpointObject`. Bypass the respawn and
+> restores are bit-exact in every mode. "Cannot be made so" was wrong, and the
+> word "cannot" is what made it expensive — it closed off the line of attack that
+> eventually worked. Read this section as a description of the respawn.
+
 The single most expensive finding of the project. Restores are **not** bit-exact,
 and cannot be made so:
 
@@ -690,6 +696,12 @@ found and fixed on the way, and both are worth keeping:
 
 ### 13.9 The architecture that actually works
 
+> **SUPERSEDED by §13.11 (2026-08-20).** The savestate/replay split described
+> here was a workaround for air-mode restores being approximate. They are now
+> exact in every mode, so the solver uses savestates everywhere and the hybrid
+> is gone. Kept because the reasoning was correct given what had been measured,
+> and because the correction is the point.
+
 **Savestate-free search.** On backtrack, replay from frame 0 to the decision
 instead of restoring. Measured **42,000 steps/sec (175x real time)** — *faster*
 per step than the savestate path, because no checkpoints are created or held.
@@ -714,6 +726,130 @@ matter. Every reasoned guess (an offset, the held button, `m_extraDelta`) was
 wrong. Probe 4a was Phase 0 item 5, was deferred as speculative, and turned out
 to be the tool that resolved this. When a fix produces byte-identical output,
 that is the signal to change technique, not to apply more of the same.
+
+### 13.11 Exact restores in EVERY mode — the hybrid is retired (2026-08-20)
+
+§13.8 established that GD's practice checkpoints are approximate in ship/UFO/wave
+by design. That is true of the **practice respawn**, and it is not true of the
+checkpoint. The respawn is the approximation; the `CheckpointObject` is fine.
+
+**The restore that works.** Per decision, capture `PlayLayer::createCheckpoint()`
+plus a full `PlayerObject` byte image plus the input state below. To restore:
+
+1. Empty `m_checkpointArray`, then `resetLevel()`. With the array empty the reset
+   goes to level *start*, so none of the respawn's positioning logic runs. This
+   also revives the dead player and returns level state to canonical.
+2. `PlayLayer::loadFromCheckpoint()` **directly** — never via the respawn.
+3. Write back the 196 `PlayerObject` fields the direct load leaves untouched
+   (`PlayerFields.inc`). `loadFromCheckpoint` assigns only a subset, and a reset
+   beforehand only changes *which* wrong value the rest hold.
+4. Write back the state that lives in **containers**, which no field table can
+   reach. See below — this is the part that took longest to find.
+5. Apply the layer/PlayLayer scalars no checkpoint carries.
+
+Anything that executes game logic (`pushButton`/`releaseButton`) must run
+**before** step 3, never after: those are not passive setters.
+
+Result: Probe 4b (F10) reports CUBE 5/5 and AIR 3/3 bit-identical, and a full
+Stereo Madness solve now replays from frame 0 with **zero diverging steps** out
+of 20,330 — not merely surviving, but identical.
+
+**Consequences.** No realign step (the direct load lands exactly; the respawn
+landed one step early). No cube-anchor hybrid, no transition anchors for restore
+purposes, no forward replay through air sections. Every decision captures a
+checkpoint, air included, so a backtrack into a ship or UFO section is O(1).
+Measured: 1,473 deaths and exactly 1,473 restores, ~114 restores/s, no resyncs.
+Cost is ~22 KB of checkpoint plus ~2 KB of player image per decision.
+
+**The input queue — the bug that hid behind everything else.**
+`GJBaseGameLayer::handleButton` does not touch the player. It appends a
+`PlayerButtonCommand` to `m_queuedButtons`, a **layer-level vector** that
+`processQueuedButtons` drains during `update`. That queue is in no checkpoint and
+`resetLevel` clears it, so every restore discarded the input in flight and the
+next press landed **one step late**. In cube modes a single frame usually washes
+out, which is why ~18,000 cube steps and all eight probe anchors looked clean; in
+ship mode, where hold controls acceleration every frame, it split the trajectory
+on the spot and never re-converged.
+
+**State the field table cannot reach — the checklist.** Every defect found in
+this restore path was state living somewhere an enumeration of `PlayerObject`'s
+own scalars can never see. Check all of it before assuming a restore is exact:
+
+| State | Lives in | Why a field table misses it |
+|---|---|---|
+| `m_holdingButtons` | `gd::map` member | container, not a scalar |
+| `m_queuedButtons` | `GJBaseGameLayer` | a different object |
+| node position | `CCNode` base | inherited, not `PlayerObject`'s own |
+| `m_cameraFlip` + camera group | `GJBaseGameLayer` | a different object |
+| `ProbeState::isHolding` | our own code | ours to track, so ours to restore |
+
+Do **not** rebuild `m_holdingButtons` from the intended input: it is one step out
+of phase with the container through `handleButton`'s latency. Capture the real
+value. And do not restore the whole layer indiscriminately — several differing
+fields (`m_solidCollisionObjectsCount`, `m_hazardCollisionObjectsCount`,
+`m_activeObjectsCount`) are per-frame working values, and writing stale numbers
+into those would be worse than leaving them.
+
+**Mirror mode is a CAMERA FLIP, and it is animated.** `GJBaseGameLayer::
+m_cameraFlip` is a **`float`**, not a flag — it is transition progress, which is
+why `toggleFlipped(bool flip, bool noEffects)` takes a `noEffects` argument at
+all. A restore landing *inside* a transition window leaves it at the wrong value.
+
+MEASURED (Time Machine, step 13071, a blue un-mirror portal): reported player `x`
+swept smoothly from +146.7 through zero to exactly −150.0 across the 95 steps of
+the transition, then snapped back into agreement. `y`, rotation, velocity,
+gravity and every flag stayed bit-identical the whole time — the flip is
+presentational, so it corrupts the reported position without corrupting the
+physics. The level still cleared, which is exactly how it hid behind eleven
+passing levels. It only bites when a restore lands inside a transition window,
+which is why one flip diverged and the same level's other flips did not.
+
+**The general rule this establishes:** a savestate must restore state wherever it
+lives, and GD spreads it across at least four places at three levels of the
+object graph. **A byte-exact `PlayerObject` is not a byte-exact player.**
+
+### 13.12 Method note, second pass
+
+§13.10 said mechanical byte comparison beat reasoning. This round sharpened that:
+**when a fix produces byte-identical output, fix the instrument, not the code.**
+
+Three targeted fixes were made against reasoned hypotheses here. The first two
+changed *nothing* — not one byte. What actually resolved it was improving the
+measurement twice:
+
+- Comparing the solver's own trajectory against a clean replay **to the end**
+  rather than latching the first difference. The first divergence turned out to
+  be a one-step transient that healed immediately; the real split was 18,000
+  steps later. Latching had been pointing at the wrong step entirely.
+- Recording a `FlagPostRestore` bit to answer *"is this step a restore?"*
+  directly. The previous proxy — "a decision is nearby" — is near-worthless,
+  because decisions occur every ~4 steps and one is adjacent to any step chosen.
+
+Corollary worth keeping: **a probe that does not mirror the code under test
+validates nothing.** Probe 4b reported 8/8 sound while the solver was broken on
+its first restore, because the probe reconstructed button state from its macro
+while the solver reconstructed it from a decision. Whenever the restore path
+changes, change the probe in the same commit.
+
+Also: eight sampled anchors are eight samples out of ~1,500 restores, along a
+known-good macro rather than the arbitrary mid-air states a search actually
+restores at. Treat a probe sweep as evidence, never as proof. **A verification
+that reports zero diverging steps is the stronger test** — it checks every
+restore on the path actually taken — so prefer F2→F4 over an F10 sweep when
+confirming a change.
+
+**Report on success, not only on failure.** Verification reported divergence only
+when the run died, so a macro that cleared the level while flying a *different*
+trajectory passed silently. Time Machine did exactly that for several runs. A
+pass that diverged is a restore defect that happened not to be fatal; it now
+reports as `PASSED, BUT DIVERGED` and writes the CSV either way.
+
+**Point the probe at a step known to be wrong.** The `PlayLayer` byte-diff
+(Probe 4a-layer) existed for days and found nothing, because it only ever ran at
+eight anchors spread evenly across the level — none of which were broken. Once a
+verification localised a real divergence and F10 was made to anchor *exactly*
+there, the same untouched code named `m_cameraFlip` on the first run. A diagnostic
+aimed at a healthy sample proves only that the sample is healthy.
 
 ---
 

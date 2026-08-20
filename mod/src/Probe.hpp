@@ -78,7 +78,40 @@ enum Flag : uint32_t {
 	FlagSrcPushButton   = 1u << 25, // PlayerObject::pushButton/releaseButton observer
 	FlagSrcHoldingMap   = 1u << 26, // PlayerObject::m_holdingButtons[Jump]
 	FlagSrcAsyncKey     = 1u << 27, // GetAsyncKeyState (space/up/LMB)
+
+	// m_holdingButtons[Jump], read DIRECTLY rather than through an observer, and
+	// deliberately outside kInputSourceMask so it is compared, not masked.
+	//
+	// A solver-vs-replay divergence showed m_jumpBuffered differing while all six
+	// physics fields were bit-identical. Input handling is then the only thing
+	// that can differ, and whether the game already believes the button is held
+	// decides whether a press registers as a new edge at all. That state lives in
+	// a container, so it is outside the PlayerObject field table the restore
+	// writes back - which makes it exactly the blind spot worth instrumenting.
+	FlagHoldingJump     = 1u << 28,
+
+	// Set on the first step recorded after a restore. Solver-only bookkeeping:
+	// a clean replay never restores, so it is masked out of comparisons.
+	//
+	// "Nearest decision at or before the divergence" turned out to be weak
+	// evidence - decisions are dense, so one is almost always nearby whether or
+	// not a restore happened there. This answers the question directly.
+	FlagPostRestore     = 1u << 29,
+
+	// GJBaseGameLayer::m_queuedButtons was non-empty at the end of this step.
+	//
+	// handleButton does not act on the player directly - it appends a
+	// PlayerButtonCommand to a layer-level queue that processQueuedButtons
+	// drains during update. That queue is not part of any checkpoint, and
+	// resetLevel clears it, so a restore can leave it holding a command from
+	// before the rewind. Compared, not masked: if the solver carries a queue
+	// entry the clean replay does not, that is the defect.
+	FlagQueuedButtons   = 1u << 30,
 };
+
+// Bits that exist only in the solver's own trace and must never take part in a
+// solver-vs-replay comparison.
+constexpr uint32_t kSolverOnlyMask = FlagPostRestore;
 
 // All four observation bits, for masking in comparisons.
 constexpr uint32_t kInputSourceMask =
