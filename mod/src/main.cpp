@@ -111,6 +111,12 @@ struct Config {
 	// knob to tighten if a section proves unsolvable.
 	int airBranchInterval = 4;
 
+	// How long a discrete tap holds the button. Only needs to outlast the
+	// measured one-step injection latency so the press registers as an edge;
+	// holding longer does nothing in UFO or swing and would only crowd the next
+	// tap.
+	int tapLengthSteps = 2;
+
 	// Minimum gap between decisions while grounded. Branching on EVERY grounded
 	// frame is the complete formulation, but it produced a 3400-deep stack over
 	// a third of Stereo Madness - which both blew memory and, per Probe 5,
@@ -154,6 +160,12 @@ struct Config {
 	// 1 s at 240Hz. Must be well BELOW the length of a section, or the floor can
 	// never advance within it: the ship is ~330 steps, so a 480-step window
 	// would still span the whole thing and freeze nothing.
+	// 1 s. REVERTED from 720 after measurement: a wider default leaves ~3x more
+	// decisions mutable at EVERY point in the search, so DFS has far more to
+	// exhaust before it can commit and advance. Theory of Everything regressed
+	// from 78.90% to 14.91%, stalling early in the level rather than at the
+	// corridor. Reach for a distant mistake is the escalation ladder's job; the
+	// default should stay tight.
 	int commitLookbackSteps = 240;
 
 	// Adaptive widening. 240 steps is one second of gameplay, chosen because
@@ -165,8 +177,33 @@ struct Config {
 	// Commitment must therefore be REVOCABLE (plan section 2.6 option 3): after
 	// this many escapes with no improvement, double the window and let the
 	// search reach further back, up to the cap.
-	int escapesBeforeWidening = 6;
+	// Escalation ladder for a stalled search, in increasing cost and reach:
+	//   stage 1  widen the window within the current section
+	//   stage 2  release the mode-transition anchor, reaching into the previous
+	//            section - the only way to reconsider HOW a portal was entered,
+	//            or whether to take it at all
+	//   stage 3  the existing frame-0 replay fallback
+	//
+	// Aggressive on purpose. Each escape needs 400 deaths (~57 s at observed
+	// rates), so at the old 6-escapes-per-doubling it took ~28 minutes to reach
+	// full reach - useless as an escape hatch. 2 escapes and x4 gets there in ~3.
+	// Back to the values that reached 78.90%. Faster escalation (2 escapes, x4)
+	// ran the whole ladder in ~2 minutes, before the search had meaningfully
+	// explored any single window. Escapes come cheaply early in a level, so the
+	// trigger must be slow enough that widening means "genuinely exhausted".
+	int escapesBeforeWidening  = 6;
+	int wideningFactor         = 2;
 	int maxCommitLookbackSteps = 7680; // 32 s
+
+	// Escapes at max window before the transition anchor is released.
+	int escapesBeforeAnchorRelease = 10;
+
+	// The floor must never collapse to zero. The window is an ABSOLUTE step count
+	// behind the frontier, so early in a level a wide window reaches past the
+	// start and commits nothing at all - measured: commit 0 with a 7680-step
+	// window at 14.91%, after which the search re-derived the whole level and
+	// thrashed. At least this fraction of the progress made always stays frozen.
+	double minCommittedFraction = 0.5;
 
 	// Give up on a branch that survives this long without a decision point or
 	// death, to avoid an unbounded descent.
@@ -929,12 +966,38 @@ bool isDecisionPoint(PlayerObject* p, int stepsSinceLast) {
 	return onGround || onRing;
 }
 
+// Input semantics differ fundamentally by mode, and lumping them together made
+// UFO structurally unsolvable in tight sections (plan section 6.3):
+//   Ground  cube/ball/spider/robot - act only on contact with a surface or orb
+//   Hold    ship/wave              - hold controls the trajectory continuously
+//   Tap     UFO/swing              - each PRESS is a discrete event; holding does
+//                                    nothing, so a tap under continue/toggle
+//                                    semantics costs TWO budget units (press then
+//                                    release) instead of one, halving expressiveness
+//                                    exactly where it is scarcest.
+enum class ModeClass { Ground, Hold, Tap };
+
+ModeClass classifyMode(PlayerObject* p) {
+	if (!p) return ModeClass::Ground;
+	if (p->m_isShip || p->m_isDart)  return ModeClass::Hold; // ship, wave
+	if (p->m_isBird || p->m_isSwing) return ModeClass::Tap;  // UFO, swing
+	return ModeClass::Ground;                                 // cube, ball, spider, robot
+}
+
+// Budget cost of taking `choice` at this decision.
+//   Hold : a toggle (changing the hold state) costs 1; continuing is free.
+//   Tap  : a tap costs 1; not tapping is free. Crucially a tap is ONE unit, not
+//          the two it cost when taps were expressed as toggle-on plus toggle-off.
+struct Decision;
+int decisionCost(Decision const& d, bool choice);
+
 struct Decision {
 	CheckpointObject* cp        = nullptr; // state entering this decision
 	int               step      = 0;       // solver step index at capture
 	uint8_t           tried     = 0;       // bit0 = tried release, bit1 = tried hold
 	bool              choice    = false;   // action currently being explored
-	bool              airPolicy = false;   // which branch policy created this
+	bool              airPolicy = false;   // Hold or Tap (i.e. not Ground)
+	ModeClass         modeClass = ModeClass::Ground;
 
 	// Iterative deepening on toggle count, for air sections.
 	//
@@ -972,6 +1035,14 @@ struct Decision {
 	// time-carrying fields in that region.
 };
 
+int decisionCost(Decision const& d, bool choice) {
+	switch (d.modeClass) {
+		case ModeClass::Tap:    return choice ? 1 : 0;
+		case ModeClass::Hold:   return (choice != d.enteringHold) ? 1 : 0;
+		case ModeClass::Ground: default: return 0;
+	}
+}
+
 struct Solver {
 	bool                  running    = false;
 	std::vector<Decision> stack;
@@ -992,6 +1063,8 @@ struct Solver {
 	size_t                commitDepth  = 0; // cached for logging; see solverCommitFloor()
 	int                   lookbackSteps = 0;   // current (possibly widened) window
 	int                   escapesAtWiden = 0;  // escape count when it last widened
+	bool                  anchorReleased = false; // stage 2: transition anchor dropped
+	uint64_t              escapesAtMaxWindow = 0;
 	int                   bestStep     = 0; // solver step at which bestPct was reached
 	uint64_t              deathsAtBest = 0;
 	uint64_t              escapes      = 0;
@@ -1010,9 +1083,11 @@ struct Solver {
 	bool                  resyncing      = false;
 	bool                  resyncForBacktrack = false;
 	bool                  resumeHold     = false;
+	int                   resumeTap      = 0;
 	int                   resumeToggles  = 0;
 	int                   resumeBranch   = 0;
 	uint64_t              replayBacktracks = 0;
+	int                   tapRemaining       = 0;   // steps left in the current tap
 	bool                  anchorReplaying    = false;
 	int                   anchorReplayTarget = 0;
 	uint64_t              anchorReplays      = 0;
@@ -1043,6 +1118,7 @@ struct Solver {
 		resyncing = false;
 		resyncForBacktrack = false;
 		replayBacktracks = 0;
+		tapRemaining = 0;
 		anchorReplaying = false;
 		anchorReplayTarget = 0;
 		anchorReplays = 0;
@@ -1058,6 +1134,8 @@ struct Solver {
 		bestStep = 0;
 		lookbackSteps = 0;
 		escapesAtWiden = 0;
+		anchorReleased = false;
+		escapesAtMaxWindow = 0;
 		bestPct = 0.f;
 		deaths = restores = steps = 0;
 	}
@@ -2615,6 +2693,19 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		return false;
 	}
 
+	// Turn a decision's choice into actual button state. Tap modes start a
+	// self-releasing countdown; everything else sets a persistent hold.
+	void applyDecisionChoice(Decision const& d) {
+		auto& sv = Solver::get();
+		if (d.modeClass == ModeClass::Tap) {
+			sv.tapRemaining = d.choice ? g_config.tapLengthSteps : 0;
+			sv.hold         = d.choice;
+		} else {
+			sv.tapRemaining = 0;
+			sv.hold         = d.choice;
+		}
+	}
+
 	// Push a decision at the current state and take the first branch.
 	void solverPushDecision() {
 		auto& sv = Solver::get();
@@ -2623,7 +2714,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		Decision d;
 		d.step = sv.step;
 		if (auto* p = m_player1) {
-			d.airPolicy = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
+			d.modeClass = classifyMode(p);
+			d.airPolicy = d.modeClass != ModeClass::Ground;
 		}
 		// Skip the checkpoint for air decisions under hybrid restore: they are
 		// never restored to, so capturing one is 22 KB and a createCheckpoint call
@@ -2668,7 +2760,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		d.tried = d.choice ? (1u << 1) : (1u << 0);
 
 		sv.stack.push_back(d);
-		sv.hold       = d.choice;
+		applyDecisionChoice(d);
 		sv.lastBranch = sv.step;
 	}
 
@@ -2692,7 +2784,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// choose its hold state from the exact step the section begins.
 		size_t floorIdx = 0;
 		bool anchored = false;
-		for (size_t i = sv.stack.size(); i-- > 0; ) {
+		for (size_t i = sv.stack.size(); i-- > 0 && !sv.anchorReleased; ) {
 			if (sv.stack[i].modeTransition && sv.stack[i].step <= sv.bestStep) {
 				floorIdx = i;
 				anchored = true;
@@ -2707,8 +2799,25 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// re-deriving the solved part of the ship instead of extending it.
 		(void)anchored;
 		if (sv.lookbackSteps <= 0) sv.lookbackSteps = g_config.commitLookbackSteps;
-		if (sv.bestStep > sv.lookbackSteps) {
-			const int cutoff = sv.bestStep - sv.lookbackSteps;
+
+		// Clamp the window so a committed prefix always survives. Widening is
+		// meant to reach further back within the explored region, not to abolish
+		// commitment - and an absolute step count does exactly that early in a
+		// level, where the window can exceed all progress made.
+		// Only clamp a WIDENED window. Applied unconditionally it also bit the
+		// default early in a level (bestStep < 2x window), quietly tightening
+		// commitment in the first couple of seconds - a behaviour change nobody
+		// asked for. The guard exists to stop escalation abolishing commitment,
+		// so it should only constrain escalation.
+		int window = sv.lookbackSteps;
+		if (sv.lookbackSteps > g_config.commitLookbackSteps) {
+			const int maxWindow =
+				static_cast<int>(sv.bestStep * (1.0 - g_config.minCommittedFraction));
+			window = std::max(g_config.commitLookbackSteps, std::min(window, maxWindow));
+		}
+
+		if (sv.bestStep > window) {
+			const int cutoff = sv.bestStep - window;
 			size_t windowIdx = 0;
 			while (windowIdx < sv.stack.size() && sv.stack[windowIdx].step < cutoff) windowIdx++;
 			floorIdx = std::max(floorIdx, windowIdx);
@@ -2834,8 +2943,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		auto& sv = Solver::get();
 
 		sv.resumeHold    = d.choice;
-		sv.resumeToggles = d.togglesBefore +
-			((d.airPolicy && d.choice != d.enteringHold) ? 1 : 0);
+		sv.resumeTap     = (d.modeClass == ModeClass::Tap && d.choice)
+		                 ? g_config.tapLengthSteps : 0;
+		sv.resumeToggles = d.togglesBefore + decisionCost(d, d.choice);
 		sv.resumeBranch  = d.step;
 		sv.macro.resize(static_cast<size_t>(d.step), 0);
 
@@ -2843,9 +2953,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (d.cp && !g_config.noSavestates) {
 			solverRestoreState(d);
 			sv.step        = d.step;
-			sv.hold        = sv.resumeHold;
-			sv.togglesUsed = sv.resumeToggles;
-			sv.lastBranch  = sv.resumeBranch;
+			sv.hold         = sv.resumeHold;
+			sv.tapRemaining = sv.resumeTap;
+			sv.togglesUsed  = sv.resumeToggles;
+			sv.lastBranch   = sv.resumeBranch;
 			return false;
 		}
 
@@ -2869,9 +2980,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					sv.anchorReplays++;
 					return true;
 				}
-				sv.hold        = sv.resumeHold;
-				sv.togglesUsed = sv.resumeToggles;
-				sv.lastBranch  = sv.resumeBranch;
+				sv.hold         = sv.resumeHold;
+				sv.tapRemaining = sv.resumeTap;
+				sv.togglesUsed  = sv.resumeToggles;
+				sv.lastBranch   = sv.resumeBranch;
 				return false;
 			}
 		}
@@ -2937,13 +3049,32 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (sv.escapes - sv.escapesAtWiden >= static_cast<uint64_t>(g_config.escapesBeforeWidening)
 			    && sv.lookbackSteps < g_config.maxCommitLookbackSteps) {
 				const int before = sv.lookbackSteps;
-				sv.lookbackSteps = std::min(sv.lookbackSteps * 2,
+				sv.lookbackSteps = std::min(sv.lookbackSteps * g_config.wideningFactor,
 				                            g_config.maxCommitLookbackSteps);
 				sv.escapesAtWiden = sv.escapes;
+				if (sv.lookbackSteps >= g_config.maxCommitLookbackSteps)
+					sv.escapesAtMaxWindow = sv.escapes;
 				log::info("Solver: {} escapes with no progress at {:.2f}% - widening the "
 				          "mutable window {} -> {} steps ({:.1f}s -> {:.1f}s of reach)",
 				          g_config.escapesBeforeWidening, sv.bestPct, before,
 				          sv.lookbackSteps, before / 240.0, sv.lookbackSteps / 240.0);
+			}
+
+			// Stage 2. The window is maxed and the search is still boxed in, so
+			// the obstacle is not inside this section - it is how we ENTERED it.
+			// Releasing the transition anchor lets the floor move back past the
+			// portal, which is the only way to reconsider the approach to it, or
+			// whether to take it at all. Fake portals inside dead-end corridors
+			// are otherwise permanently unescapable: taking one scores progress,
+			// the anchor freezes behind it, and "do not go here" is unreachable.
+			if (!sv.anchorReleased &&
+			    sv.lookbackSteps >= g_config.maxCommitLookbackSteps &&
+			    sv.escapesAtMaxWindow > 0 &&
+			    sv.escapes - sv.escapesAtMaxWindow >= static_cast<uint64_t>(g_config.escapesBeforeAnchorRelease)) {
+				sv.anchorReleased = true;
+				log::info("Solver: still stuck at {:.2f}% with the window maxed - releasing "
+				          "the mode-transition anchor. The search can now reconsider how it "
+				          "entered this section, or whether to enter it at all.", sv.bestPct);
 			}
 
 			// Phase A2: the rewind distance in steps AND seconds. Arithmetic says
@@ -2978,7 +3109,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// that toggles. Refuse it when the path is already at the toggle
 			// budget; the bound rises when the whole tree at this bound is done.
 			if (d.tried != 0b11 && d.airPolicy) {
-				const bool wouldToggle = (!d.choice) != d.enteringHold;
+				const bool wouldToggle = decisionCost(d, !d.choice) > 0;
 				// Relative to the committed prefix: toggles spent inside a
 				// frozen, already-working prefix must not count against the
 				// budget for the part still being solved.
@@ -2999,8 +3130,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				// meant ~800 cube decisions exhausted the budget before the ship
 				// was even reached, so every air toggle was refused and each
 				// budget level "exhausted" after a single path.
-				sv.togglesUsed = d.togglesBefore +
-					((d.airPolicy && d.choice != d.enteringHold) ? 1 : 0);
+				sv.togglesUsed = d.togglesBefore + decisionCost(d, d.choice);
 
 				if (solverRepositionTo(d)) return true;
 				sv.togglesUsed = sv.resumeToggles;
@@ -3074,9 +3204,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// the stack; only the trajectory was re-derived.
 			sv.resyncForBacktrack = false;
 			sv.resyncing   = false;
-			sv.hold        = sv.resumeHold;
-			sv.togglesUsed = sv.resumeToggles;
-			sv.lastBranch  = sv.resumeBranch;
+			sv.hold         = sv.resumeHold;
+			sv.tapRemaining = sv.resumeTap;
+			sv.togglesUsed  = sv.resumeToggles;
+			sv.lastBranch   = sv.resumeBranch;
 			sv.macro.resize(static_cast<size_t>(sv.step), 0);
 			return;
 		}
@@ -3227,11 +3358,14 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// Progress: the window was wide enough, so return to the cheap
 			// default. A permanently wide window would keep the whole tail of the
 			// level mutable and undo the point of committing at all.
-			if (sv.lookbackSteps > g_config.commitLookbackSteps) {
-				log::info("Solver: progress at {:.2f}% - narrowing window back to {} steps",
-				          sv.bestPct, g_config.commitLookbackSteps);
-				sv.lookbackSteps  = g_config.commitLookbackSteps;
-				sv.escapesAtWiden = sv.escapes;
+			if (sv.lookbackSteps > g_config.commitLookbackSteps || sv.anchorReleased) {
+				log::info("Solver: progress at {:.2f}% - resetting escalation (window {} -> {}"
+				          "{})", sv.bestPct, sv.lookbackSteps, g_config.commitLookbackSteps,
+				          sv.anchorReleased ? ", transition anchor restored" : "");
+				sv.lookbackSteps      = g_config.commitLookbackSteps;
+				sv.escapesAtWiden     = sv.escapes;
+				sv.anchorReleased     = false;
+				sv.escapesAtMaxWindow = 0;
 			}
 
 			// Far enough past the last validation: re-derive the prefix cleanly.
@@ -3327,7 +3461,15 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		}
 
 		auto* p = m_player1;
-		const bool airMode = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
+		const ModeClass mc = classifyMode(p);
+		const bool airMode = mc != ModeClass::Ground;
+
+		// A tap is a short press that releases itself. Holding does nothing in
+		// UFO or swing, so a persistent hold would just block the next tap.
+		if (sv.tapRemaining > 0) {
+			sv.tapRemaining--;
+			if (sv.tapRemaining == 0) sv.hold = false;
+		}
 
 		// A mode change is the most timing-critical frame in a section, and
 		// nothing otherwise guarantees a decision lands on it. Force one so the
@@ -3339,7 +3481,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			return true;
 		}
 
-		if (airMode) {
+		if (mc == ModeClass::Tap) {
+			// Discrete events: decide whether to tap, on the same cadence. No
+			// hold persists between decisions.
+			if (sv.step - sv.lastBranch >= g_config.airBranchInterval) solverPushDecision();
+		} else if (mc == ModeClass::Hold) {
 			// Hold state controls the trajectory continuously, so the action
 			// genuinely is per-segment and persists across the interval.
 			if (sv.step - sv.lastBranch >= g_config.airBranchInterval) solverPushDecision();
