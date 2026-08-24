@@ -29,6 +29,7 @@
 #include <vector>
 #include <cstring>
 #include <unordered_set>
+#include <unordered_map>
 #include <cctype>
 #include <memory>
 
@@ -250,14 +251,35 @@ struct Config {
 	bool noSavestates = false;
 
 	// --- beam search -------------------------------------------------------
-	// Frontier width. Bounds NUMBER of nodes; sparse checkpointing separately
-	// bounds bytes per node, and neither substitutes for the other.
-	int  beamWidth = 2000;
+	// Frontier width.
+	//
+	// Set from TIME, not memory. Expanding a node costs two restores - after
+	// stepping the first child we are at the child's state, not the parent's -
+	// and a restore was MEASURED at 1.06 ms on Stereo Madness and 40.9 ms on an
+	// object-heavy level (Probe 5). A 20k-step level branches every 4 steps, so
+	// ~5000 beam levels:
+	//
+	//     restores = 2 * width * 5000
+	//     width 64  -> 640k  ->  11 min @1.06ms,  7.3 h @40.9ms
+	//     width 500 -> 5M    ->  88 min @1.06ms,   57 h @40.9ms
+	//
+	// For comparison the DFS clears Stereo Madness in 1473 restores. The beam
+	// buys coverage by paying restores, so width belongs in the tens until
+	// restore cost comes down. Memory is NOT the binding constraint at these
+	// widths - beamReclaim keeps live checkpoints proportional to width, not to
+	// nodes explored.
+	int  beamWidth = 64;
 
 	// A node gets its own checkpoint once it is this far, in steps, from its
-	// nearest checkpointed ancestor. Directly bounds replay cost per restore:
-	// higher means less memory and slower restores.
-	int  beamCheckpointIntervalSteps = 240;
+	// nearest checkpointed ancestor.
+	//
+	// 0 = derive it at search start from the measured restore and step costs.
+	// Restoring an ancestor and replaying d steps beats a direct restore exactly
+	// when d * stepCost < restoreCost, so the break-even interval IS
+	// restoreCost/stepCost - about 5 steps on Stereo Madness and about 195 on a
+	// heavy level. A fixed constant would be wrong on one of them, so it is
+	// measured per level instead of guessed.
+	int  beamCheckpointIntervalSteps = 0;
 
 	// Selection rule. Score-ranking is the naive baseline and is EXPECTED to
 	// fail on fake-corridor levels: the decoy scores higher early, so ranking by
@@ -281,6 +303,7 @@ enum class Mode {
 	Determinism,  // Probe 1: replay fixed input N times, compare trace hashes
 	RestoreTest,  // Probe 4b: does a restore reproduce the future, bit-for-bit?
 	Solve,        // DFS search for an input sequence that clears the level
+	Beam,         // deduplicated width-K beam search over the same action space
 	Verify,       // replay a found macro from frame 0, no savestates, no practice
 };
 
@@ -1536,9 +1559,19 @@ struct BeamNode {
 	// replay is exact in EVERY mode now, which is what makes this sound - the
 	// superficially similar hybrid deleted in 13.11 existed to dodge broken air
 	// restores, whereas this exists purely to bound memory.
-	RestoreState rs;           // cp is usually null; see cpAncestor
+	// Captured state lives in Beam::rsPool, not here. Inlining a RestoreState
+	// would put two vector headers and ~25 scalars - about 220 bytes - on every
+	// node including the overwhelming majority that hold no checkpoint. The
+	// indirection keeps BeamNode at 40 bytes, which is the difference between a
+	// 100 MB arena and a 650 MB one, and lets a reclaimed slot be reused.
+	int      rsIndex     = -1; // index into Beam::rsPool, -1 = no checkpoint
 	int      cpAncestor  = -1; // nearest ancestor (or self) holding a checkpoint
 	int      stepsSinceCp = 0; // replay distance from that ancestor
+
+	// Diversity bucket, computed while the player is actually in this state.
+	// It cannot be recovered afterwards from the node alone, which is why it is
+	// stored rather than derived at selection time.
+	uint32_t bucket      = 0;
 };
 
 struct Decision;
@@ -1744,6 +1777,13 @@ struct Solver {
 struct Beam {
 	bool running = false;
 
+	// The search alternates between expanding a frontier and choosing the next
+	// one. Expansion is resumable mid-frontier because a full frontier is far
+	// more work than one rendered frame's budget allows.
+	enum class Phase { Init, Expand };
+	Phase phase     = Phase::Init;
+	int   expandIdx = 0;   // position within `frontier` while expanding
+
 	// Arena. Nodes are never erased while the search runs - a node may be the
 	// checkpoint ancestor of a live descendant long after it leaves the frontier
 	// - so `alive` marks frontier membership and the arena is freed at the end.
@@ -1757,18 +1797,38 @@ struct Beam {
 	// already explored the future of, so the duplicate is dropped.
 	std::unordered_set<uint64_t> visited;
 
-	// Scratch for macro reconstruction, reused so expansion allocates nothing.
-	std::vector<uint8_t> macroScratch;
-	std::vector<int>     pathScratch;
+	// Captured states, indexed by BeamNode::rsIndex. Slots freed by beamReclaim
+	// are reused, so this grows to the high-water mark of live checkpoints
+	// rather than to the number of checkpoints ever taken.
+	std::vector<RestoreState> rsPool;
+	std::vector<int>          rsFree;   // reusable slots
+	std::vector<int>          cpNodes;  // nodes currently holding a checkpoint
+
+	// Scratch, reused so expansion and selection allocate nothing per node.
+	std::vector<uint8_t>   macroScratch;
+	std::vector<int>       pathScratch;
+	std::vector<int>       keepScratch;
+	std::unordered_set<int> neededScratch;
 
 	uint64_t expansions   = 0;
 	uint64_t dedupHits    = 0;
 	uint64_t deaths       = 0;
+	uint64_t steps        = 0;
 	uint64_t replaySteps  = 0;  // steps spent replaying forward from an ancestor
-	uint64_t checkpoints  = 0;  // checkpoints currently held
+	uint64_t restoreCount = 0;
+	uint64_t restoreFails = 0;
+	uint64_t dropped      = 0;  // nodes discarded by the selection rule
 	float    bestPct      = 0.f;
 	int      bestNode     = -1;
 	int      depth        = 0;
+
+	// Calibration, measured once at search start. cpInterval is derived from
+	// them unless the config pins it.
+	double restoreUs = 0.0;
+	double stepUs    = 0.0;
+	int    cpInterval = 240;
+	size_t memAtStart = 0;
+
 	uint64_t startTicks   = 0;
 	uint64_t lastReport   = 0;
 
@@ -1776,17 +1836,28 @@ struct Beam {
 		if (auto* pl = PlayLayer::get()) {
 			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
 		}
-		for (auto& n : nodes) releaseCheckpoint(n.rs.cp);
+		for (auto& r : rsPool) releaseCheckpoint(r.cp);
+		rsPool.clear();
+		rsFree.clear();
+		cpNodes.clear();
 		nodes.clear();
 		frontier.clear();
 		next.clear();
 		visited.clear();
 		macroScratch.clear();
 		pathScratch.clear();
-		expansions = dedupHits = deaths = replaySteps = checkpoints = 0;
+		keepScratch.clear();
+		neededScratch.clear();
+		expansions = dedupHits = deaths = steps = replaySteps = 0;
+		restoreCount = restoreFails = dropped = 0;
 		bestPct = 0.f;
 		bestNode = -1;
 		depth = 0;
+		expandIdx = 0;
+		phase = Phase::Init;
+		restoreUs = stepUs = 0.0;
+		cpInterval = 240;
+		memAtStart = 0;
 		running = false;
 	}
 
@@ -2250,6 +2321,36 @@ void pollHotkeys() {
 	// carries no level state, so restoring one discards trigger and
 	// moving-object state - fine on a 2013 level, wrong everywhere this project
 	// is aiming. The full CheckpointObject path is the only correct one.
+
+	// B = beam search. Every function key was already taken; the beam is a
+	// second search mode rather than a probe, so it gets its own letter.
+	if (keyPressedEdge('B')) {
+		auto& bm = Beam::get();
+		if (bm.running) {
+			log::info("Beam: stopped by user.");
+			// Staging the best path happens inside beamStop, so F9 can replay
+			// wherever it got to.
+			bm.clear();
+			st.mode = Mode::Idle;
+		} else if (PlayLayer::get()) {
+			g_config.physicsFix = true;   // the beam requires fixed-dt stepping
+			g_config.noSavestates = false; // the beam IS savestates; without them it cannot switch nodes
+
+			// Practice mode for the same reason the DFS needs it: it is what
+			// makes resetLevel a usable revive path.
+			PlayLayer::get()->m_isPracticeMode = true;
+
+			Solver::get().clear();  // the two searches share the macro buffers
+			bm.clear();
+			bm.running    = true;
+			bm.startTicks = probe::nowTicks();
+			bm.lastReport = bm.startTicks;
+			st.mode       = Mode::Beam;
+			st.resetPending = true;
+			log::info("Beam: starting a NEW search. Press B again to stop it. "
+			          "F4 verifies a finished solution; F9 replays the best path so far.");
+		}
+	}
 
 	if (keyPressedEdge(VK_F8)) {
 		g_config.resyncEnabled = !g_config.resyncEnabled;
@@ -4062,9 +4163,34 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		Solver::get().pendingPostRestore = true;
 	}
 
+	// --- beam: state pool --------------------------------------------------
+
+	int beamRsAlloc() {
+		auto& bm = Beam::get();
+		if (!bm.rsFree.empty()) { const int i = bm.rsFree.back(); bm.rsFree.pop_back(); return i; }
+		bm.rsPool.emplace_back();
+		return static_cast<int>(bm.rsPool.size()) - 1;
+	}
+
+	// Return a slot to the pool. swap-with-empty rather than clear(): clear()
+	// keeps the capacity, and playerBytes is nearly the whole slot, so clearing
+	// would reclaim the checkpoint's ~22 KB and leak the rest indefinitely.
+	void beamRsRelease(int slot) {
+		auto& bm = Beam::get();
+		if (slot < 0 || slot >= static_cast<int>(bm.rsPool.size())) return;
+		auto& r = bm.rsPool[static_cast<size_t>(slot)];
+		releaseCheckpoint(r.cp);
+		std::vector<uint8_t>().swap(r.playerBytes);
+		std::vector<PlayerButtonCommand>().swap(r.queuedButtons);
+		bm.rsFree.push_back(slot);
+	}
+
 	// Restore a beam node's own captured state, with no forward replay.
 	void beamRestoreCheckpointOnly(BeamNode const& n) {
-		applyRestoreState(n.rs, n.hold);
+		auto& bm = Beam::get();
+		if (n.rsIndex < 0) return;
+		applyRestoreState(bm.rsPool[static_cast<size_t>(n.rsIndex)], n.hold);
+		bm.restoreCount++;
 	}
 
 	// Reconstruct the input sequence from the root to `idx` into `out`.
@@ -4076,15 +4202,15 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		auto& bm = Beam::get();
 		auto& path = bm.pathScratch;
 		path.clear();
-		for (int i = idx; i >= 0; i = bm.nodes[i].parent) path.push_back(i);
+		for (int i = idx; i >= 0; i = bm.nodes[static_cast<size_t>(i)].parent) path.push_back(i);
 
-		const int endStep = idx >= 0 ? bm.nodes[idx].step : 0;
+		const int endStep = idx >= 0 ? bm.nodes[static_cast<size_t>(idx)].step : 0;
 		out.assign(static_cast<size_t>(endStep), 0);
 		// Walk root-ward to leaf, filling each edge's span with its hold.
 		for (size_t k = path.size(); k-- > 0; ) {
-			const BeamNode& n = bm.nodes[path[k]];
+			const BeamNode& n = bm.nodes[static_cast<size_t>(path[k])];
 			if (n.parent < 0) continue;
-			const int from = bm.nodes[n.parent].step;
+			const int from = bm.nodes[static_cast<size_t>(n.parent)].step;
 			for (int t = from; t < n.step && t < endStep; t++)
 				out[static_cast<size_t>(t)] = n.hold ? 1 : 0;
 		}
@@ -4097,24 +4223,25 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	// every mode (13.11), so this is sound - unlike the superficially identical
 	// hybrid it replaces, which existed because air restores were NOT exact.
 	//
-	// Replay is bounded by beamCheckpointIntervalSteps and runs synchronously.
-	// The deleted hybrid spread its replay across frames as a state machine and
-	// was a recurring source of bugs; a bounded synchronous loop cannot get out
-	// of sync with itself.
+	// Replay is bounded by Beam::cpInterval and runs synchronously. The deleted
+	// hybrid spread its replay across frames as a state machine and was a
+	// recurring source of bugs; a bounded synchronous loop cannot get out of
+	// sync with itself.
 	bool beamRestoreNode(int idx) {
 		auto& bm = Beam::get();
 		if (idx < 0 || idx >= static_cast<int>(bm.nodes.size())) return false;
 
-		const int anc = bm.nodes[idx].rs.cp ? idx : bm.nodes[idx].cpAncestor;
-		if (anc < 0 || !bm.nodes[anc].rs.cp) return false;
+		const int anc = bm.nodes[static_cast<size_t>(idx)].rsIndex >= 0
+		                ? idx : bm.nodes[static_cast<size_t>(idx)].cpAncestor;
+		if (anc < 0 || bm.nodes[static_cast<size_t>(anc)].rsIndex < 0) return false;
 
-		beamRestoreCheckpointOnly(bm.nodes[anc]);
+		beamRestoreCheckpointOnly(bm.nodes[static_cast<size_t>(anc)]);
 		if (anc == idx) return true;
 
 		// Replay the edge span from the ancestor to this node.
 		beamMacro(idx, bm.macroScratch);
-		const int from = bm.nodes[anc].step;
-		const int to   = bm.nodes[idx].step;
+		const int from = bm.nodes[static_cast<size_t>(anc)].step;
+		const int to   = bm.nodes[static_cast<size_t>(idx)].step;
 		for (int t = from; t < to; t++) {
 			const bool pressed = static_cast<size_t>(t) < bm.macroScratch.size() &&
 			                     bm.macroScratch[static_cast<size_t>(t)] != 0;
@@ -4125,6 +4252,423 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (m_player1 && m_player1->m_isDead) return false;
 		}
 		return true;
+	}
+
+	// --- beam: node construction -------------------------------------------
+
+	int beamNewNode(int parent, int step, bool hold) {
+		auto& bm = Beam::get();
+		BeamNode n;
+		n.parent = parent;
+		n.step   = step;
+		n.hold   = hold;
+		if (parent >= 0) {
+			auto const& pn = bm.nodes[static_cast<size_t>(parent)];
+			n.cpAncestor   = pn.rsIndex >= 0 ? parent : pn.cpAncestor;
+			n.stepsSinceCp = pn.stepsSinceCp + (step - pn.step);
+		}
+		bm.nodes.push_back(n);
+		return static_cast<int>(bm.nodes.size()) - 1;
+	}
+
+	// Give node `idx` its own checkpoint at the CURRENT game state, which the
+	// caller must already have stepped to.
+	void beamCapture(int idx) {
+		auto& bm = Beam::get();
+		{
+			auto& n = bm.nodes[static_cast<size_t>(idx)];
+			if (n.rsIndex >= 0) return;
+			n.rsIndex = beamRsAlloc();
+		}
+		const int slot = bm.nodes[static_cast<size_t>(idx)].rsIndex;
+		captureRestoreState(bm.rsPool[static_cast<size_t>(slot)]);
+		if (!bm.rsPool[static_cast<size_t>(slot)].cp) {
+			beamRsRelease(slot);
+			bm.nodes[static_cast<size_t>(idx)].rsIndex = -1;
+			return;
+		}
+		bm.nodes[static_cast<size_t>(idx)].cpAncestor   = idx;
+		bm.nodes[static_cast<size_t>(idx)].stepsSinceCp = 0;
+		bm.cpNodes.push_back(idx);
+	}
+
+	// Diversity bucket for the CURRENT state: game mode plus a band of height.
+	//
+	// Mode and altitude are what actually distinguish two routes through the
+	// same stretch of level - a decoy corridor and the real one sit at different
+	// heights, which is exactly the distinction progress percent throws away.
+	uint32_t beamBucket() {
+		auto* p = m_player1;
+		if (!p) return 0;
+		const int size = std::max(1, g_config.beamYBucketSize);
+		const int band = static_cast<int>(std::floor(p->getPositionY() / size));
+		const uint32_t m = static_cast<uint32_t>(classifyMode(p));
+		return (m << 24) ^ (static_cast<uint32_t>(band) & 0x00FFFFFFu);
+	}
+
+	// --- beam: expansion ----------------------------------------------------
+
+	// Has this edge reached the next decision point?
+	//
+	// Deliberately identical to the DFS's branching policy, including both
+	// interval constants. Changing branch granularity at the same time as the
+	// search algorithm would make any result unattributable.
+	bool beamEdgeDone(int steps, bool& prevGround) {
+		auto* p = m_player1;
+		if (!p) return true;
+		if (classifyMode(p) != ModeClass::Ground)
+			return steps >= g_config.airBranchInterval;
+
+		const bool onGround = p->m_isOnGround;
+		const bool onRing   = p->m_touchingRings && p->m_touchingRings->count() > 0;
+		const bool landed   = onGround && !prevGround;
+		prevGround = onGround;
+		return landed || onRing || steps >= g_config.groundBranchInterval;
+	}
+
+	// Expand one frontier node into its two children.
+	//
+	// TWO restores, one per child: after stepping the first child we are at the
+	// child's state, not the parent's, and there is no way back except another
+	// restore. This is the beam's dominant cost and the reason beamWidth lives
+	// in the tens - see the arithmetic on Config::beamWidth.
+	void beamExpandNode(int idx) {
+		auto& bm = Beam::get();
+		auto* pl = PlayLayer::get();
+		if (!pl) return;
+
+		for (int a = 0; a < 2; a++) {
+			if (!beamRestoreNode(idx)) { bm.restoreFails++; return; }
+			const bool hold = (a != 0);
+
+			int  steps = 0;
+			bool dead  = false;
+			bool prevGround = m_player1 && m_player1->m_isOnGround;
+
+			while (true) {
+				applyInput(hold);
+				GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+				steps++;
+				bm.steps++;
+				if (!m_player1) return;
+				if (m_player1->m_isDead) { dead = true; break; }
+				if (ProbeState::get().finished) break;
+				if (beamEdgeDone(steps, prevGround)) break;
+				if (steps >= g_config.maxSegmentSteps) break;
+			}
+
+			if (dead) { bm.deaths++; continue; }
+
+			const int childStep = bm.nodes[static_cast<size_t>(idx)].step + steps;
+
+			if (ProbeState::get().finished) {
+				beamSolved(beamNewNode(idx, childStep, hold));
+				return;
+			}
+
+			// Dedup. A state already expanded has a future already searched, so
+			// a second copy of it can only cost time. This is where the beam
+			// beats the DFS on cube sections, where many input sequences land on
+			// the same grounded state; in air it fires rarely, because the state
+			// is continuous.
+			const uint64_t key = solverStateKey();
+			if (!bm.visited.insert(key).second) { bm.dedupHits++; continue; }
+
+			const int ci = beamNewNode(idx, childStep, hold);
+			bm.nodes[static_cast<size_t>(ci)].key    = key;
+			bm.nodes[static_cast<size_t>(ci)].pct    = pl->getCurrentPercent();
+			bm.nodes[static_cast<size_t>(ci)].bucket = beamBucket();
+
+			// Checkpoint once replaying to this node would cost more than
+			// restoring it directly.
+			if (bm.nodes[static_cast<size_t>(ci)].stepsSinceCp >= bm.cpInterval)
+				beamCapture(ci);
+
+			const float cpct = bm.nodes[static_cast<size_t>(ci)].pct;
+			if (cpct > bm.bestPct) { bm.bestPct = cpct; bm.bestNode = ci; }
+			bm.next.push_back(ci);
+		}
+		bm.expansions++;
+	}
+
+	// --- beam: selection ----------------------------------------------------
+
+	// Keep K nodes spread across (mode, height) buckets rather than the K
+	// furthest along.
+	//
+	// Ranking by progress is what traps the DFS on a fake corridor: the decoy
+	// scores higher for a while, so every slot goes to it and the real route is
+	// gone before it ever pays off. Round-robin across buckets means a corridor
+	// that is currently behind still keeps a seat, because it is competing only
+	// against others at its own height in its own mode.
+	void beamSelectDiverse(size_t K) {
+		auto& bm = Beam::get();
+		// Runs once per beam level, not per step, so a map here costs nothing
+		// that matters.
+		std::unordered_map<uint32_t, std::vector<int>> buckets;
+		for (int i : bm.next) buckets[bm.nodes[static_cast<size_t>(i)].bucket].push_back(i);
+		for (auto& kv : buckets)
+			std::sort(kv.second.begin(), kv.second.end(), [&](int x, int y) {
+				return bm.nodes[static_cast<size_t>(x)].pct > bm.nodes[static_cast<size_t>(y)].pct;
+			});
+
+		auto& keep = bm.keepScratch;
+		keep.clear();
+		keep.reserve(K);
+		for (size_t pass = 0; keep.size() < K; pass++) {
+			bool took = false;
+			for (auto& kv : buckets) {
+				if (pass >= kv.second.size()) continue;
+				keep.push_back(kv.second[pass]);
+				took = true;
+				if (keep.size() >= K) break;
+			}
+			if (!took) break; // every bucket exhausted
+		}
+		bm.next.swap(keep);
+	}
+
+	void beamSelect() {
+		auto& bm = Beam::get();
+		const size_t K = static_cast<size_t>(std::max(1, g_config.beamWidth));
+
+		if (bm.next.size() > K) {
+			bm.dropped += bm.next.size() - K;
+			if (g_config.beamRankByScore) {
+				std::partial_sort(bm.next.begin(), bm.next.begin() + K, bm.next.end(),
+					[&](int x, int y) {
+						return bm.nodes[static_cast<size_t>(x)].pct >
+						       bm.nodes[static_cast<size_t>(y)].pct;
+					});
+				bm.next.resize(K);
+			} else {
+				beamSelectDiverse(K);
+			}
+		}
+
+		bm.frontier.swap(bm.next);
+		bm.next.clear();
+		beamReclaim();
+		bm.depth++;
+	}
+
+	// Release every checkpoint no live node still depends on.
+	//
+	// This is what decouples width from memory. Each node's cpAncestor is within
+	// cpInterval steps by construction, so nothing further back than the current
+	// frontier's own ancestors can ever be reached again - but with no sweep
+	// those checkpoints are held until the search ends, which at width 500 is
+	// ~900 MB of state nothing can ever use.
+	//
+	// Recomputed from the frontier each level rather than reference-counted: a
+	// wrong refcount here frees a checkpoint a live node still needs, and that
+	// failure is silent and arbitrarily delayed.
+	void beamReclaim() {
+		auto& bm = Beam::get();
+		if (bm.cpNodes.empty()) return;
+
+		bm.neededScratch.clear();
+		for (int i : bm.frontier) {
+			auto const& n = bm.nodes[static_cast<size_t>(i)];
+			bm.neededScratch.insert(n.rsIndex >= 0 ? i : n.cpAncestor);
+		}
+
+		size_t w = 0;
+		for (size_t r = 0; r < bm.cpNodes.size(); r++) {
+			const int ni = bm.cpNodes[r];
+			if (bm.neededScratch.count(ni)) { bm.cpNodes[w++] = ni; continue; }
+			beamRsRelease(bm.nodes[static_cast<size_t>(ni)].rsIndex);
+			bm.nodes[static_cast<size_t>(ni)].rsIndex = -1;
+		}
+		bm.cpNodes.resize(w);
+	}
+
+	// --- beam: driver -------------------------------------------------------
+
+	void beamReport(bool force) {
+		auto& bm = Beam::get();
+		const uint64_t now = probe::nowTicks();
+		if (!force && probe::ticksToMicros(now - bm.lastReport) < 2'000'000.0) return;
+		bm.lastReport = now;
+
+		const double secs = probe::ticksToMicros(now - bm.startTicks) / 1e6;
+		const size_t mem  = processMemoryBytes();
+		const double memMB = (mem > bm.memAtStart ? mem - bm.memAtStart : 0) / (1024.0 * 1024.0);
+
+		// Memory is reported as a live delta rather than estimated from a
+		// per-checkpoint constant: that constant measured 22.0 KB on one level
+		// and 33.7 KB on another (Probe 5), so an estimate would be wrong by
+		// half on any level we have not separately probed.
+		log::info("Beam: best {:.2f}%  depth {}  frontier {}  nodes {}  cps {}  "
+		          "deaths {}  dedup {}  dropped {}  steps {}  restores {}  "
+		          "(+{:.0f} MB, {:.0f} steps/s, {:.0f} restores/s)",
+		          bm.bestPct, bm.depth, bm.frontier.size(), bm.nodes.size(),
+		          bm.cpNodes.size(), bm.deaths, bm.dedupHits, bm.dropped,
+		          bm.steps, bm.restoreCount, memMB,
+		          secs > 0 ? bm.steps / secs : 0.0,
+		          secs > 0 ? bm.restoreCount / secs : 0.0);
+	}
+
+	// Write the best path so far, so a stall can be watched with F9 instead of
+	// inferred from counters. Staged through the Solver's buffers because the
+	// macro writers and the verifier already read from there.
+	void beamStageBest() {
+		auto& bm = Beam::get();
+		if (bm.bestNode < 0) return;
+		beamMacro(bm.bestNode, bm.macroScratch);
+		Solver::get().bestMacro = bm.macroScratch;
+		solverWriteBestMacro();
+	}
+
+	void beamStop(const char* why) {
+		auto& bm = Beam::get();
+		beamReport(true);
+		log::info("Beam: {} - best {:.2f}% at depth {}", why, bm.bestPct, bm.depth);
+		beamStageBest();
+		bm.clear();
+		ProbeState::get().mode = Mode::Idle;
+	}
+
+	void beamSolved(int idx) {
+		auto& bm = Beam::get();
+		beamMacro(idx, bm.macroScratch);
+
+		beamReport(true);
+		log::info("================ BEAM SOLVED ================");
+		log::info("  {} steps, depth {}, {} nodes, {} deaths, {} deduped, {} restores",
+		          bm.macroScratch.size(), bm.depth, bm.nodes.size(), bm.deaths,
+		          bm.dedupHits, bm.restoreCount);
+
+		Solver::get().macro = bm.macroScratch;
+		solverWriteMacro("solution.txt");
+
+		// best.txt too. Leaving it stale meant F9 replayed the DFS's last macro
+		// and reported a clean PASS for a path the beam never produced.
+		Solver::get().bestMacro = bm.macroScratch;
+		solverWriteBestMacro();
+
+		// The beam does not record a step-by-step trace of the winning path the
+		// way the DFS does, so F4 can still PASS or FAIL the macro but cannot
+		// name the step where a clean replay departs from it. Said here rather
+		// than left for someone to discover from an empty diff file.
+		auto& ps = ProbeState::get();
+		ps.solvePathTrace.clear();
+		ps.solveDecisionSteps.clear();
+		log::info("  No path trace: F4 will verify this macro but cannot report a "
+		          "divergence step for it.");
+		log::info("  Verify by replaying from frame 0 - a solution found via "
+		          "savestates only counts if it reproduces in a clean run.");
+		log::info("=============================================");
+
+		bm.clear();
+		ps.mode = Mode::Idle;
+	}
+
+	// Measure what a restore and a step actually cost on THIS level, then set
+	// the checkpoint interval to the break-even point between them.
+	//
+	// Probe 5 measured 1.06 ms per restore on Stereo Madness and 40.9 ms on an
+	// object-heavy level - a 40x spread. At 1.06 ms it is cheaper to checkpoint
+	// almost every node; at 40.9 ms one restore is worth ~195 replayed steps.
+	// No single constant serves both, so it is measured rather than guessed.
+	void beamCalibrate(int root) {
+		auto& bm = Beam::get();
+
+		constexpr int kRestoreSamples = 8;
+		constexpr int kStepSamples    = 64;
+
+		uint64_t t0 = probe::nowTicks();
+		for (int i = 0; i < kRestoreSamples; i++)
+			beamRestoreCheckpointOnly(bm.nodes[static_cast<size_t>(root)]);
+		bm.restoreUs = probe::ticksToMicros(probe::nowTicks() - t0) / kRestoreSamples;
+
+		t0 = probe::nowTicks();
+		for (int i = 0; i < kStepSamples; i++) {
+			applyInput(false);
+			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+			if (m_player1 && m_player1->m_isDead) break;
+		}
+		bm.stepUs = probe::ticksToMicros(probe::nowTicks() - t0) / kStepSamples;
+
+		// Leave the player exactly at the root, whatever the sampling did to it.
+		beamRestoreCheckpointOnly(bm.nodes[static_cast<size_t>(root)]);
+
+		if (g_config.beamCheckpointIntervalSteps > 0) {
+			bm.cpInterval = g_config.beamCheckpointIntervalSteps;
+		} else if (bm.stepUs > 0.0) {
+			const int d = static_cast<int>(bm.restoreUs / bm.stepUs);
+			bm.cpInterval = std::max(4, std::min(2000, d));
+		}
+
+		// The projection is what decides whether this run is worth waiting for,
+		// so it is printed BEFORE the search rather than inferred from
+		// throughput an hour in.
+		const double levels = 5000.0; // ~20k steps at a 4-step branch interval
+		const double hours  = 2.0 * g_config.beamWidth * levels * bm.restoreUs / 3.6e9;
+		log::info("Beam: restore {:.2f} ms, step {:.3f} ms -> checkpoint every {} steps ({}).",
+		          bm.restoreUs / 1000.0, bm.stepUs / 1000.0, bm.cpInterval,
+		          g_config.beamCheckpointIntervalSteps > 0 ? "pinned by config"
+		                                                   : "break-even, measured");
+		log::info("Beam: width {}, selection {}. At this restore cost a full 20k-step "
+		          "level projects to ~{:.1f} h of restores alone.",
+		          g_config.beamWidth,
+		          g_config.beamRankByScore ? "SCORE-RANKED (baseline)"
+		                                   : "diverse (mode, y-band)",
+		          hours);
+		if (bm.restoreUs > 10000.0)
+			log::warn("Beam: restores cost >10 ms on this level. Probe 5 calls that "
+			          "'architecture rethink' territory - this run will be "
+			          "restore-bound, so read the projection above before waiting on it.");
+	}
+
+	bool beamInit() {
+		auto& bm = Beam::get();
+		auto* pl = PlayLayer::get();
+		if (!pl || !m_player1) return false;
+
+		const int root = beamNewNode(-1, 0, false);
+		beamCapture(root);
+		if (bm.nodes[static_cast<size_t>(root)].rsIndex < 0) {
+			log::error("Beam: could not checkpoint the level start - nothing to search from.");
+			beamStop("failed to start");
+			return false;
+		}
+		bm.nodes[static_cast<size_t>(root)].pct    = pl->getCurrentPercent();
+		bm.nodes[static_cast<size_t>(root)].bucket = beamBucket();
+		bm.visited.insert(solverStateKey());
+		bm.frontier.assign(1, root);
+		bm.expandIdx  = 0;
+		bm.memAtStart = processMemoryBytes();
+
+		beamCalibrate(root);
+		bm.phase = Beam::Phase::Expand;
+		return true;
+	}
+
+	// One unit of beam work: expand a single frontier node, or - when the
+	// frontier is exhausted - choose the next one. Node-at-a-time so the caller
+	// can stop on its frame budget without leaving the search mid-node.
+	bool beamStep() {
+		auto& bm = Beam::get();
+		if (!PlayLayer::get() || !m_player1) return false;
+
+		if (bm.phase == Beam::Phase::Init) return beamInit();
+
+		if (bm.expandIdx >= static_cast<int>(bm.frontier.size())) {
+			beamSelect();
+			bm.expandIdx = 0;
+			if (bm.frontier.empty()) {
+				log::error("Beam: frontier empty at depth {} - every branch died or "
+				           "deduplicated. The search cannot continue from here.", bm.depth);
+				beamStop("exhausted");
+				return false;
+			}
+			beamReport(false);
+			return bm.running;
+		}
+
+		beamExpandNode(bm.frontier[static_cast<size_t>(bm.expandIdx++)]);
+		return bm.running;
 	}
 
 	// Put the player back at decision `d`, whatever that takes.
@@ -4769,7 +5313,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// exactly when it needs to backtrack and respawn. Gating it behind
 		// !m_isDead froze the search on the first death.
 		const bool solving = st.mode == Mode::Solve && Solver::get().running;
-		const bool active  = pl && m_player1 && (solving || (!m_player1->m_isDead && !st.finished));
+		// Same reasoning as the DFS: the beam spends most of its time with a
+		// dead player, because a branch that dies is the normal outcome and the
+		// next restore is what revives it.
+		const bool beaming = st.mode == Mode::Beam && Beam::get().running;
+		const bool active  = pl && m_player1 &&
+		                     (solving || beaming || (!m_player1->m_isDead && !st.finished));
 
 		if (st.mode == Mode::Idle || !active) {
 			GJBaseGameLayer::update(dt);
@@ -4849,6 +5398,19 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			const uint64_t frameStart = probe::nowTicks();
 			while (sv.running) {
 				if (!solverStep()) break;
+				if (probe::ticksToMicros(probe::nowTicks() - frameStart) > kSolverFrameBudgetUs) break;
+			}
+			return;
+		}
+
+		// Same shape as the solver's loop: as much work per rendered frame as the
+		// budget allows. One beamStep is one node expansion (two restores) or one
+		// frontier selection, so the budget can never cut a node in half.
+		if (st.mode == Mode::Beam) {
+			auto& bm = Beam::get();
+			const uint64_t frameStart = probe::nowTicks();
+			while (bm.running) {
+				if (!beamStep()) break;
 				if (probe::ticksToMicros(probe::nowTicks() - frameStart) > kSolverFrameBudgetUs) break;
 			}
 			return;
@@ -4964,7 +5526,7 @@ class $modify(SolverPlayLayer, PlayLayer) {
 		}
 		log::info("gd-solver: level '{}' loaded - output files are namespaced as {}_*",
 		          ProbeState::get().levelKey, ProbeState::get().levelKey);
-		log::info("  F2 = solve/stop, F4 = verify, F5 = record input, F6 = load input, "
+		log::info("  F2 = solve/stop, B = beam, F4 = verify, F5 = record input, F6 = load input, "
 		          "F7 = dump trace, F8 = toggle resync, F11 = savestate cost, "
 		          "F12 = restore fidelity");
 		return true;
