@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <vector>
 #include <cstring>
+#include <unordered_set>
 #include <cctype>
 #include <memory>
 
@@ -248,6 +249,24 @@ struct Config {
 	// replay is the only exact option.
 	bool noSavestates = false;
 
+	// --- beam search -------------------------------------------------------
+	// Frontier width. Bounds NUMBER of nodes; sparse checkpointing separately
+	// bounds bytes per node, and neither substitutes for the other.
+	int  beamWidth = 2000;
+
+	// A node gets its own checkpoint once it is this far, in steps, from its
+	// nearest checkpointed ancestor. Directly bounds replay cost per restore:
+	// higher means less memory and slower restores.
+	int  beamCheckpointIntervalSteps = 240;
+
+	// Selection rule. Score-ranking is the naive baseline and is EXPECTED to
+	// fail on fake-corridor levels: the decoy scores higher early, so ranking by
+	// progress drops the correct branch first - which is precisely the greedy
+	// commitment that traps the DFS. Bucketed selection keeps a quota per
+	// (mode, y band) so both corridors survive. Kept switchable so the
+	// prediction can be tested rather than assumed.
+	bool beamRankByScore = false;
+	int  beamYBucketSize = 30;   // world units per diversity bucket
 };
 
 Config g_config;
@@ -1393,45 +1412,17 @@ ModeClass classifyMode(PlayerObject* p) {
 //   Hold : a toggle (changing the hold state) costs 1; continuing is free.
 //   Tap  : a tap costs 1; not tapping is free. Crucially a tap is ONE unit, not
 //          the two it cost when taps were expressed as toggle-on plus toggle-off.
-struct Decision;
-int decisionCost(Decision const& d, bool choice);
-
-// Release a checkpoint, first detaching it from anything GD still points at.
+// Everything a restore must put back, in one place.
 //
-// The old restore put our checkpoint INTO m_checkpointArray and let the practice
-// respawn consume it, so clearing the array was enough. The direct load takes
-// the object straight and may leave PlayLayer::m_currentCheckpoint pointing at
-// it, so releasing without clearing that leaves a dangling pointer for the next
-// reset or level exit to walk into. Checkpoint lifetime has already caused three
-// separate crashes here, and every air decision now holds one.
-inline void releaseCheckpoint(CheckpointObject*& cp) {
-	if (!cp) return;
-	if (auto* pl = PlayLayer::get()) {
-		if (pl->m_currentCheckpoint == cp) pl->m_currentCheckpoint = nullptr;
-	}
-	cp->release();
-	cp = nullptr;
-}
-
-struct Decision {
-	CheckpointObject* cp        = nullptr; // state entering this decision
-	int               step      = 0;       // solver step index at capture
-	uint8_t           tried     = 0;       // bit0 = tried release, bit1 = tried hold
-	bool              choice    = false;   // action currently being explored
-	bool              airPolicy = false;   // Hold or Tap (i.e. not Ground)
-	ModeClass         modeClass = ModeClass::Ground;
-
-	// Iterative deepening on toggle count, for air sections.
-	//
-	// Good ship paths have FEW input changes: "hold from ship entry" is one
-	// toggle, "hold then release to level off" is two. DFS on raw hold/release
-	// reaches those last, having exhausted astronomically many high-toggle
-	// sequences first. Bounding the toggle count and raising the bound on
-	// exhaustion searches simple paths before complicated ones, and stays
-	// complete as the bound grows.
-	bool enteringHold  = false; // hold state on arrival, so a toggle is well-defined
-	int  togglesBefore = 0;     // air toggles used on the path up to this decision
-	bool modeTransition = false; // pushed because the game mode changed here
+// This lives apart from Decision because the DFS and the beam both restore, and
+// two copies of a restore path is how this file kept acquiring bugs that were
+// fixed in one caller and not the other (see solverRepositionTo's history). One
+// struct, one capture function, one apply function.
+//
+// Every field here was added because a measurement proved it was missing, never
+// because it looked relevant. See 13.11.
+struct RestoreState {
+	CheckpointObject* cp = nullptr;
 
 	// State the vanilla checkpoint does NOT restore, found by byte-diffing
 	// PlayerObject across a restore (Probe 4a). Everything else that differed
@@ -1510,6 +1501,86 @@ struct Decision {
 	// Stored whole rather than packed to the 196 spans so the solver reproduces
 	// the validated probe path byte for byte. ~2 KB against a 22 KB checkpoint.
 	std::vector<uint8_t> playerBytes;
+};
+
+// ---------------------------------------------------------------------------
+// Deduplicated beam search: node store and sparse checkpointing
+// ---------------------------------------------------------------------------
+//
+// WHY NOT PLAIN BFS. Branching every few steps across a ~6000-step section is
+// on the order of 1500 binary decisions, i.e. 2^1500 states. Deduplication does
+// not rescue that: it collapses cube sections well, where many input sequences
+// converge on the same grounded state, but air trajectories almost never
+// coincide bit for bit, and the sections that block us are air. A bounded
+// frontier is the only thing that fits.
+//
+// The bound costs completeness, which is acceptable here for the same reason
+// the escape heuristic was: a found macro must still replay from frame 0 to
+// count, so an incomplete search can MISS a solution but can never manufacture
+// a false one.
+//
+// TWO SEPARATE BUDGETS, easily confused:
+//   * sparse checkpointing bounds BYTES PER NODE
+//   * frontier selection bounds NUMBER OF NODES
+// Neither substitutes for the other. A cheap node still costs a slot.
+struct BeamNode {
+	int      parent   = -1;   // index into Beam::nodes, -1 at the root
+	int      step     = 0;    // solver step this node sits at
+	uint64_t key      = 0;    // solverStateKey() at this node
+	float    pct      = 0.f;  // progress, for reporting and optional ranking
+	bool     hold     = false;// input applied on the edge from parent to here
+	bool     alive    = true;
+
+	// Sparse checkpointing. Most nodes carry no checkpoint and are reached by
+	// restoring the nearest ancestor that does, then replaying forward. That
+	// replay is exact in EVERY mode now, which is what makes this sound - the
+	// superficially similar hybrid deleted in 13.11 existed to dodge broken air
+	// restores, whereas this exists purely to bound memory.
+	RestoreState rs;           // cp is usually null; see cpAncestor
+	int      cpAncestor  = -1; // nearest ancestor (or self) holding a checkpoint
+	int      stepsSinceCp = 0; // replay distance from that ancestor
+};
+
+struct Decision;
+int decisionCost(Decision const& d, bool choice);
+
+// Release a checkpoint, first detaching it from anything GD still points at.
+//
+// The old restore put our checkpoint INTO m_checkpointArray and let the practice
+// respawn consume it, so clearing the array was enough. The direct load takes
+// the object straight and may leave PlayLayer::m_currentCheckpoint pointing at
+// it, so releasing without clearing that leaves a dangling pointer for the next
+// reset or level exit to walk into. Checkpoint lifetime has already caused three
+// separate crashes here, and every air decision now holds one.
+inline void releaseCheckpoint(CheckpointObject*& cp) {
+	if (!cp) return;
+	if (auto* pl = PlayLayer::get()) {
+		if (pl->m_currentCheckpoint == cp) pl->m_currentCheckpoint = nullptr;
+	}
+	cp->release();
+	cp = nullptr;
+}
+
+struct Decision {
+	int               step      = 0;       // solver step index at capture
+	uint8_t           tried     = 0;       // bit0 = tried release, bit1 = tried hold
+	bool              choice    = false;   // action currently being explored
+	bool              airPolicy = false;   // Hold or Tap (i.e. not Ground)
+	ModeClass         modeClass = ModeClass::Ground;
+
+	// Iterative deepening on toggle count, for air sections.
+	//
+	// Good ship paths have FEW input changes: "hold from ship entry" is one
+	// toggle, "hold then release to level off" is two. DFS on raw hold/release
+	// reaches those last, having exhausted astronomically many high-toggle
+	// sequences first. Bounding the toggle count and raising the bound on
+	// exhaustion searches simple paths before complicated ones, and stays
+	// complete as the bound grows.
+	bool enteringHold  = false; // hold state on arrival, so a toggle is well-defined
+	int  togglesBefore = 0;     // air toggles used on the path up to this decision
+	bool modeTransition = false; // pushed because the game mode changed here
+
+	RestoreState rs;            // the state entering this decision
 };
 
 int decisionCost(Decision const& d, bool choice) {
@@ -1627,7 +1698,7 @@ struct Solver {
 		if (auto* pl = PlayLayer::get()) {
 			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
 		}
-		for (auto& d : stack) releaseCheckpoint(d.cp);
+		for (auto& d : stack) releaseCheckpoint(d.rs.cp);
 		stack.clear();
 		macro.clear();
 		running = false;
@@ -1665,6 +1736,61 @@ struct Solver {
 	}
 
 	static Solver& get() { static Solver s; return s; }
+};
+
+// ---------------------------------------------------------------------------
+// The beam
+// ---------------------------------------------------------------------------
+struct Beam {
+	bool running = false;
+
+	// Arena. Nodes are never erased while the search runs - a node may be the
+	// checkpoint ancestor of a live descendant long after it leaves the frontier
+	// - so `alive` marks frontier membership and the arena is freed at the end.
+	std::vector<BeamNode> nodes;
+
+	// Current depth's frontier and the next one being built, as node indices.
+	std::vector<int> frontier;
+	std::vector<int> next;
+
+	// Every state key ever expanded. A key that reappears is a state we have
+	// already explored the future of, so the duplicate is dropped.
+	std::unordered_set<uint64_t> visited;
+
+	// Scratch for macro reconstruction, reused so expansion allocates nothing.
+	std::vector<uint8_t> macroScratch;
+	std::vector<int>     pathScratch;
+
+	uint64_t expansions   = 0;
+	uint64_t dedupHits    = 0;
+	uint64_t deaths       = 0;
+	uint64_t replaySteps  = 0;  // steps spent replaying forward from an ancestor
+	uint64_t checkpoints  = 0;  // checkpoints currently held
+	float    bestPct      = 0.f;
+	int      bestNode     = -1;
+	int      depth        = 0;
+	uint64_t startTicks   = 0;
+	uint64_t lastReport   = 0;
+
+	void clear() {
+		if (auto* pl = PlayLayer::get()) {
+			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+		}
+		for (auto& n : nodes) releaseCheckpoint(n.rs.cp);
+		nodes.clear();
+		frontier.clear();
+		next.clear();
+		visited.clear();
+		macroScratch.clear();
+		pathScratch.clear();
+		expansions = dedupHits = deaths = replaySteps = checkpoints = 0;
+		bestPct = 0.f;
+		bestNode = -1;
+		depth = 0;
+		running = false;
+	}
+
+	static Beam& get() { static Beam b; return b; }
 };
 
 // Write the furthest-reaching path, so a stall can be replayed and watched at
@@ -2322,6 +2448,90 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	void recordStep(bool pressed, int relStep) {
 		if (!m_player1) return;
 		ProbeState::get().trace.push(makeTraceRow(pressed, relStep));
+	}
+
+	// A hash of everything that determines the FUTURE of a run, for dedup.
+	//
+	// The rule is asymmetric, so err toward including state: hashing too much
+	// causes UNDER-merging, which costs only efficiency, while hashing too
+	// little causes OVER-merging, which silently prunes reachable branches and
+	// loses completeness. Two states that hash equal are treated as the same
+	// state forever after, so anything left out is a correctness bug, not a
+	// tuning issue.
+	//
+	// What goes in is exactly what a day of restore debugging proved a player
+	// consists of: the physics scalars, plus the input state that lives in three
+	// other places (m_holdingButtons in a gd::map, m_queuedButtons on the LAYER,
+	// the cocos node transform), plus m_cameraFlip, because a mirror transition
+	// in flight changes what happens next.
+	//
+	// What stays OUT is anything time-like. A monotonically increasing value -
+	// a step index, an absolute timestamp - makes every state unique and turns
+	// the visited set into dead weight that never fires once. That is why the
+	// queued buttons contribute only their SEMANTIC content and never their
+	// m_timestamp or m_step, and why `percent` is skipped as a pure function of
+	// x rather than independent state.
+	uint64_t solverStateKey() {
+		auto* p = m_player1;
+		if (!p) return 0;
+
+		// Physics scalars, as raw bits: a decimal rendering can compare equal
+		// while the underlying doubles differ in the low bits.
+		struct Core {
+			uint32_t x, y, rotation, playerSpeed;
+			uint64_t yVelocity, gravity;
+			uint32_t flags;
+			uint32_t cameraFlip;
+			uint32_t nodeX, nodeY;
+			uint8_t  holdingJump;
+			uint8_t  pad[3];
+		} c{};
+		c.x           = probe::bits(p->getPositionX());
+		c.y           = probe::bits(p->getPositionY());
+		c.rotation    = probe::bits(p->getRotation());
+		c.playerSpeed = probe::bits(p->m_playerSpeed);
+		c.yVelocity   = probe::bits(p->m_yVelocity);
+		c.gravity     = probe::bits(p->m_gravity);
+		c.cameraFlip  = probe::bits(m_cameraFlip);
+		c.nodeX       = probe::bits(p->getPosition().x);
+		c.nodeY       = probe::bits(p->getPosition().y);
+
+		uint32_t f = 0;
+		if (p->m_isDead)       f |= 1u << 0;
+		if (p->m_isOnGround)   f |= 1u << 1;
+		if (p->m_isOnGround2)  f |= 1u << 2;
+		if (p->m_isOnGround3)  f |= 1u << 3;
+		if (p->m_isOnGround4)  f |= 1u << 4;
+		if (p->m_jumpBuffered) f |= 1u << 5;
+		if (p->m_isUpsideDown) f |= 1u << 6;
+		if (p->m_isShip)       f |= 1u << 7;
+		if (p->m_isBird)       f |= 1u << 8;
+		if (p->m_isBall)       f |= 1u << 9;
+		if (p->m_isDart)       f |= 1u << 10;
+		if (p->m_isRobot)      f |= 1u << 11;
+		if (p->m_isSpider)     f |= 1u << 12;
+		if (p->m_isSwing)      f |= 1u << 13;
+		if (p->m_isSideways)   f |= 1u << 14;
+		c.flags = f;
+
+		{
+			auto it = p->m_holdingButtons.find(kJumpButton);
+			c.holdingJump = (it != p->m_holdingButtons.end() && it->second) ? 1 : 0;
+		}
+
+		uint64_t h = probe::fnv1a(&c, sizeof(c));
+
+		// Pending input, by meaning only. Order matters (the queue is drained in
+		// order) but timestamps must not.
+		for (auto const& cmd : m_queuedButtons) {
+			const uint8_t sem[3] = {
+				static_cast<uint8_t>(cmd.m_button),
+				static_cast<uint8_t>(cmd.m_isPush ? 1 : 0),
+				static_cast<uint8_t>(cmd.m_isPlayer2 ? 1 : 0),
+			};
+			h = probe::fnv1a(sem, sizeof(sem), h);
+		}
+		return h;
 	}
 
 	// Compare the clean replay against the solver's own trajectory, one step at
@@ -3508,6 +3718,43 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		}
 	}
 
+	// Capture everything a restore needs. THE single capture path.
+	void captureRestoreState(RestoreState& r) {
+		auto* pl = PlayLayer::get();
+		if (CheckpointObject* cp = pl ? pl->createCheckpoint() : nullptr) {
+			cp->retain();
+			r.cp = cp;
+		}
+		if (auto* pp = m_player1) {
+			auto const* raw = reinterpret_cast<uint8_t const*>(pp);
+			r.playerBytes.assign(raw, raw + sizeof(PlayerObject));
+			auto it = pp->m_holdingButtons.find(kJumpButton);
+			r.holdingJump    = it != pp->m_holdingButtons.end() && it->second;
+			r.probeIsHolding = ProbeState::get().isHolding;
+			r.nodePos        = pp->getPosition();
+			r.gameModeChangedTime = pp->m_gameModeChangedTime;
+			r.unkA29              = pp->m_unkA29;
+		}
+		r.queuedButtons.assign(m_queuedButtons.begin(), m_queuedButtons.end());
+		r.layerExtraDelta  = m_extraDelta;
+		r.layerTimePlayed  = m_timePlayed;
+		r.layerTimestamp   = m_timestamp;
+		r.layerTickIndex   = m_tickIndex;
+		r.layerClickIndex  = m_clickIndex;
+		r.layerResumeTimer = m_resumeTimer;
+		r.layerJumping     = m_jumping;
+		r.layerCameraFlip      = m_cameraFlip;
+		r.layerCameraUnzoomedX = m_cameraUnzoomedX;
+		r.layerUnk322a         = m_unk322a;
+		r.layerUnk3251         = m_unk3251;
+		if (pl) {
+			r.layerAttemptTime     = pl->m_attemptTime;
+			r.layerBestAttemptTime = pl->m_bestAttemptTime;
+			r.layerCurrentTime     = pl->m_currentTime;
+			r.layerHasJumped       = pl->m_hasJumped;
+		}
+	}
+
 	// Push a decision at the current state and take the first branch.
 	void solverPushDecision() {
 		auto& sv = Solver::get();
@@ -3526,46 +3773,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// restore is exact in every mode (8/8), so that replay is pure cost:
 		// backtracking into a ship or UFO section is now O(1) instead of
 		// re-simulating the whole section. The price is ~22 KB per air decision.
-		if (!g_config.noSavestates) {
-			if (CheckpointObject* cp = pl->createCheckpoint()) {
-				cp->retain();
-				d.cp = cp;
-				if (auto* pp = m_player1) {
-					auto const* raw = reinterpret_cast<uint8_t const*>(pp);
-					d.playerBytes.assign(raw, raw + sizeof(PlayerObject));
-					auto it = pp->m_holdingButtons.find(kJumpButton);
-					d.holdingJump = it != pp->m_holdingButtons.end() && it->second;
-					d.probeIsHolding = ProbeState::get().isHolding;
-					d.queuedButtons.assign(m_queuedButtons.begin(), m_queuedButtons.end());
-					d.nodePos = pp->getPosition();
-				}
-			}
-		}
-
-		if (auto* pp = m_player1) {
-			d.gameModeChangedTime = pp->m_gameModeChangedTime;
-			d.unkA29              = pp->m_unkA29;
-		}
-		d.layerExtraDelta  = m_extraDelta;
-		d.layerTimePlayed  = m_timePlayed;
-		d.layerTimestamp   = m_timestamp;
-		d.layerTickIndex   = m_tickIndex;
-		d.layerClickIndex  = m_clickIndex;
-		d.layerResumeTimer = m_resumeTimer;
-		d.layerJumping     = m_jumping;
-		d.layerCameraFlip      = m_cameraFlip;
-		d.layerCameraUnzoomedX = m_cameraUnzoomedX;
-		d.layerUnk322a         = m_unk322a;
-		d.layerUnk3251         = m_unk3251;
-		// PlayLayer's own region, above sizeof(GJBaseGameLayer). The respawn path
-		// restored these as zeros because nothing ever captured them; the probe
-		// found they matter enough to be part of the validated restore.
-		if (pl) {
-			d.layerAttemptTime     = pl->m_attemptTime;
-			d.layerBestAttemptTime = pl->m_bestAttemptTime;
-			d.layerCurrentTime     = pl->m_currentTime;
-			d.layerHasJumped       = pl->m_hasJumped;
-		}
+		if (!g_config.noSavestates) captureRestoreState(d.rs);
 		d.enteringHold  = sv.hold;
 		d.togglesBefore = d.airPolicy ? sv.togglesUsed : 0;
 
@@ -3751,9 +3959,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		}
 	}
 
-	void solverRestoreState(Decision& d) {
+	void applyRestoreState(RestoreState const& r, bool enteringHold) {
 		auto* pl = PlayLayer::get();
-		if (!pl || !d.cp) return;
+		if (!pl || !r.cp) return;
 		auto& ps = ProbeState::get();
 
 		// Nothing may die during the restore: the reset and the load both move
@@ -3769,7 +3977,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		pl->resetLevel();
 		ps.solverRestoring = false;
 
-		pl->loadFromCheckpoint(d.cp);
+		pl->loadFromCheckpoint(r.cp);
 		ps.suppressDeath = false;
 
 		// The held-button state, which no checkpoint stores. The captured state
@@ -3791,60 +3999,132 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// the captured value.
 		if (auto* p = m_player1) {
 			ps.injecting = true;
-			if (d.enteringHold) p->pushButton(PlayerButton::Jump);
+			if (enteringHold) p->pushButton(PlayerButton::Jump);
 			else                p->releaseButton(PlayerButton::Jump);
 			ps.injecting = false;
-			ps.isHolding = d.enteringHold;
+			ps.isHolding = enteringHold;
 		}
 
 		// Everything the direct load leaves untouched. Authoritative: this is the
 		// last thing to write PlayerObject, so nothing above can corrupt it.
-		if (auto* p = m_player1; p && !d.playerBytes.empty()) {
+		if (auto* p = m_player1; p && !r.playerBytes.empty()) {
 			auto* dst = reinterpret_cast<uint8_t*>(p);
 			for (auto const& f : kPlayerFields)
-				std::memcpy(dst + f.off, d.playerBytes.data() + f.off, f.size);
+				std::memcpy(dst + f.off, r.playerBytes.data() + f.off, f.size);
 		}
 
 		// And the containers the field table cannot reach, written directly so no
 		// game logic gets a chance to re-derive them from the wrong phase.
-		if (auto* p = m_player1) p->m_holdingButtons[kJumpButton] = d.holdingJump;
-		ps.isHolding = d.probeIsHolding;
+		if (auto* p = m_player1) p->m_holdingButtons[kJumpButton] = r.holdingJump;
+		ps.isHolding = r.probeIsHolding;
 
 		// The layer's pending input queue. resetLevel cleared it and nothing else
 		// puts it back, so restore it to exactly what was in flight at capture.
 		m_queuedButtons.clear();
-		for (auto const& c : d.queuedButtons) m_queuedButtons.push_back(c);
+		for (auto const& c : r.queuedButtons) m_queuedButtons.push_back(c);
 
 		// The cocos node transform, which no field table can reach.
-		if (auto* p = m_player1) p->setPosition(d.nodePos);
+		if (auto* p = m_player1) p->setPosition(r.nodePos);
 
 		// Layer and PlayLayer state no checkpoint carries. Applied directly
 		// rather than deferred through pendingExtra: the respawn path had to
 		// wait for its realign step to finish, and there is no realign step now.
 		{
 			Solver::PendingExtra e;
-			e.gameModeChangedTime = d.gameModeChangedTime;
-			e.unkA29          = d.unkA29;
-			e.extraDelta      = d.layerExtraDelta;
-			e.timePlayed      = d.layerTimePlayed;
-			e.timestamp       = d.layerTimestamp;
-			e.tickIndex       = d.layerTickIndex;
-			e.clickIndex      = d.layerClickIndex;
-			e.resumeTimer     = d.layerResumeTimer;
-			e.jumping         = d.layerJumping;
-			e.attemptTime     = d.layerAttemptTime;
-			e.bestAttemptTime = d.layerBestAttemptTime;
-			e.currentTime     = d.layerCurrentTime;
-			e.hasJumped       = d.layerHasJumped;
-			e.cameraFlip      = d.layerCameraFlip;
-			e.cameraUnzoomedX = d.layerCameraUnzoomedX;
-			e.unk322a         = d.layerUnk322a;
-			e.unk3251         = d.layerUnk3251;
+			e.gameModeChangedTime = r.gameModeChangedTime;
+			e.unkA29          = r.unkA29;
+			e.extraDelta      = r.layerExtraDelta;
+			e.timePlayed      = r.layerTimePlayed;
+			e.timestamp       = r.layerTimestamp;
+			e.tickIndex       = r.layerTickIndex;
+			e.clickIndex      = r.layerClickIndex;
+			e.resumeTimer     = r.layerResumeTimer;
+			e.jumping         = r.layerJumping;
+			e.attemptTime     = r.layerAttemptTime;
+			e.bestAttemptTime = r.layerBestAttemptTime;
+			e.currentTime     = r.layerCurrentTime;
+			e.hasJumped       = r.layerHasJumped;
+			e.cameraFlip      = r.layerCameraFlip;
+			e.cameraUnzoomedX = r.layerCameraUnzoomedX;
+			e.unk322a         = r.layerUnk322a;
+			e.unk3251         = r.layerUnk3251;
 			applyExtraState(e);
 		}
 
+	}
+
+	// Restore to a decision. Thin wrapper over the shared primitive so the DFS
+	// and the beam cannot drift apart the way two hand-written copies did.
+	void solverRestoreState(Decision& d) {
+		if (!d.rs.cp) return;
+		applyRestoreState(d.rs, d.enteringHold);
 		Solver::get().restores++;
 		Solver::get().pendingPostRestore = true;
+	}
+
+	// Restore a beam node's own captured state, with no forward replay.
+	void beamRestoreCheckpointOnly(BeamNode const& n) {
+		applyRestoreState(n.rs, n.hold);
+	}
+
+	// Reconstruct the input sequence from the root to `idx` into `out`.
+	//
+	// Nodes store only (parent, step, hold), so a macro costs O(depth) to
+	// rebuild but O(1) to store. With a frontier in the thousands, storing a
+	// full macro per node instead would dominate memory.
+	void beamMacro(int idx, std::vector<uint8_t>& out) {
+		auto& bm = Beam::get();
+		auto& path = bm.pathScratch;
+		path.clear();
+		for (int i = idx; i >= 0; i = bm.nodes[i].parent) path.push_back(i);
+
+		const int endStep = idx >= 0 ? bm.nodes[idx].step : 0;
+		out.assign(static_cast<size_t>(endStep), 0);
+		// Walk root-ward to leaf, filling each edge's span with its hold.
+		for (size_t k = path.size(); k-- > 0; ) {
+			const BeamNode& n = bm.nodes[path[k]];
+			if (n.parent < 0) continue;
+			const int from = bm.nodes[n.parent].step;
+			for (int t = from; t < n.step && t < endStep; t++)
+				out[static_cast<size_t>(t)] = n.hold ? 1 : 0;
+		}
+	}
+
+	// Put the player into node `idx`'s exact state.
+	//
+	// Direct restore when the node holds a checkpoint; otherwise restore its
+	// nearest checkpointed ancestor and replay forward. The replay is exact in
+	// every mode (13.11), so this is sound - unlike the superficially identical
+	// hybrid it replaces, which existed because air restores were NOT exact.
+	//
+	// Replay is bounded by beamCheckpointIntervalSteps and runs synchronously.
+	// The deleted hybrid spread its replay across frames as a state machine and
+	// was a recurring source of bugs; a bounded synchronous loop cannot get out
+	// of sync with itself.
+	bool beamRestoreNode(int idx) {
+		auto& bm = Beam::get();
+		if (idx < 0 || idx >= static_cast<int>(bm.nodes.size())) return false;
+
+		const int anc = bm.nodes[idx].rs.cp ? idx : bm.nodes[idx].cpAncestor;
+		if (anc < 0 || !bm.nodes[anc].rs.cp) return false;
+
+		beamRestoreCheckpointOnly(bm.nodes[anc]);
+		if (anc == idx) return true;
+
+		// Replay the edge span from the ancestor to this node.
+		beamMacro(idx, bm.macroScratch);
+		const int from = bm.nodes[anc].step;
+		const int to   = bm.nodes[idx].step;
+		for (int t = from; t < to; t++) {
+			const bool pressed = static_cast<size_t>(t) < bm.macroScratch.size() &&
+			                     bm.macroScratch[static_cast<size_t>(t)] != 0;
+			applyInput(pressed);
+			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+			bm.replaySteps++;
+			// A replayed prefix must not die: it is a path we already simulated.
+			if (m_player1 && m_player1->m_isDead) return false;
+		}
+		return true;
 	}
 
 	// Put the player back at decision `d`, whatever that takes.
@@ -3871,7 +4151,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		// A usable checkpoint. Exact in every mode now (Probe 4b, 8/8), so this
 		// is the path taken for essentially every backtrack.
-		if (d.cp && !g_config.noSavestates) {
+		if (d.rs.cp && !g_config.noSavestates) {
 			solverRestoreState(d);
 			sv.step        = d.step;
 			sv.hold         = sv.resumeHold;
@@ -3929,7 +4209,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 			const size_t drop = std::min(static_cast<size_t>(g_config.escapeJump), maxDrop);
 			for (size_t i = 0; i < drop; i++) {
-				releaseCheckpoint(sv.stack.back().cp);
+				releaseCheckpoint(sv.stack.back().rs.cp);
 				sv.stack.pop_back();
 			}
 			sv.escapes++;
@@ -4012,7 +4292,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				                       ? sv.stack[floor].togglesBefore : 0;
 				const int spent = d.togglesBefore - floorToggles;
 				if (wouldToggle && spent >= g_config.toggleBudget) {
-					releaseCheckpoint(d.cp);
+					releaseCheckpoint(d.rs.cp);
 					sv.stack.pop_back();
 					continue;
 				}
@@ -4032,7 +4312,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				return true;
 			}
 
-			releaseCheckpoint(d.cp);
+			releaseCheckpoint(d.rs.cp);
 			sv.stack.pop_back();
 		}
 		return false;
@@ -4082,7 +4362,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (auto* pl = PlayLayer::get()) {
 			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
 		}
-		for (auto& d : sv.stack) releaseCheckpoint(d.cp);
+		for (auto& d : sv.stack) releaseCheckpoint(d.rs.cp);
 		sv.stack.clear();
 		sv.commitDepth = 0;
 		sv.resyncTarget = static_cast<int>(sv.resyncMacro.size());
