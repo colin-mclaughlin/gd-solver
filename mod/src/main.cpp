@@ -289,6 +289,87 @@ struct Config {
 	// prediction can be tested rather than assumed.
 	bool beamRankByScore = false;
 	int  beamYBucketSize = 30;   // world units per diversity bucket
+
+	// --- Go-Explore --------------------------------------------------------
+	// Cell size. Too fine and the archive explodes with states that are the same
+	// situation; too coarse and two genuinely different situations share a cell
+	// and one of them is never explored properly. One block is 30 units, which
+	// makes these "same block, same rough height, same rough vertical speed".
+	// x: the player covers ~1.28 units per step at normal speed (26k units over
+	// Stereo Madness's 20,330 steps), so 60 units is ~47 steps of travel - about
+	// a third of an episode. Finer than this and the archive is mostly cells
+	// that are the same situation one frame apart.
+	double goCellX  = 60.0;
+	double goCellY  = 30.0;   // one block; platforming precision lives here
+
+	// Vertical velocity is banded on a SIGNED SQUARE ROOT, not linearly.
+	// MEASURED range is -15..+15, but a ship's entire flight envelope is
+	// |vy| < 2 where small differences decide everything, while a cube jump
+	// swings through +-15 where they barely matter. A linear band cannot serve
+	// both: at 4.0 the whole ship envelope collapses into two cells, which is
+	// precisely the distinction the beam threw away before dying in a ship
+	// section. sqrt keeps resolution where control is and compresses the rest.
+	double goCellVy = 0.4;
+
+	// Steps of DFS work per episode before returning to a fresh cell.
+	//
+	// Much larger than the 120 the coin-flip explorer used, and necessarily so:
+	// that budget was 120 steps of forward travel, this is 120 steps of SEARCH,
+	// most of which is spent re-walking a subtree after a death. 120 would buy
+	// two or three deaths and no coverage at all.
+	int goEpisodeSteps = 3000;
+
+	// Cap on the local DFS stack. Each entry holds a checkpoint, and a runaway
+	// stack would both exhaust memory and defeat the point of a BOUNDED local
+	// search - the archive is supposed to decide where effort goes, not one
+	// episode that never ends.
+	int goMaxDepth = 256;
+
+	// Archive cap. Each cell holds a checkpoint (~22-34 KB measured) plus its
+	// macro, so this is the memory knob. Eviction drops the cells furthest
+	// behind that have already been explored most.
+	// Each cell holds a checkpoint (22.0 KB measured on Stereo Madness, 33.7 KB
+	// on a heavier level) plus its macro, so this is the memory knob: 8000 cells
+	// is roughly 340 MB worst case. Deliberately a guess - the first run reports
+	// live memory and eviction rate, and those numbers set this properly. The
+	// beam taught the same lesson: one run's counters beat an afternoon of my
+	// arithmetic.
+	int goArchiveCap = 8000;
+
+	// Selection bias toward progress. 0 = pure count-based novelty, which is
+	// the paper's mechanism and is self-balancing: a new frontier cell has been
+	// chosen zero times so it wins automatically. Raising this makes selection
+	// greedier, which is the fake-corridor trap - kept switchable so that can be
+	// tested rather than assumed.
+	double goProgressBias = 0.0;
+
+	// How many archive cells one selection samples.
+	//
+	// MEASURED: at 16 out of 2016 cells a tournament sees 0.8% of the archive,
+	// so a frontier cell was picked roughly 8% of the time and ~92% of episodes
+	// re-explored solved ground - 12,000 episodes and 1.2M steps bought 19 new
+	// cells. Sampling has to be wide enough to FIND the frontier before any
+	// weighting can prefer it.
+	int goTournament = 64;
+
+	// Replace a cell's stored representative only when the new route is at least
+	// this many steps shorter.
+	//
+	// Go-Explore's criterion is trajectory length, which assumes length carries
+	// information about quality. Here it does not: the player advances at a
+	// constant rate, so macro length is very nearly a restatement of x position
+	// and two routes into the same cell differ by a handful of steps. Without a
+	// threshold this fires constantly (3,567 replacements for 2,017 cells) and
+	// the state a return lands on keeps shifting underneath the search.
+	int goImproveMargin = 8;
+
+	// A cell counts as "frontier" for reporting if it is within this many
+	// percent of the best reached. Diagnostic only; it steers nothing.
+	double goFrontierPct = 2.0;
+
+	// Fixed so a run reproduces. A search that misbehaves once and never again
+	// cannot be debugged.
+	uint64_t goSeed = 0x243F6A8885A308D3ull;
 };
 
 Config g_config;
@@ -304,6 +385,7 @@ enum class Mode {
 	RestoreTest,  // Probe 4b: does a restore reproduce the future, bit-for-bit?
 	Solve,        // DFS search for an input sequence that clears the level
 	Beam,         // deduplicated width-K beam search over the same action space
+	GoExplore,    // archive of cells; return to one, then explore from it
 	Verify,       // replay a found macro from frame 0, no savestates, no practice
 };
 
@@ -1864,6 +1946,170 @@ struct Beam {
 	static Beam& get() { static Beam b; return b; }
 };
 
+// ---------------------------------------------------------------------------
+// Go-Explore: archive of cells, return-then-explore
+// ---------------------------------------------------------------------------
+//
+// Ecoffet et al., "First Return, Then Explore" (Nature 2021). The algorithm
+// exists to fix two named failures, both of which this project has now measured:
+//
+//   DETACHMENT - the searcher forgets promising frontiers it already reached.
+//     The DFS's Theory of Everything stall is exactly this: escapes 41/42/43
+//     were identical, 18,557 deaths re-deriving one subtree, because the escape
+//     heuristic drops decisions and their `tried` state along with them.
+//
+//   DERAILMENT - the searcher explores WHILE returning, so it never reliably
+//     gets back to the promising state. The beam pruning its way through a ship
+//     section and losing the thread is a fair description of this.
+//
+// The fix for both is structural rather than heuristic: keep an archive of
+// states, RETURN to one with no exploration at all (a savestate restore), and
+// only then explore. The paper notes returning by state load rather than replay
+// is ~45x faster, which is the same substrate argument this project is built on.
+//
+// Unlike the beam there is no synchronised frontier, so there is nothing that
+// can collapse: the archive only ever grows or improves.
+
+struct GoEntry {
+	RestoreState rs;                // how to get back here, with no exploration
+	std::vector<uint8_t> macro;     // inputs from frame 0 to this cell
+
+	float    pct    = 0.f;
+	int      step   = 0;
+	bool     hold   = false;        // input state on arrival, for the restore
+	uint32_t chosen = 0;            // times selected as an exploration start
+	uint32_t seen   = 0;            // times any trajectory reached this cell
+};
+
+// One node of the local DFS an episode runs inside a cell.
+//
+// Deliberately separate from Decision: that one carries the global solver's
+// commit floor, toggle budget, escape bookkeeping and mode anchors, none of
+// which apply to a bounded local search whose job is to explore one
+// neighbourhood and then hand control back to the archive.
+struct GoDecision {
+	RestoreState rs;
+	uint8_t tried        = 0;      // bit0 = tried release, bit1 = tried hold
+	bool    enteringHold = false;  // input that produced rs, for the restore
+	int     step         = 0;
+	int     macroLen     = 0;      // curMacro length on arrival, for truncation
+};
+
+struct GoExplore {
+	bool running = false;
+	// The archive is seeded on the first update AFTER the level reset, not at
+	// keypress: at keypress the level has not been reset yet, so the level-start
+	// checkpoint would capture wherever the player happened to be standing.
+	bool seeded  = false;
+
+	// The archive, keyed by cell. A cell is a coarse bucket of state, NOT an
+	// exact state: two genuinely different states landing in one cell is
+	// expected and benign here, because we keep exploring from the cell and a
+	// poor representative gets replaced when a better one arrives. That is why
+	// this structure tolerates an imperfect key where a transposition table
+	// would not - a bad prune is permanent, a bad archive entry is not.
+	std::unordered_map<uint64_t, GoEntry> archive;
+	std::vector<uint64_t> keys;     // archive keys, for selection sampling
+
+	// Current episode.
+	bool     exploring    = false;
+	uint64_t currentCell  = 0;
+	int      episodeSteps = 0;
+	int      curStep      = 0;
+	std::vector<uint8_t> curMacro;
+
+	// Exploration decides at DECISION POINTS, not on a clock.
+	//
+	// The first version sampled run lengths in time (mean 8 steps). MEASURED
+	// result: saturation at 28.56% of Stereo Madness with 3,000 episodes and
+	// 400,000 steps producing zero new cells, on a stretch the DFS walks through
+	// in about a second.
+	//
+	// The reason is that a cube's decisions are events, not durations. A jump
+	// arc is ~35 steps of which only the 1-3 on the ground can do anything, so
+	// ~11 of every 15 random input changes landed in mid-air where the button is
+	// inert - and worse, consecutive landings were CORRELATED, because one long
+	// hold jumps at all of them. That policy cannot produce "jump, don't jump,
+	// jump", which is exactly what a cube corridor asks for.
+	//
+	// Deciding at decision points makes each choice independent, spends no
+	// randomness where it cannot matter, and gives this search the same action
+	// space as the DFS.
+	bool runHold       = false;
+	bool atDecision    = true;   // a fresh choice is due
+	int  sinceDecision = 0;
+	bool prevGround    = false;
+
+	// The local DFS stack for the current episode.
+	//
+	// Random exploration was measured out over three runs and ceilings at
+	// 20-29% of Stereo Madness, a stretch the DFS clears in about a second. The
+	// reason is coverage arithmetic that no knob touches: an episode holds ~25
+	// binary decisions, so 2^25 ~ 34 million sequences, and 20,000 random
+	// samples reach 0.06% of them. Systematic search with death pruning covers
+	// the same space instead of sampling it.
+	std::vector<GoDecision> stack;
+
+	// Seeded so a run is reproducible. An unseeded search that misbehaves once
+	// and never again is not debuggable.
+	uint64_t rng = 0;
+
+	uint64_t episodes   = 0;
+	uint64_t decisions  = 0;  // decision nodes pushed
+	uint64_t backtracks = 0;  // deaths converted into a retry rather than an exit
+	uint64_t exhausted  = 0;  // episodes that ran their whole subtree out
+	uint64_t deaths    = 0;
+	uint64_t steps     = 0;
+	uint64_t returns   = 0;
+	uint64_t newCells  = 0;
+	uint64_t improved  = 0;
+	uint64_t evicted   = 0;
+	uint64_t returnFails = 0;
+	float    bestPct   = 0.f;
+	uint64_t bestKey   = 0;
+	bool     haveBest  = false;
+
+	size_t   memAtStart = 0;
+	uint64_t startTicks = 0;
+	uint64_t lastReport = 0;
+
+	// xorshift64*, so the sequence is ours and does not depend on the CRT.
+	uint64_t next() {
+		rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
+		return rng * 2685821657736338717ull;
+	}
+	double nextUnit() { return (next() >> 11) * (1.0 / 9007199254740992.0); }
+
+	void clear() {
+		if (auto* pl = PlayLayer::get()) {
+			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+		}
+		for (auto& kv : archive) releaseCheckpoint(kv.second.rs.cp);
+		archive.clear();
+		keys.clear();
+		curMacro.clear();
+		exploring = false;
+		currentCell = 0;
+		episodeSteps = curStep = 0;
+		runHold = false;
+		atDecision = true;
+		sinceDecision = 0;
+		prevGround = false;
+		for (auto& d : stack) releaseCheckpoint(d.rs.cp);
+		stack.clear();
+		episodes = decisions = backtracks = exhausted = deaths = steps = returns = 0;
+		newCells = improved = evicted = returnFails = 0;
+		bestPct = 0.f;
+		bestKey = 0;
+		haveBest = false;
+		memAtStart = 0;
+		running = false;
+		seeded  = false;
+	}
+
+	static GoExplore& get() { static GoExplore g; return g; }
+};
+
 // Write the furthest-reaching path, so a stall can be replayed and watched at
 // normal speed instead of diagnosed from death counts.
 void solverWriteBestMacro();
@@ -2322,33 +2568,50 @@ void pollHotkeys() {
 	// moving-object state - fine on a 2013 level, wrong everywhere this project
 	// is aiming. The full CheckpointObject path is the only correct one.
 
-	// B = beam search. Every function key was already taken; the beam is a
-	// second search mode rather than a probe, so it gets its own letter.
-	if (keyPressedEdge('B')) {
-		auto& bm = Beam::get();
-		if (bm.running) {
-			log::info("Beam: stopped by user.");
-			// Staging the best path happens inside beamStop, so F9 can replay
-			// wherever it got to.
-			bm.clear();
+	// The beam has NO hotkey. Its code is kept - it compiles, it is correct, and
+	// beam-stack search would build on it - but plain beam lost to the DFS on
+	// both levels it was measured on (58x slower on Stereo Madness, frontier
+	// collapse at 10.02% on Theory of Everything where the DFS reaches 32.49%),
+	// so nothing should be able to start one by accident. Restoring it is one
+	// if-block; see Mode::Beam and beamStep.
+
+	// F3 = Go-Explore. Sits next to F2 so the two live searches are adjacent.
+	// It replaced verify-in-practice-mode, which was redundant with F4 - a
+	// solution only counts if it reproduces in NORMAL mode.
+	if (keyPressedEdge(VK_F3)) {
+		auto& gx = GoExplore::get();
+		if (gx.running) {
+			// Stopped inline rather than through goStop: pollHotkeys is a free
+			// function and cannot reach the modify class's members.
+			log::info("Go-Explore: stopped by user at best {:.2f}%, {} cells.",
+			          gx.bestPct, gx.archive.size());
+			if (gx.haveBest) {
+				auto it = gx.archive.find(gx.bestKey);
+				if (it != gx.archive.end() && !it->second.macro.empty()) {
+					Solver::get().bestMacro = it->second.macro;
+					solverWriteBestMacro();
+				}
+			}
+			gx.clear();
 			st.mode = Mode::Idle;
 		} else if (PlayLayer::get()) {
-			g_config.physicsFix = true;   // the beam requires fixed-dt stepping
-			g_config.noSavestates = false; // the beam IS savestates; without them it cannot switch nodes
+			g_config.physicsFix   = true;  // fixed-dt stepping is required
+			g_config.noSavestates = false; // returning to a cell IS a savestate load
 
 			// Practice mode for the same reason the DFS needs it: it is what
 			// makes resetLevel a usable revive path.
 			PlayLayer::get()->m_isPracticeMode = true;
 
-			Solver::get().clear();  // the two searches share the macro buffers
-			bm.clear();
-			bm.running    = true;
-			bm.startTicks = probe::nowTicks();
-			bm.lastReport = bm.startTicks;
-			st.mode       = Mode::Beam;
+			Solver::get().clear();   // the searches share the macro buffers
+			gx.clear();
+			gx.running    = true;
+			gx.rng        = g_config.goSeed;
+			gx.startTicks = probe::nowTicks();
+			gx.lastReport = gx.startTicks;
+			st.mode       = Mode::GoExplore;
 			st.resetPending = true;
-			log::info("Beam: starting a NEW search. Press B again to stop it. "
-			          "F4 verifies a finished solution; F9 replays the best path so far.");
+			log::info("Go-Explore: starting. F3 again to stop, F4 verifies a finished "
+			          "solution, F9 replays the best path so far.");
 		}
 	}
 
@@ -2409,7 +2672,6 @@ void pollHotkeys() {
 	if (keyPressedEdge(VK_F12)) startRestoreTest(RestoreKind::Full);
 	if (keyPressedEdge(VK_F10)) startRestoreTest(RestoreKind::DirectLoad);
 	if (keyPressedEdge(VK_F4))  startVerify(false); // normal mode
-	if (keyPressedEdge(VK_F3))  startVerify(true);  // practice mode
 
 	if (keyPressedEdge(VK_F7)) {
 		std::string p = probe::outputPath("trace_manual.csv");
@@ -4308,12 +4570,15 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 	// --- beam: expansion ----------------------------------------------------
 
-	// Has this edge reached the next decision point?
+	// Has the run reached the next decision point?
 	//
 	// Deliberately identical to the DFS's branching policy, including both
-	// interval constants. Changing branch granularity at the same time as the
-	// search algorithm would make any result unattributable.
-	bool beamEdgeDone(int steps, bool& prevGround) {
+	// interval constants, and shared by every search that needs it. In Ground
+	// modes a decision happens on LANDING or a ring touch - an event, not a
+	// clock - because that is the only moment the button can do anything. In air
+	// modes the trajectory responds continuously, so decisions fall on a fixed
+	// grid instead.
+	bool atDecisionPoint(int steps, bool& prevGround) {
 		auto* p = m_player1;
 		if (!p) return true;
 		if (classifyMode(p) != ModeClass::Ground)
@@ -4353,7 +4618,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				if (!m_player1) return;
 				if (m_player1->m_isDead) { dead = true; break; }
 				if (ProbeState::get().finished) break;
-				if (beamEdgeDone(steps, prevGround)) break;
+				if (atDecisionPoint(steps, prevGround)) break;
 				if (steps >= g_config.maxSegmentSteps) break;
 			}
 
@@ -4669,6 +4934,409 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		beamExpandNode(bm.frontier[static_cast<size_t>(bm.expandIdx++)]);
 		return bm.running;
+	}
+
+	// --- Go-Explore ---------------------------------------------------------
+
+	// Which archive cell the CURRENT state falls in.
+	//
+	// Coarser than solverStateKey on purpose. The key question a cell answers is
+	// "have I been somewhere like here", not "have I been exactly here" - exact
+	// keys never repeat in continuous air state, which is what made the beam's
+	// dedup freeze on Theory of Everything. Position and mode say where you are;
+	// vertical velocity is included because arriving at the same point rising
+	// and falling are completely different situations, and collapsing them would
+	// throw away the distinction that decides whether a gap is clearable.
+	uint64_t goCellKey() {
+		auto* p = m_player1;
+		if (!p) return 0;
+		struct Cell {
+			int32_t  x, y, vy;
+			uint32_t mode;
+			uint32_t flags;
+		} c{};
+		c.x    = static_cast<int32_t>(std::floor(p->getPositionX() / std::max(1.0, g_config.goCellX)));
+		c.y    = static_cast<int32_t>(std::floor(p->getPositionY() / std::max(1.0, g_config.goCellY)));
+		{
+			const double v = p->m_yVelocity;
+			const double r = v < 0.0 ? -std::sqrt(-v) : std::sqrt(v);
+			c.vy = static_cast<int32_t>(std::floor(r / std::max(0.05, g_config.goCellVy)));
+		}
+		c.mode = static_cast<uint32_t>(classifyMode(p));
+		uint32_t f = 0;
+		if (p->m_isUpsideDown) f |= 1u << 0;  // gravity direction changes everything
+		if (p->m_isOnGround)   f |= 1u << 1;
+		c.flags = f;
+		return probe::fnv1a(&c, sizeof(c));
+	}
+
+	// Record the current state in the archive.
+	//
+	// Called after every explored step. createCheckpoint is ~12 us (Probe 5), so
+	// capturing is cheap; it is LOADING that costs a millisecond. That asymmetry
+	// is what makes an archive of this shape affordable at all.
+	void goRecordCell() {
+		auto& gx = GoExplore::get();
+		auto* pl = PlayLayer::get();
+		if (!pl || !m_player1 || m_player1->m_isDead) return;
+
+		const uint64_t key = goCellKey();
+		const float pct = pl->getCurrentPercent();
+
+		auto it = gx.archive.find(key);
+		if (it == gx.archive.end()) {
+			if (gx.archive.size() >= static_cast<size_t>(g_config.goArchiveCap) && !goEvictOne())
+				return;
+			GoEntry e;
+			captureRestoreState(e.rs);
+			if (!e.rs.cp) return;
+			e.macro = gx.curMacro;
+			e.pct   = pct;
+			e.step  = gx.curStep;
+			e.hold  = gx.runHold;
+			e.seen  = 1;
+			gx.archive.emplace(key, std::move(e));
+			gx.keys.push_back(key);
+			gx.newCells++;
+		} else {
+			auto& e = it->second;
+			e.seen++;
+			// A meaningfully shorter route replaces the representative, so a bad
+			// early one gets corrected instead of poisoning the cell forever.
+			// The margin matters: without it this fires on one- and two-step
+			// differences that carry no information here, and the state a return
+			// lands on never settles.
+			if (gx.curMacro.size() + static_cast<size_t>(g_config.goImproveMargin)
+			    <= e.macro.size()) {
+				releaseCheckpoint(e.rs.cp);
+				captureRestoreState(e.rs);
+				if (!e.rs.cp) return;
+				e.macro = gx.curMacro;
+				e.pct   = pct;
+				e.step  = gx.curStep;
+				e.hold  = gx.runHold;
+				gx.improved++;
+			}
+		}
+
+		if (pct > gx.bestPct) {
+			gx.bestPct  = pct;
+			gx.bestKey  = key;
+			gx.haveBest = true;
+		}
+	}
+
+	// Drop the least useful cell to make room. Least useful = furthest behind
+	// and most heavily explored already.
+	bool goEvictOne() {
+		auto& gx = GoExplore::get();
+		if (gx.keys.empty()) return false;
+
+		// Sampled rather than scanned: a full pass over the archive on every
+		// insertion at the cap would dominate the stepping path.
+		size_t worstIdx = 0;
+		double worstScore = 1e30;
+		bool found = false;
+		for (int t = 0; t < 32; t++) {
+			const size_t i = static_cast<size_t>(gx.next() % gx.keys.size());
+			auto it = gx.archive.find(gx.keys[i]);
+			if (it == gx.archive.end()) continue;
+			if (gx.haveBest && gx.keys[i] == gx.bestKey) continue;
+			const double score = it->second.pct - 0.01 * it->second.chosen;
+			if (!found || score < worstScore) { worstScore = score; worstIdx = i; found = true; }
+		}
+		if (!found) return false;
+
+		auto it = gx.archive.find(gx.keys[worstIdx]);
+		if (it != gx.archive.end()) {
+			releaseCheckpoint(it->second.rs.cp);
+			gx.archive.erase(it);
+		}
+		gx.keys[worstIdx] = gx.keys.back();
+		gx.keys.pop_back();
+		gx.evicted++;
+		return true;
+	}
+
+	// Choose a cell to explore from.
+	//
+	// Two novelty terms, both counting rather than scoring:
+	//
+	//   chosen - how often this cell has been an exploration start. Falls as a
+	//     cell is worked over, so attention drifts away from exhausted cells.
+	//   seen   - how often ANY trajectory has passed through it. This is the
+	//     term that identifies the frontier: a cell just discovered has been
+	//     seen once, while established cells are traversed by every episode
+	//     that starts nearby. It was being tracked and not used, and the
+	//     measured result was 92% of episodes re-exploring solved ground.
+	//
+	// Deliberately no progress term by default. Weighting by percent is the
+	// greedy ranking that traps on fake corridors; novelty gets the search
+	// forward without ever preferring "further along" as such. goProgressBias
+	// exists so that claim can be TESTED rather than asserted.
+	uint64_t goSelectCell() {
+		auto& gx = GoExplore::get();
+		if (gx.keys.empty()) return 0;
+
+		uint64_t bestKey = gx.keys[0];
+		double   bestW   = -1.0;
+		const int kTournament = std::max(1, g_config.goTournament);
+		for (int t = 0; t < kTournament; t++) {
+			const uint64_t k = gx.keys[static_cast<size_t>(gx.next() % gx.keys.size())];
+			auto it = gx.archive.find(k);
+			if (it == gx.archive.end()) continue;
+			double w = 1.0 / std::sqrt(1.0 + static_cast<double>(it->second.chosen));
+			w       /= std::sqrt(1.0 + static_cast<double>(it->second.seen));
+			if (g_config.goProgressBias > 0.0)
+				w *= 1.0 + g_config.goProgressBias * (it->second.pct / 100.0);
+			if (w > bestW) { bestW = w; bestKey = k; }
+		}
+		return bestKey;
+	}
+
+	// Return to a cell. No exploration happens here - that separation IS the
+	// algorithm's fix for derailment, and mixing any randomness into this step
+	// would quietly reintroduce the failure it exists to prevent.
+	bool goReturn(uint64_t key) {
+		auto& gx = GoExplore::get();
+		auto it = gx.archive.find(key);
+		if (it == gx.archive.end() || !it->second.rs.cp) return false;
+
+		applyRestoreState(it->second.rs, it->second.hold);
+		gx.currentCell   = key;
+		gx.curMacro      = it->second.macro;
+		gx.curStep       = it->second.step;
+		gx.runHold       = it->second.hold;
+		// A choice is due on the first step: returning to a cell and then
+		// continuing whatever input it arrived with would re-walk the trajectory
+		// that produced it, which is the one episode guaranteed to find nothing.
+		gx.atDecision    = true;
+		gx.sinceDecision = 0;
+		gx.prevGround    = m_player1 && m_player1->m_isOnGround;
+		for (auto& d : gx.stack) releaseCheckpoint(d.rs.cp);
+		gx.stack.clear();
+		it->second.chosen++;
+		gx.returns++;
+		return true;
+	}
+
+	// Release the episode's decision stack. Every entry holds a checkpoint, and
+	// an episode ends thousands of times per minute.
+	void goEndEpisode() {
+		auto& gx = GoExplore::get();
+		for (auto& d : gx.stack) releaseCheckpoint(d.rs.cp);
+		gx.stack.clear();
+		gx.exploring = false;
+	}
+
+	// A death is information, not a wasted episode: return to the nearest
+	// decision with an untried branch and take it.
+	//
+	// This is the whole difference from the coin-flip explorer. There, a death
+	// discarded everything learned and the next episode re-sampled blind. Here
+	// the subtree below a fatal choice is pruned and never revisited, which is
+	// why the DFS clears in a second what 20,000 random episodes could not.
+	bool goBacktrack() {
+		auto& gx = GoExplore::get();
+		while (!gx.stack.empty()) {
+			auto& d = gx.stack.back();
+			if (!(d.tried & 2u)) {
+				d.tried |= 2u;
+				applyRestoreState(d.rs, d.enteringHold);
+				gx.curMacro.resize(static_cast<size_t>(d.macroLen));
+				gx.curStep       = d.step;
+				gx.runHold       = true;   // the untried branch
+				gx.atDecision    = false;
+				gx.sinceDecision = 0;
+				gx.prevGround    = m_player1 && m_player1->m_isOnGround;
+				gx.backtracks++;
+				return true;
+			}
+			releaseCheckpoint(d.rs.cp);
+			gx.stack.pop_back();
+		}
+		return false;
+	}
+
+	void goSolved() {
+		auto& gx = GoExplore::get();
+		goReport(true);
+		log::info("============== GO-EXPLORE SOLVED ==============");
+		log::info("  {} steps, {} episodes, {} returns, {} cells, {} deaths",
+		          gx.curMacro.size(), gx.episodes, gx.returns, gx.archive.size(), gx.deaths);
+
+		Solver::get().macro     = gx.curMacro;
+		Solver::get().bestMacro = gx.curMacro;
+		solverWriteMacro("solution.txt");
+		solverWriteBestMacro();
+
+		auto& ps = ProbeState::get();
+		ps.solvePathTrace.clear();
+		ps.solveDecisionSteps.clear();
+		log::info("  No path trace: F4 will verify this macro but cannot report a "
+		          "divergence step for it.");
+		log::info("  Verify by replaying from frame 0 - a solution found via "
+		          "savestates only counts if it reproduces in a clean run.");
+		log::info("===============================================");
+
+		gx.clear();
+		ps.mode = Mode::Idle;
+	}
+
+	void goStageBest() {
+		auto& gx = GoExplore::get();
+		if (!gx.haveBest) return;
+		auto it = gx.archive.find(gx.bestKey);
+		if (it == gx.archive.end() || it->second.macro.empty()) return;
+		Solver::get().bestMacro = it->second.macro;
+		solverWriteBestMacro();
+	}
+
+	void goStop(const char* why) {
+		auto& gx = GoExplore::get();
+		goReport(true);
+		log::info("Go-Explore: {} - best {:.2f}%, {} cells", why, gx.bestPct, gx.archive.size());
+		goStageBest();
+		gx.clear();
+		ProbeState::get().mode = Mode::Idle;
+	}
+
+	void goReport(bool force) {
+		auto& gx = GoExplore::get();
+		const uint64_t now = probe::nowTicks();
+		if (!force && probe::ticksToMicros(now - gx.lastReport) < 2'000'000.0) return;
+		gx.lastReport = now;
+
+		const double secs = probe::ticksToMicros(now - gx.startTicks) / 1e6;
+		const size_t mem  = processMemoryBytes();
+		const double memMB = (mem > gx.memAtStart ? mem - gx.memAtStart : 0) / (1024.0 * 1024.0);
+
+		// How many cells sit at the leading edge, and how often an episode
+		// actually banks something. `new/ep` near zero with `died` low is the
+		// saturation signature: episodes surviving their full length and
+		// finding nothing, i.e. compute spent on solved ground.
+		size_t frontier = 0;
+		for (auto const& kv : gx.archive)
+			if (kv.second.pct >= gx.bestPct - g_config.goFrontierPct) frontier++;
+
+		log::info("Go: best {:.2f}%  cells {}  frontier {}  new {}  improved {}  "
+		          "evicted {}  episodes {}  dec/ep {:.1f}  depth {}  backtracks {}  "
+		          "exhausted {}  returns {}  deaths {}  steps {}  new/ep {:.3f}  "
+		          "(+{:.0f} MB, {:.0f} steps/s, {:.0f} returns/s)",
+		          gx.bestPct, gx.archive.size(), frontier, gx.newCells, gx.improved,
+		          gx.evicted, gx.episodes,
+		          gx.episodes > 0 ? static_cast<double>(gx.decisions) / gx.episodes : 0.0,
+		          gx.stack.size(), gx.backtracks, gx.exhausted,
+		          gx.returns, gx.deaths,
+		          gx.steps,
+		          gx.episodes > 0 ? static_cast<double>(gx.newCells) / gx.episodes : 0.0,
+		          memMB,
+		          secs > 0 ? gx.steps / secs : 0.0,
+		          secs > 0 ? gx.returns / secs : 0.0);
+	}
+
+	// Seed the archive with the level start, so there is something to return to.
+	bool goInit() {
+		auto& gx = GoExplore::get();
+		auto* pl = PlayLayer::get();
+		if (!pl || !m_player1) return false;
+
+		gx.curMacro.clear();
+		gx.curStep = 0;
+		gx.runHold = false;
+		goRecordCell();
+		if (gx.archive.empty()) {
+			log::error("Go-Explore: could not checkpoint the level start.");
+			goStop("failed to start");
+			return false;
+		}
+		gx.memAtStart = processMemoryBytes();
+		log::info("Go-Explore: seeded from level start. cell size x{:.0f} y{:.0f} vy{:.1f}, "
+		          "systematic DFS episodes of {} steps (max depth {}), decisions on "
+		          "landings/rings (ground) and every {} steps (air), tournament {}, "
+		          "archive cap {}, seed {}.",
+		          g_config.goCellX, g_config.goCellY, g_config.goCellVy,
+		          g_config.goEpisodeSteps, g_config.goMaxDepth, g_config.airBranchInterval,
+		          g_config.goTournament, g_config.goArchiveCap, g_config.goSeed);
+		return true;
+	}
+
+	// One unit of work: either return to a cell, or advance one explored step.
+	bool goStep() {
+		auto& gx = GoExplore::get();
+		auto* pl = PlayLayer::get();
+		if (!pl || !m_player1) return false;
+
+		// --- return phase ---
+		if (!gx.exploring) {
+			const uint64_t key = goSelectCell();
+			if (!key || !goReturn(key)) {
+				gx.returnFails++;
+				if (gx.returnFails > 64) {
+					log::error("Go-Explore: {} consecutive failed returns - the archive "
+					           "holds no restorable cell.", gx.returnFails);
+					goStop("archive unusable");
+					return false;
+				}
+				return true;
+			}
+			gx.returnFails  = 0;
+			gx.exploring    = true;
+			gx.episodeSteps = 0;
+			gx.episodes++;
+			return true;
+		}
+
+		// --- explore phase ---
+		if (gx.atDecision) {
+			if (static_cast<int>(gx.stack.size()) >= g_config.goMaxDepth) {
+				goEndEpisode();
+				return true;
+			}
+			GoDecision d;
+			captureRestoreState(d.rs);
+			if (!d.rs.cp) { goEndEpisode(); return true; }
+			d.enteringHold = gx.runHold;   // the input that produced this state
+			d.step         = gx.curStep;
+			d.macroLen     = static_cast<int>(gx.curMacro.size());
+			d.tried        = 1u;           // about to take the release branch
+			gx.stack.push_back(std::move(d));
+
+			gx.runHold       = false;      // release first, as the DFS does
+			gx.atDecision    = false;
+			gx.sinceDecision = 0;
+			gx.decisions++;
+		}
+
+		applyInput(gx.runHold);
+		GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+		gx.sinceDecision++;
+		gx.episodeSteps++;
+		gx.curStep++;
+		gx.steps++;
+		gx.curMacro.push_back(gx.runHold ? 1 : 0);
+
+		if (ProbeState::get().finished) { goSolved(); return false; }
+
+		if (m_player1->m_isDead) {
+			gx.deaths++;
+			if (!goBacktrack()) {
+				// The whole subtree below this cell is dead. That is a real
+				// result, not a failure - the cell has been settled, and its
+				// rising `chosen` count moves selection elsewhere.
+				gx.exhausted++;
+				goEndEpisode();
+			}
+			return true;
+		}
+
+		goRecordCell();
+		goReport(false);
+
+		if (atDecisionPoint(gx.sinceDecision, gx.prevGround)) gx.atDecision = true;
+
+		if (gx.episodeSteps >= g_config.goEpisodeSteps) goEndEpisode();
+		return gx.running;
 	}
 
 	// Put the player back at decision `d`, whatever that takes.
@@ -5317,8 +5985,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// dead player, because a branch that dies is the normal outcome and the
 		// next restore is what revives it.
 		const bool beaming = st.mode == Mode::Beam && Beam::get().running;
+		// Go-Explore spends most of its time with a dead player too: an episode
+		// ending in death is the normal outcome, and the next return revives it.
+		const bool going   = st.mode == Mode::GoExplore && GoExplore::get().running;
 		const bool active  = pl && m_player1 &&
-		                     (solving || beaming || (!m_player1->m_isDead && !st.finished));
+		                     (solving || beaming || going ||
+		                      (!m_player1->m_isDead && !st.finished));
 
 		if (st.mode == Mode::Idle || !active) {
 			GJBaseGameLayer::update(dt);
@@ -5398,6 +6070,20 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			const uint64_t frameStart = probe::nowTicks();
 			while (sv.running) {
 				if (!solverStep()) break;
+				if (probe::ticksToMicros(probe::nowTicks() - frameStart) > kSolverFrameBudgetUs) break;
+			}
+			return;
+		}
+
+		if (st.mode == Mode::GoExplore) {
+			auto& gx = GoExplore::get();
+			if (!gx.seeded) {
+				if (!goInit()) return;
+				gx.seeded = true;
+			}
+			const uint64_t frameStart = probe::nowTicks();
+			while (gx.running) {
+				if (!goStep()) break;
 				if (probe::ticksToMicros(probe::nowTicks() - frameStart) > kSolverFrameBudgetUs) break;
 			}
 			return;
