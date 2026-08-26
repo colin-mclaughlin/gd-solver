@@ -154,7 +154,68 @@ struct Config {
 	// state equals the state forward simulation reaches. Replay-forward cannot be
 	// wrong about that by construction, which is the leading explanation for a
 	// gap no amount of soundness testing has closed.
-	bool hybridRestore = true;
+	// Now OFF by default. It was reinstated only to reproduce 30fe2b7's stale
+	// tap state (13.15); with tap ordering supplying that effect deliberately it
+	// is pure overhead. MEASURED, same session: Time Machine and Clutterfunk both
+	// searched a BIT-IDENTICAL tree with it on and off - same deaths, same depth,
+	// same solution length - while Clutterfunk went from 169,516 simulated steps
+	// to 3,953,558 for that identical search, 34s -> 3m05s. Air decisions carry
+	// exact checkpoints again, so a backtrack into air is O(1) instead of a
+	// replay from the nearest cube ancestor.
+	bool hybridRestore = false;
+
+	// Order Tap decisions (UFO, swing) by whether a tap is NEEDED, instead of by
+	// the carried-over hold state.
+	//
+	// decisionCost is asymmetric for Tap - `choice ? 1 : 0` - so a decision
+	// pushed with choice=true has a FREE alternative and is never gated by the
+	// toggle budget, while one pushed with choice=false has an alternative that
+	// costs 1 and is refused the instant the budget is spent. Release-first
+	// therefore makes "never tap" the cheapest path through a UFO corridor,
+	// which is exactly "fall to the bottom corridor" - the observed ToE failure.
+	//
+	// 30fe2b7 evaded this by accident: stale tap state left sv.hold true often
+	// enough that 7.7% of gate evaluations had a free alternative. This does the
+	// same thing on purpose and for a stated reason. Plan 13.15.
+	// MEASURED and LOST: 27.72% on Theory of Everything against 32.49% with it
+	// off and 78.90% for 30fe2b7's stale tap state. It is not over-tapping - the
+	// rule fired on 10373 of 26890 Tap decisions (38.6%), so it discriminates -
+	// it is simply the wrong prior for this level. Deaths in the stall sit at
+	// yVelocity +5.8 to +6.7, i.e. RISING into a ceiling: "tap when falling"
+	// lifts the UFO out of a corridor whose correct route is to stay low.
+	//
+	// Kept behind the flag because the rule is sound where altitude must be held
+	// and may still win on other levels; it is only wrong as a universal prior.
+	//
+	// It also refutes the free-alternative story I attached to 13.15: this made
+	// 38.6% of Tap decisions carry a free alternative against 30fe2b7's 7.7% of
+	// gate evaluations, and did WORSE. More reachable tree is not the mechanism.
+	bool tapOrderByNeed = false;
+
+	// Let tapping/tapRemaining survive a reposition instead of being restored -
+	// what 30fe2b7 did by omission on its anchor-replay arrival, applied to
+	// EVERY path back to a decision rather than only that one.
+	//
+	// Why this is the experiment that matters: staleness is measured causal
+	// (78.90% vs 32.49%, hybrid on, nothing else changed), but in 30fe2b7 it
+	// could only ever fire through an anchor replay, so it was welded to the
+	// hybrid. With hybrid off there are no anchor replays and the effect has no
+	// vector at all. This gives it one, which makes "stale tap state" and
+	// "cube-anchor replay" independently testable for the first time.
+	//
+	// If this reaches 78.90% the hybrid is redundant: exact checkpoints in every
+	// mode AND ~115 restores/s instead of ~15.
+	bool tapStateSurvivesRestore = true;
+
+	// "Falling" threshold, in units of gravity-relative fall speed (positive =
+	// moving the way gravity pulls). 0.0 means any downward motion counts.
+	//
+	// A knob, not a tuned constant: the risk with this rule is over-tapping. A
+	// UFO spends most of each cycle falling, so a sign-only test could fire at
+	// nearly every decision, spend the whole toggle budget in three decisions
+	// and gate everything after. The tapFirst counters in the report line
+	// measure that directly - if the fraction is near 1.0, raise this.
+	double tapNeedFallSpeed = 0.0;
 
 	// Census of the cells the DFS visits. Read-only: it records bands and counts
 	// and nothing reads them back, so it cannot alter a decision the search
@@ -1791,6 +1852,12 @@ struct Solver {
 	int                   bestStep     = 0; // solver step at which bestPct was reached
 	uint64_t              deathsAtBest = 0;
 	uint64_t              escapes      = 0;
+
+	// How often the tap-ordering rule fires, split by gravity direction. The
+	// point is to catch over-tapping from the FIRST report line rather than by
+	// inferring it from a stalled percentage an hour later.
+	uint64_t              tapDecisions = 0;
+	uint64_t              tapFirstChosen = 0;
 	struct PendingExtra {
 		double gameModeChangedTime = 0.0;
 		bool   unkA29 = false;
@@ -1931,6 +1998,7 @@ struct Solver {
 		// ran. Any level that runs later in a session AND stalls was searching
 		// a different shape than the same level run first.
 		deaths = restores = steps = escapes = 0;
+		tapDecisions = tapFirstChosen = 0;
 	}
 
 	// Reserved once in clear(); the stepping path only ever push_back()s into
@@ -2901,6 +2969,12 @@ void pollHotkeys() {
 			          "checkpoint. Plan 13.13.",
 			          g_config.hybridRestore ? "ON" : "OFF",
 			          g_config.hybridRestore ? "do NOT carry" : "carry");
+			log::info("Solver: tap ordering by need is {} (fall speed > {:.2f} tries the "
+			          "tap first). Plan 13.15.",
+			          g_config.tapOrderByNeed ? "ON" : "OFF", g_config.tapNeedFallSpeed);
+			log::info("Solver: tap state {} a reposition. Plan 13.15.",
+			          g_config.tapStateSurvivesRestore ? "SURVIVES (stale, as 30fe2b7)"
+			                                           : "is restored (clean)");
 			log::info("Solver: starting DFS. air branch interval {} steps, "
 			          "release-before-hold ordering. F2 again to stop.",
 			          g_config.airBranchInterval);
@@ -4364,9 +4438,17 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		Decision d;
 		d.step = sv.step;
+
+		// Gravity-relative fall speed: positive means moving the way gravity
+		// pulls, so the test reads the same upright and inverted. m_yVelocity is
+		// in world coordinates, so the sign flips with m_isUpsideDown.
+		bool tapFirst = false;
 		if (auto* p = m_player1) {
 			d.modeClass = classifyMode(p);
 			d.airPolicy = d.modeClass != ModeClass::Ground;
+			const double fall = p->m_isUpsideDown ?  static_cast<double>(p->m_yVelocity)
+			                                      : -static_cast<double>(p->m_yVelocity);
+			tapFirst = fall > g_config.tapNeedFallSpeed;
 		}
 		// EVERY decision gets a checkpoint now, air included. Air decisions used
 		// to be skipped because restoring to one was unreliable (Probe 4b under
@@ -4395,7 +4477,23 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// "hold when m_isOnGround" to lift off the floor - but in ship mode
 			// m_isOnGround is also true against the CEILING, so it held the ship
 			// harder into it and best% went backwards, 35.23% -> 33.78%.
-			d.choice = sv.hold;
+			// Tap modes have no "continue": a tap self-releases, so sv.hold at
+			// push time is carried-over state rather than a sustained action.
+			// Ordering by whether a tap is needed is the physical reading of the
+			// same decision, and by decisionCost's asymmetry it also makes the
+			// no-tap fallback free instead of budget-gated.
+			//
+			// Deliberately velocity-only. The earlier physics rule that failed
+			// keyed on m_isOnGround, which is true against the CEILING in ship
+			// mode and so held the ship harder into it; velocity has no such
+			// second meaning, and this is confined to Tap so ship is untouched.
+			if (d.modeClass == ModeClass::Tap && g_config.tapOrderByNeed) {
+				d.choice = tapFirst;
+				sv.tapDecisions++;
+				if (tapFirst) sv.tapFirstChosen++;
+			} else {
+				d.choice = sv.hold;
+			}
 		} else {
 			// Cube: no-press is the likelier correct branch (~10% jump rate in
 			// the BC dataset), and this policy already clears 35% of the level.
@@ -5640,8 +5738,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			solverRestoreState(d);
 			sv.step        = d.step;
 			sv.hold         = sv.resumeHold;
-			sv.tapping      = sv.resumeTapping;
-			sv.tapRemaining = sv.resumeTap;
+			if (!g_config.tapStateSurvivesRestore) {
+				sv.tapping      = sv.resumeTapping;
+				sv.tapRemaining = sv.resumeTap;
+			}
 			sv.togglesUsed  = sv.resumeToggles;
 			sv.lastBranch   = sv.resumeBranch;
 			return false;
@@ -5673,8 +5773,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					return true;
 				}
 				sv.hold         = sv.resumeHold;
-				sv.tapping      = sv.resumeTapping;
-				sv.tapRemaining = sv.resumeTap;
+				if (!g_config.tapStateSurvivesRestore) {
+					sv.tapping      = sv.resumeTapping;
+					sv.tapRemaining = sv.resumeTap;
+				}
 				sv.togglesUsed  = sv.resumeToggles;
 				sv.lastBranch   = sv.resumeBranch;
 				return false;
@@ -5891,10 +5993,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// and wall-clock time are not interchangeable here.
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
-		          "anchorReplays {}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
+		          "anchorReplays {}  tapFirst {}/{}  "
+		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
 		          g_config.toggleBudget, sv.commitDepth, sv.lookbackSteps, sv.resyncs, sv.resyncFailures,
 		          CellProbe::get().cells.size(), sv.anchorReplays,
+		          sv.tapFirstChosen, sv.tapDecisions,
 		          stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
 	}
@@ -5939,8 +6043,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			sv.resyncForBacktrack = false;
 			sv.resyncing   = false;
 			sv.hold         = sv.resumeHold;
-			sv.tapping      = sv.resumeTapping;
-			sv.tapRemaining = sv.resumeTap;
+			if (!g_config.tapStateSurvivesRestore) {
+				sv.tapping      = sv.resumeTapping;
+				sv.tapRemaining = sv.resumeTap;
+			}
 			sv.togglesUsed  = sv.resumeToggles;
 			sv.lastBranch   = sv.resumeBranch;
 			sv.macro.resize(static_cast<size_t>(sv.step), 0);
