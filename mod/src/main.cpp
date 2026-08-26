@@ -31,6 +31,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <map>
+#include <set>
 #include <cctype>
 #include <memory>
 
@@ -280,6 +281,27 @@ struct Config {
 	// Reading only. Nothing here influences a search decision - that comes later
 	// and starts as move ORDERING, never pruning, because a misclassified object
 	// used for pruning deletes a viable route and nothing reports it.
+	// Probe 8: which open space can still reach the end of the level.
+	//
+	// A fake corridor is a pocket of open space that looks identical to the real
+	// route and then terminates. MEASURED at ToE's 78.90% wall: floors at y 930,
+	// 1020, 1110, 1200 make three 60-unit corridors, and at x 20417 two 44x85
+	// hazards (objID 88) fill the bottom and middle ones while the top is empty.
+	// The solver has occupied y32-33 and y35-36 tens of thousands of times and
+	// y38-39 never - it cannot tell the three apart, because from inside they
+	// are identical until the frame it dies.
+	//
+	// Geometry can tell them apart. Flood fill backwards from the level end
+	// through open cells; anything that cannot reach the end is a dead pocket.
+	//
+	// The fill allows free movement between adjacent open cells, which no game
+	// mode can actually do. That is deliberate and it is the SAFE direction: it
+	// over-estimates what is reachable, so it under-reports dead pockets. A cell
+	// it marks dead is dead under any physics. A cell it marks live may still be
+	// unreachable in practice - which is why this orders moves rather than
+	// pruning them.
+	bool deadEndProbe = true;
+
 	int geomXMin = 18000;   // units; the region around ToE's third corridor set
 	int geomXMax = 21000;
 	bool geomDumpObjects = true;  // also write the raw per-object list
@@ -2633,10 +2655,17 @@ void geometryDump() {
 		                     r.getMinX(), r.getMinY(), r.size.width, r.size.height,
 		                     t, o->m_objectID, hazard ? "HAZARD" : "solid");
 
+		// Half-open on the far edge. A floor occupying [930, 960) is entirely
+		// band 31, but floor(960/30) = 32 marked band 32 solid as well, so every
+		// floor ate the bottom band of the corridor above it and the map showed
+		// ToE's 2-block corridors as 1 band with 2-band floors. MEASURED against
+		// the raw objects: floors at y 930/1020/1110/1200 are 30 tall, corridors
+		// are 960-1020, 1050-1110, 1140-1200 - 60 units, exactly two blocks.
+		const double eps = 1e-6;
 		const int x0 = static_cast<int>(std::floor(r.getMinX() / xb));
-		const int x1 = static_cast<int>(std::floor(r.getMaxX() / xb));
+		const int x1 = static_cast<int>(std::floor((r.getMaxX() - eps) / xb));
 		const int y0 = static_cast<int>(std::floor(r.getMinY() / yb));
-		const int y1 = static_cast<int>(std::floor(r.getMaxY() / yb));
+		const int y1 = static_cast<int>(std::floor((r.getMaxY() - eps) / yb));
 		for (int x = x0; x <= x1; x++) {
 			for (int y = y0; y <= y1; y++) {
 				char& c = grid[{x, y}];
@@ -2700,6 +2729,139 @@ void geometryDump() {
 	log::info("  object types present (type:count) - {}", types);
 	log::info("  map -> {}", path);
 	if (g_config.geomDumpObjects) log::info("  raw objects -> {}", objPath);
+}
+
+// Probe 8. Occupancy over the WHOLE level, then a backward flood fill.
+void deadEndDump() {
+	auto* gl = GJBaseGameLayer::get();
+	auto* pl = PlayLayer::get();
+	if (!gl || !gl->m_objects || !pl) { log::error("Probe 8: no level"); return; }
+
+	const double xb = std::max(1.0, g_config.goCellX);
+	const double yb = std::max(1.0, g_config.goCellY);
+	const double eps = 1e-6;
+
+	// 0 = open, 1 = solid, 2 = hazard. Both block a route; kept apart so the
+	// map says WHY a pocket is sealed.
+	std::map<std::pair<int,int>, char> cell;
+	int xlo = INT_MAX, xhi = INT_MIN, ylo = INT_MAX, yhi = INT_MIN;
+
+	auto* arr = gl->m_objects;
+	for (unsigned int i = 0; i < arr->count(); i++) {
+		auto* o = static_cast<GameObject*>(arr->objectAtIndex(i));
+		if (!o) continue;
+		const int t = static_cast<int>(o->getType());
+		const bool solid  = t == static_cast<int>(GameObjectType::Solid) ||
+		                    t == static_cast<int>(GameObjectType::Slope) ||
+		                    t == static_cast<int>(GameObjectType::Breakable);
+		const bool hazard = t == static_cast<int>(GameObjectType::Hazard) ||
+		                    t == static_cast<int>(GameObjectType::AnimatedHazard);
+		if (!solid && !hazard) continue;
+
+		const cocos2d::CCRect r = o->getObjectRect();
+		const int x0 = static_cast<int>(std::floor(r.getMinX() / xb));
+		const int x1 = static_cast<int>(std::floor((r.getMaxX() - eps) / xb));
+		const int y0 = static_cast<int>(std::floor(r.getMinY() / yb));
+		const int y1 = static_cast<int>(std::floor((r.getMaxY() - eps) / yb));
+		for (int x = x0; x <= x1; x++)
+			for (int y = y0; y <= y1; y++) {
+				char& c = cell[{x, y}];
+				if (hazard || c == 0) c = hazard ? 2 : 1;
+			}
+	}
+	if (cell.empty()) { log::warn("Probe 8: no solid or hazardous objects"); return; }
+
+	for (auto const& kv : cell) {
+		xlo = std::min(xlo, kv.first.first);  xhi = std::max(xhi, kv.first.first);
+		ylo = std::min(ylo, kv.first.second); yhi = std::max(yhi, kv.first.second);
+	}
+	// The playable band is bounded by geometry, but open space extends past the
+	// topmost block, so give the fill a margin to travel through.
+	ylo -= 2; yhi += 2;
+
+	auto blocked = [&](int x, int y) {
+		auto it = cell.find({x, y});
+		return it != cell.end() && it->second != 0;
+	};
+
+	// Forward reachability, swept right to left - NOT a flood fill.
+	//
+	// MEASURED CONSEQUENCE of the flood: it marked ToE's dead corridors LIVE.
+	// An undirected fill asks "is this cell connected to the end", and it
+	// reached the sealed bottom corridor from the LEFT, through the open air at
+	// band 334 before the corridor walls begin. In a side-scroller you cannot
+	// walk back out; x only ever increases. Connectivity is the wrong question.
+	//
+	// So: a cell is live only if, moving vertically WITHIN ITS OWN COLUMN through
+	// open cells, it can reach some cell that steps right into a live cell. From
+	// the bottom corridor at band 339 the column is bounded by the y34 floor and
+	// every rightward step lands in the saw, so it is dead - correctly.
+	//
+	// Free vertical movement inside one column is still an over-estimate (a
+	// column is 60 units of x, ~46 steps, and no mode can climb arbitrarily in
+	// that), which keeps the error on the safe side: X stays "dead under any
+	// physics".
+	std::set<std::pair<int,int>> live;
+	for (int y = ylo; y <= yhi; y++)
+		if (!blocked(xhi, y)) live.insert({xhi, y});
+
+	for (int x = xhi - 1; x >= xlo; x--) {
+		int y = ylo;
+		while (y <= yhi) {
+			if (blocked(x, y)) { y++; continue; }
+			// One vertical run of open cells: the player can move freely inside
+			// it while crossing this column.
+			const int runLo = y;
+			while (y <= yhi && !blocked(x, y)) y++;
+			const int runHi = y - 1;
+
+			bool runLive = false;
+			for (int r = runLo; r <= runHi && !runLive; r++)
+				if (!blocked(x + 1, r) && live.count({x + 1, r})) runLive = true;
+
+			if (runLive)
+				for (int r = runLo; r <= runHi; r++) live.insert({x, r});
+		}
+	}
+
+	const std::string path = levelFilePath("deadends.txt");
+	std::FILE* f = std::fopen(path.c_str(), "wb");
+	if (!f) { log::error("Probe 8: cannot write {}", path); return; }
+
+	std::fprintf(f, "# gd-solver dead-end map (Probe 8)\n");
+	std::fprintf(f, "# bands x %.0f y %.0f, x %d..%d, y %d..%d\n", xb, yb, xlo, xhi, ylo, yhi);
+	std::fprintf(f, "# S solid  H hazard  . open and CAN reach the level end  "
+	                "X open but DEAD (no path to the end)\n");
+	std::fprintf(f, "# The fill allows free movement between adjacent open cells, so it\n"
+	                "# over-estimates reachability: an X is dead under any physics.\n#\n");
+
+	const double len = pl->m_levelLength > 1.f ? pl->m_levelLength : 0.0;
+	int dead = 0, open = 0;
+	std::fprintf(f, "# %-7s %-9s %-7s ", "xband", "x", "pct");
+	for (int y = yhi; y >= ylo; y--) std::fprintf(f, "%d", std::abs(y) % 10);
+	std::fprintf(f, "  (y%d down to y%d)\n", yhi, ylo);
+
+	for (int x = xlo; x <= xhi; x++) {
+		const double xu = x * xb;
+		std::fprintf(f, "%-9d %-9.0f %-7.2f ", x, xu, len > 0.0 ? (xu / len) * 100.0 : 0.0);
+		for (int y = yhi; y >= ylo; y--) {
+			auto it = cell.find({x, y});
+			const char c = it == cell.end() ? 0 : it->second;
+			if (c == 1) { std::fputc('S', f); continue; }
+			if (c == 2) { std::fputc('H', f); continue; }
+			open++;
+			if (live.count({x, y})) std::fputc('.', f);
+			else { std::fputc('X', f); dead++; }
+		}
+		std::fputc('\n', f);
+	}
+	std::fclose(f);
+
+	log::info("Probe 8: dead-end map over x bands {}..{}, y {}..{} - {} open cells, "
+	          "{} of them DEAD ({:.1f}%).", xlo, xhi, ylo, yhi, open, dead,
+	          open > 0 ? 100.0 * dead / open : 0.0);
+	log::info("  a cell marked X is open space with no path to the end of the level "
+	          "under free movement, so it is dead under any physics -> {}", path);
 }
 
 void sweepWriteResults() {
@@ -3262,6 +3424,13 @@ void pollHotkeys() {
 	if (keyPressedEdge('G')) {
 		if (PlayLayer::get()) geometryDump();
 		else log::warn("Probe 7: not in a level");
+	}
+
+	// H = dead-end map (Probe 8). Read-only, same as G.
+	if (keyPressedEdge('H')) {
+		if (!PlayLayer::get()) log::warn("Probe 8: not in a level");
+		else if (!g_config.deadEndProbe) log::warn("Probe 8: disabled in config");
+		else deadEndDump();
 	}
 
 	// C = corridor sweep (Probe 6). A letter because every F key is taken.
