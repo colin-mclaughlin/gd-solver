@@ -207,6 +207,49 @@ struct Config {
 	// mode AND ~115 restores/s instead of ~15.
 	bool tapStateSurvivesRestore = true;
 
+	// Budget taps as a RATE rather than a count.
+	//
+	// The toggle budget means two different things in the two air modes. For
+	// Hold, a toggle is a CHANGE: a sustained hold is one toggle whether it
+	// lasts ten steps or ten thousand, so the count does not depend on how much
+	// of the path is mutable. For Tap, cost is one per tap and the taps a UFO
+	// needs scale LINEARLY with the length of the section - so the same number
+	// means "path complexity" in one mode and "section length" in the other.
+	//
+	// MEASURED CONSEQUENCE: widening is self-defeating in UFO. The mutable
+	// window escalated 240 -> 7680 steps (1s -> 32s) in 90 seconds while the
+	// allowance stayed at 3 taps, so reaching further back made the gate TIGHTER
+	// exactly when the search needed it looser: more refusals -> more stalls ->
+	// more widening. Both a run with tap ordering and the current baseline show
+	// the same runaway once progress stops.
+	//
+	// With this on, taps are counted against their own allowance which scales
+	// with the window, so a 32-second window permits 32x the taps of a
+	// one-second window. At the default window the allowance is exactly
+	// toggleBudget, so nothing changes until widening begins. Hold toggles keep
+	// the flat, window-invariant budget, which is correct for them.
+	// MEASURED and LOST, worse than the thing it was meant to fix: Theory of
+	// Everything stalled at 32.49% where the shared budget reaches 78.90%, and
+	// the widening runaway it targeted was UNCHANGED - 5 widenings, 0 resets,
+	// identical to the baseline. Reverted to off.
+	//
+	// Two things it established, both worth more than the change itself:
+	//
+	// 1. The budget is NOT what gates the fake corridor. At w7680 the allowance
+	//    was 3 x 32 = 96 taps in the mutable window - a nearly free gate - and
+	//    the search still never left 32.49%. Loosening the bound does not help,
+	//    so budget tuning, rate budgets and faster deepening are all dead ends.
+	//    What stops it is DFS ORDER: release-first explores essentially every
+	//    low-altitude path before any high-altitude one, and there are
+	//    astronomically many. The fix has to change what is TRIED, not what is
+	//    allowed.
+	//
+	// 2. The 78.90% result depends on taps and hold toggles sharing ONE budget.
+	//    Giving them separate pools is strictly looser and still broke it, so
+	//    the coupling is load-bearing and not understood. Treat 78.90% as
+	//    fragile until it is.
+	bool tapRateBudget = false;
+
 	// "Falling" threshold, in units of gravity-relative fall speed (positive =
 	// moving the way gravity pulls). 0.0 means any downward motion counts.
 	//
@@ -1758,6 +1801,8 @@ struct BeamNode {
 
 struct Decision;
 int decisionCost(Decision const& d, bool choice);
+int tapCost(Decision const& d, bool choice);
+int tapAllowance(int window);
 
 // Release a checkpoint, first detaching it from anything GD still points at.
 //
@@ -1793,10 +1838,29 @@ struct Decision {
 	// complete as the bound grows.
 	bool enteringHold  = false; // hold state on arrival, so a toggle is well-defined
 	int  togglesBefore = 0;     // air toggles used on the path up to this decision
+	int  tapsBefore    = 0;     // taps used on the path up to this decision
 	bool modeTransition = false; // pushed because the game mode changed here
 
 	RestoreState rs;            // the state entering this decision
 };
+
+// Taps spent by this choice. Always 1 for a tap, independent of the flag - the
+// flag decides which budget it is charged to, not what it costs.
+int tapCost(Decision const& d, bool choice) {
+	return (d.modeClass == ModeClass::Tap && choice) ? 1 : 0;
+}
+
+// Taps permitted above the commit floor for a given mutable window. Scales with
+// the window so the allowance means the same thing at any width; at the default
+// window it is exactly toggleBudget, which is what makes this inert until
+// widening starts.
+int tapAllowance(int window) {
+	const int base = g_config.commitLookbackSteps;
+	if (window <= base) return g_config.toggleBudget;
+	const double scale = static_cast<double>(window) / static_cast<double>(base);
+	const double n = static_cast<double>(g_config.toggleBudget) * scale;
+	return static_cast<int>(n < 1.0 ? 1.0 : n);
+}
 
 int decisionCost(Decision const& d, bool choice) {
 	switch (d.modeClass) {
@@ -1805,7 +1869,9 @@ int decisionCost(Decision const& d, bool choice) {
 		// from 78.90% to 32.49% - the first UFO section needs scattered single
 		// taps, which doubled in price. Neither model dominates; per-tap is the
 		// one that demonstrably clears more.
-		case ModeClass::Tap:    return choice ? 1 : 0;
+		// Under tapRateBudget a tap is charged to the tap allowance instead, so
+		// it must not also consume the hold-toggle budget or it is counted twice.
+		case ModeClass::Tap:    return g_config.tapRateBudget ? 0 : (choice ? 1 : 0);
 		case ModeClass::Hold:   return (choice != d.enteringHold) ? 1 : 0;
 		case ModeClass::Ground: default: return 0;
 	}
@@ -1844,6 +1910,7 @@ struct Solver {
 	bool                  prevOnGround = false;
 	bool                  prevAirMode  = false;
 	int                   togglesUsed  = 0;
+	int                   tapsUsed     = 0;
 	size_t                commitDepth  = 0; // cached for logging; see solverCommitFloor()
 	int                   lookbackSteps = 0;   // current (possibly widened) window
 	int                   escapesAtWiden = 0;  // escape count when it last widened
@@ -1897,6 +1964,7 @@ struct Solver {
 	bool                  resumeHold     = false;
 	int                   resumeTap      = 0;
 	int                   resumeToggles  = 0;
+	int                   resumeTaps     = 0;
 	int                   resumeBranch   = 0;
 	uint64_t              replayBacktracks = 0;
 
@@ -1949,6 +2017,7 @@ struct Solver {
 		step = 0;
 		lastBranch = 0;
 		togglesUsed = 0;
+		tapsUsed = 0;
 		resyncing = false;
 		resyncForBacktrack = false;
 		replayBacktracks = 0;
@@ -2972,6 +3041,11 @@ void pollHotkeys() {
 			log::info("Solver: tap ordering by need is {} (fall speed > {:.2f} tries the "
 			          "tap first). Plan 13.15.",
 			          g_config.tapOrderByNeed ? "ON" : "OFF", g_config.tapNeedFallSpeed);
+			log::info("Solver: tap budget is {} (allowance {} taps at the default {}-step "
+			          "window, scaling with it). Plan 13.15.",
+			          g_config.tapRateBudget ? "a RATE" : "a flat count",
+			          tapAllowance(g_config.commitLookbackSteps),
+			          g_config.commitLookbackSteps);
 			log::info("Solver: tap state {} a reposition. Plan 13.15.",
 			          g_config.tapStateSurvivesRestore ? "SURVIVES (stale, as 30fe2b7)"
 			                                           : "is restored (clean)");
@@ -4465,6 +4539,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (needsCheckpoint) captureRestoreState(d.rs);
 		d.enteringHold  = sv.hold;
 		d.togglesBefore = d.airPolicy ? sv.togglesUsed : 0;
+		d.tapsBefore    = d.airPolicy ? sv.tapsUsed    : 0;
 
 		// Move ordering. Both branches are still explored (subject to the toggle
 		// budget), so this changes only which is tried FIRST.
@@ -5727,6 +5802,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		                 ? g_config.tapLengthSteps : 0;
 		sv.resumeTapping = (d.modeClass == ModeClass::Tap) ? d.choice : false;
 		sv.resumeToggles = d.togglesBefore + decisionCost(d, d.choice);
+		sv.resumeTaps    = d.tapsBefore    + tapCost(d, d.choice);
 		sv.resumeBranch  = d.step;
 		sv.macro.resize(static_cast<size_t>(d.step), 0);
 		if (sv.pathTrace.size() > static_cast<size_t>(d.step))
@@ -5743,6 +5819,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				sv.tapRemaining = sv.resumeTap;
 			}
 			sv.togglesUsed  = sv.resumeToggles;
+			sv.tapsUsed     = sv.resumeTaps;
 			sv.lastBranch   = sv.resumeBranch;
 			return false;
 		}
@@ -5778,6 +5855,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					sv.tapRemaining = sv.resumeTap;
 				}
 				sv.togglesUsed  = sv.resumeToggles;
+				sv.tapsUsed     = sv.resumeTaps;
 				sv.lastBranch   = sv.resumeBranch;
 				return false;
 			}
@@ -5917,25 +5995,38 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// budget; the bound rises when the whole tree at this bound is done.
 			if (d.tried != 0b11 && d.airPolicy) {
 				sv.budgetGateEvals++;
-				const bool wouldToggle = decisionCost(d, !d.choice) > 0;
+
+				// Tap decisions are gated on the tap allowance, Hold on the flat
+				// toggle budget. Under tapRateBudget decisionCost returns 0 for
+				// Tap, so exactly one of these is nonzero for any decision.
+				const bool isTapBudget = g_config.tapRateBudget &&
+				                         d.modeClass == ModeClass::Tap;
+				const bool wouldToggle = isTapBudget
+				                       ? tapCost(d, !d.choice) > 0
+				                       : decisionCost(d, !d.choice) > 0;
 				if (wouldToggle) sv.budgetGateWouldToggle++;
 				// Relative to the committed prefix: toggles spent inside a
 				// frozen, already-working prefix must not count against the
 				// budget for the part still being solved.
 				const int floorToggles = floor < sv.stack.size()
-				                       ? sv.stack[floor].togglesBefore : 0;
-				const int spent = d.togglesBefore - floorToggles;
+				                       ? (isTapBudget ? sv.stack[floor].tapsBefore
+				                                      : sv.stack[floor].togglesBefore)
+				                       : 0;
+				const int spent = (isTapBudget ? d.tapsBefore : d.togglesBefore)
+				                - floorToggles;
+				const int budget = isTapBudget ? tapAllowance(sv.lookbackSteps)
+				                              : g_config.toggleBudget;
 				if (spent > sv.budgetMaxSpent) sv.budgetMaxSpent = spent;
-				if (wouldToggle && spent >= g_config.toggleBudget) {
+				if (wouldToggle && spent >= budget) {
 					// Record BEFORE the pop: d is about to be destroyed.
 					sv.budgetPopCount++;
 					if (sv.budgetPops.size() < sv.budgetPops.capacity()) {
 						BudgetPop bp;
 						bp.step          = d.step;
-						bp.togglesBefore = d.togglesBefore;
+						bp.togglesBefore = isTapBudget ? d.tapsBefore : d.togglesBefore;
 						bp.floorToggles  = floorToggles;
 						bp.spent         = spent;
-						bp.budget        = g_config.toggleBudget;
+						bp.budget        = budget;
 						bp.floorIdx      = static_cast<int>(floor);
 						bp.stackSize     = static_cast<int>(sv.stack.size());
 						bp.mode          = static_cast<int>(d.modeClass);
@@ -5957,9 +6048,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				// was even reached, so every air toggle was refused and each
 				// budget level "exhausted" after a single path.
 				sv.togglesUsed = d.togglesBefore + decisionCost(d, d.choice);
+				sv.tapsUsed    = d.tapsBefore    + tapCost(d, d.choice);
 
 				if (solverRepositionTo(d)) return true;
 				sv.togglesUsed = sv.resumeToggles;
+				sv.tapsUsed    = sv.resumeTaps;
 				return true;
 			}
 
@@ -6025,6 +6118,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		sv.step         = 0;
 		sv.hold         = false;
 		sv.togglesUsed  = 0;
+		sv.tapsUsed     = 0;
 		sv.prevAirMode  = false;
 		sv.prevOnGround = false;
 		log::info("Solver: resync - replaying {} committed steps from frame 0 with no "
@@ -6048,6 +6142,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				sv.tapRemaining = sv.resumeTap;
 			}
 			sv.togglesUsed  = sv.resumeToggles;
+			sv.tapsUsed     = sv.resumeTaps;
 			sv.lastBranch   = sv.resumeBranch;
 			sv.macro.resize(static_cast<size_t>(sv.step), 0);
 			return;
@@ -6194,6 +6289,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				sv.anchorReplaying = false;
 				sv.hold         = sv.resumeHold;
 				sv.togglesUsed  = sv.resumeToggles;
+				sv.tapsUsed     = sv.resumeTaps;
 				sv.lastBranch   = sv.resumeBranch;
 				sv.macro.resize(static_cast<size_t>(sv.step), 0);
 
@@ -6373,6 +6469,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 						Decision& d = sv.stack.back();
 						solverRepositionTo(d);
 						sv.togglesUsed  = sv.resumeToggles;
+						sv.tapsUsed     = sv.resumeTaps;
 						sv.deathsAtBest = sv.deaths;
 						// Reopen the frontier above the floor at the new budget.
 						for (auto& e : sv.stack) {
