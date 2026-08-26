@@ -756,7 +756,15 @@ of 20,330 — not merely surviving, but identical.
 
 **Consequences.** No realign step (the direct load lands exactly; the respawn
 landed one step early). No cube-anchor hybrid, no transition anchors for restore
-purposes, no forward replay through air sections. Every decision captures a
+purposes, no forward replay through air sections.
+
+> **SUPERSEDED IN PART - see 13.13.** The restore accuracy claimed here holds,
+> including in a UFO (measured on ToE: `UFO SOUND`, `AIR modes: 3/3`). What does
+> not hold is the conclusion that the cube-anchor hybrid was therefore
+> unnecessary. Retiring it cost Theory of Everything 46 percentage points
+> (78.90% -> 32.49%) with no other search behaviour changed in that commit. The
+> hybrid was supplying something beyond a workaround for inexact air restores,
+> and what that is remains unknown. Every decision captures a
 checkpoint, air included, so a backtrack into a ship or UFO section is O(1).
 Measured: 1,473 deaths and exactly 1,473 restores, ~114 restores/s, no resyncs.
 Cost is ~22 KB of checkpoint plus ~2 KB of player image per decision.
@@ -853,6 +861,158 @@ aimed at a healthy sample proves only that the sample is healthy.
 
 ---
 
+### 13.13 Theory of Everything: the hybrid was doing more than working around inexact restores (2026-08-25)
+
+ToE is the first level the solver does not clear. It has three "fake corridor"
+sections: three stacked flat UFO corridors, only one of which leads anywhere.
+**In all three, the correct route is the TOP corridor and the solver ends up in
+the bottom one.** That is not bad luck, it is structural - release-first ordering
+means "no tap", no tap means fall, so the cheapest path under the toggle budget
+is always the lowest corridor. The search is biased toward exactly the wrong
+answer on this level.
+
+**The regression.** ToE reached **78.90%** on 2026-08-19 and has stalled at
+**32.49%** - the first corridor - ever since. Bisected against the logs:
+
+| Build | ToE result |
+|---|---|
+| `30fe2b7` (pre-`6257b89`) | **78.90%** at 9.4M steps, ~11 minutes |
+| `6257b89`..HEAD | **32.49%**, still there after 141M steps in the longest run |
+
+Re-running `30fe2b7` in a git worktree on 2026-08-25 reproduced the original run
+almost exactly - same escape numbers, same commit depths, ~3% variance in steps:
+
+| Milestone | worktree replay | original 08-19 run |
+|---|---|---|
+| 32.49% | step 1,659,386 - escape 1 - `commit 1170(w240)` | step 1,678,334 - escape 1 - `commit 1170(w240)` |
+| 78.90% | step 9,406,613 - escape 8 - `commit 2757(w240)` | step 9,729,146 - escape 8 - `commit 2757(w240)` |
+
+**The 78.90% path is REAL, not a savestate artifact.** Its macro replays from
+frame 0 in normal mode with no savestates and no restores, surviving **step 15713
+of 15713** and dying only on the last recorded step. A divergence anywhere would
+have killed it earlier and at a different percent. Archived at
+`gd-solver-regression-test/backup/oldbuild-78.90/`.
+
+Note what this does and does not prove. A clean replay validates **the artifact,
+not the mechanism**: it proves this input sequence works in the real game, not
+that the search's savestates were exact in general. For the question being asked
+- "is 78.90% reachable by real inputs, or a mirage from bad states" - the
+artifact is what needed checking.
+
+**What actually changed.** `6257b89` did two things. It made air restores exact
+(13.11), and it deleted `hybridRestore` as a workaround whose reason had been
+fixed. Every search-tuning constant is byte-identical across that commit -
+`commitLookbackSteps`, `escapesBeforeWidening`, `wideningFactor`,
+`minCommittedFraction`, `airBranchInterval`, `groundBranchInterval`,
+`toggleBudget`, `maxToggleBudget`, `stallLimit`, `escapeJump`, `tapLengthSteps`,
+`escapesBeforeAnchorRelease`. So the 46-point difference is the deleted mechanism
+and nothing else.
+
+`hybridRestore` never restored to an air decision: it restored the nearest CUBE
+ancestor and replayed the macro forward through the air section. In the worktree
+run, **7,507 of ~7,940 deaths (95%) were anchor replays.**
+
+**It is NOT a restore-soundness problem.** The obvious hypothesis - that air
+restores are still unsound in a UFO and `hybridRestore` was masking it - is
+contradicted by measurement taken on ToE with the current checkpointing:
+
+- `Geode 2026-08-20 15.53.28.log`, sweeping ToE's 32.49% path:
+  `step 5424  27.23%  UFO  SOUND`, `CUBE-like: 5/5 sound`, `AIR modes: 3/3 sound`.
+- `Geode 2026-08-20 14.54.11.log`, sweeping the 15,713-step 78.90% path itself:
+  six anchors from step 1914 to 10288 (~9.6% to ~51.7%), every one reporting
+  **state at restore boundary is EXACT**. Cut short at anchor 6 of 8, so no
+  summary line and no anchor inside the 78.90% region.
+
+So the checkpoints do what they claim. **What changed is what the search does
+with them, and the mechanism is not yet understood.** Recorded plainly because
+guessing at it has already cost two false diagnoses (13.14):
+
+- The decision tree is identical either way. `hybridRestore` does not remove air
+  decisions - they remain backtrack targets, reached by replay instead of by
+  restore. Same nodes, same order, same toggle budget.
+- The build that wins is **7x slower in branches per second** (13 restores/s
+  against 94). So it is not throughput, and it is not reaching more states per
+  unit time.
+- Candidates worth instrumenting once a flag exists: live-checkpoint count and
+  its effect on restore cost (~2,800 air checkpoints at depth 2817 versus ~577
+  cube-only), and how the frame budget (`kSolverFrameBudgetUs`) gets spent when
+  every backtrack costs the same instead of costing more with depth.
+
+**The experiment that settles causation** is the A/B inside ONE binary: port
+`hybridRestore` behind a flag and run ToE both ways. Two builds differing by a
+1,145-line commit is a correlation; one binary differing by one boolean is not.
+
+One shape difference worth carrying either way. Mutable decisions at the stall:
+
+| | depth | commit floor | mutable |
+|---|---|---|---|
+| `30fe2b7` at 78.90% | 2817 | 2757 | **60** |
+| HEAD at 32.49% | 1249 | 802 | **447** |
+
+The build that advances keeps 7x less of the stack open. This is the same effect
+13.9 records for an over-wide window, arriving by a different route.
+
+**Throughput is not the explanation, and the naive comparison is a trap.**
+`30fe2b7` reports 24,228 steps/s against HEAD's 4,489 - but its "steps" are
+mostly *replay* steps, not exploration. Per restore: 1,864 steps then, 48 now.
+HEAD explores roughly 7x more branches per second and still fails.
+
+**The cell census (uncommitted, records during `solverStep`).** A read-only
+archive of visited cells keyed `(x/60, y/30, signed-sqrt vy, mode, gravity,
+on-ground)`, recorded per step, no checkpoints, nothing read back. On ToE at the
+32.49% stall: 1,731 cells frozen across more than 1.1M steps, zero new x bands
+ever, and only **two adjacent y bands** at the wall against five to seven earlier
+in the section.
+
+Observed directly (Colin, watching the F9 replay): at the 78.90% death the UFO
+is in the bottom of the three corridors and the correct route is the top one, and
+**the approach leaves enough altitude to reach the top** - the entry does not
+foreclose it. So the failure is choice, not geometry, which is what makes
+decision ORDERING (13.13 "next steps") the targeted fix rather than anything
+about how the section is entered.
+
+The census limitation, found immediately: **height diversity proves almost
+nothing in a UFO section.** A UFO press generates a new altitude nearly every time, so y-spread
+is produced trivially and carries no information about whether the correct
+corridor was found. The census also has no time axis, so a band showing six
+heights may be six heights from different search phases under different commit
+floors, not six alternatives available at one decision. It would mean more in
+cube (discrete arcs launched from the ground) or wave (slope-constrained).
+
+### 13.14 Method note, third pass: bisect the logs, not the code
+
+Two false diagnoses were made this session before the right one, both from
+reasoning over code instead of measuring:
+
+- "The wall just needs more steps" - built on a progress curve that silently
+  merged four levels sharing one log file. Restricting to the ToE segment of that
+  file reversed the conclusion.
+- "The regression is the Ground/Hold/Tap split" - built on commit timestamps
+  bracketing a good and a bad run. The conversation transcript showed the actual
+  edits in that window were a Tap **rhythm-cost** experiment that was reverted
+  eight minutes later, and that ToE was never re-tested between the revert and
+  the checkpointing commit.
+
+What worked, in order of value:
+
+1. **Per-run log fingerprints.** `anchorReplays` present or absent dates a build
+   more reliably than any commit timestamp, because commits lag builds and builds
+   lag runs.
+2. **Counter equality as a determinism check.** Two runs printing
+   `deaths 115  restores 114  steps 44651` identically proves the builds behaved
+   identically to that point. Where they stop matching is where the code changed.
+3. **The conversation transcript as the real history.** Not every change is a
+   commit. `~/.claude/projects/*/*.jsonl` holds every edit with a timestamp;
+   **transcript timestamps are UTC and Geode log timestamps are local.**
+4. **A git worktree to run an old build.** `git worktree add --detach` builds a
+   past commit without touching the working tree. `geode build` installs, so back
+   up the current `.geode` first - restoring it is a file copy, not a rebuild.
+
+Corollary: **when a workaround is deleted because its stated reason was fixed,
+re-test the case that motivated it.** `hybridRestore` existed for inexact air
+restores; the air restore was fixed and the workaround removed in the same
+commit, and no UFO level was run before or after.
+
 ## 11. Reference material
 
 - **peony, "60tps In 2.2 Is a Lie"** (June 2025) — the authoritative physics/determinism fix. `catflowers.substack.com/p/60tps-in-22-is-a-lie`
@@ -884,3 +1044,122 @@ aimed at a healthy sample proves only that the sample is healthy.
 - **Never silently overwrite a working baseline.** Distinctly named artifacts for real comparisons.
 - **Delete artifacts trained under assumptions later found wrong.** Do not build on a known-bad foundation.
 - **Recruiting-timeline-aware scope discipline.** Complexity gets trimmed when it does not demonstrably help.
+
+### 13.15 ToE regression located: stale tap state made half the UFO branches free (2026-08-25)
+
+The 78.90% -> 32.49% regression is **not** physics, not restore fidelity, and not
+any search-tuning constant. It is a single pair of assignments.
+
+**What was measured.** The toggle-budget gate was instrumented to record every
+refusal (step, mode, togglesBefore, floorToggles, spent, budget, floor index,
+stack size) into a file, written at each deepening and on stop - recorded in the
+stepping path, dumped where I/O is allowed. Both builds ran Theory of Everything
+from the same start.
+
+The two refusal sequences are **identical for 5,243 refusals**, through both
+deepenings, at the same depths and percentages:
+
+| deepening | 30fe2b7 (78.90%) | current (32.49%) |
+| --- | --- | --- |
+| 1 -> 2 | 806/864, max spent 1, depth 564, 12.77% | identical |
+| 2 -> 3 | 3987/4483, max spent 2, depth 744, 16.28% | identical |
+| 3 -> 4 | never happens | 8376/11029, max spent 3 |
+
+Then they split at one decision, in the first UFO corridor:
+
+```
+row    30fe2b7                                     current
+5243   5750 Tap tg3 fl0 spent3 floor990 stack1050  (same)
+5244   5750 Tap tg3 fl0 spent3 floor990 stack1050  5746 ... stack1049   <- split
+5245   6470 Tap tg9 fl6 spent3 floor1170 stack1230 5750 ... stack1050
+```
+
+30fe2b7 takes a fourth branch at step 5750 and its next refusal is **720 steps
+further into the level**; the commit floor advances 990 -> 1170. The current build
+takes three, then unwinds 5750, 5746, 5750, 5746, 5742, 5738 and never recovers.
+
+Two things this rules out. **The commit floor is not the cause** - in both builds
+`floorIdx == stackSize - 60` exactly (1050-990, 1230-1170), so it is a strict
+function of depth and the pinned floor is a symptom of not getting past 5750, as
+is the extra widening to w960. And **`airPolicy` covers UFO in both**
+(`modeClass != Ground`), so the hybrid path was genuinely active where the
+regression lives.
+
+**The discriminating statistic.** 30fe2b7 evaluated the gate 22,675 times with
+**1,756 (7.7%) on a branch whose alternative was FREE**. The current build
+evaluated 67,995 times with **3**. A free alternative is never gated, so those
+1,756 branches cost nothing against the toggle budget.
+
+**The mechanism.** `decisionCost` is asymmetric for Tap:
+
+```cpp
+case ModeClass::Tap: return choice ? 1 : 0;
+```
+
+A Tap decision is pushed with `d.choice = sv.hold`. Pushed while `sv.hold` is
+TRUE, the untried alternative is "no tap", costs 0, and the budget never gates
+it. Pushed while `sv.hold` is FALSE, the alternative is a tap, costs 1, and is
+refused the instant the budget is spent.
+
+30fe2b7's hybrid anchor-replay arrival block restores `hold`, `togglesUsed` and
+`lastBranch` - and **not** `tapping` / `tapRemaining`. Leaving `tapRemaining`
+stale (almost always 0) means the countdown in `solverStep` never fires, so
+`sv.hold = resumeHold` survives the full 4-step branch interval to the next push,
+and that push gets `choice = true`. Restoring `resumeTap` sets `tapRemaining` to
+`tapLengthSteps`, `sv.hold` self-releases after 2 steps, and the next push gets
+`choice = false`.
+
+So the retired hybrid was not only working around inexact air restores. It was
+also, accidentally, making a large fraction of UFO branches budget-free.
+
+**Consequence for the level.** With every tap costing 1 against a budget of 3, at
+most three taps are affordable above the commit floor. A UFO corridor that must
+stay high needs a tap every few frames, so the cheapest path is always "do not
+tap" - fall - bottom corridor. That is exactly the observed failure: three fake
+corridor sections, correct route on top, solver ends on the bottom every time.
+
+**Process failure worth recording.** The first port of this block into the
+current build *restored* `tapping`/`tapRemaining`, because that reads as the
+obviously correct thing to do. The A/B of `hybridRestore` therefore compared the
+new build against a mechanism that was not the old build's, concluded "the hybrid
+alone does not fix it", and cost a run. **When porting a mechanism to reproduce a
+behaviour, diff the ported block against the original line by line before
+running it** - not the function it lives in, the block.
+
+**What run 5 established first, and why it mattered.** The 78.90% macro was
+replayed from frame 0 in the *current* build via F9 (no search, no savestates):
+`FAILED - died at step 15713 of 15713 (78.90%)`, identical to 30fe2b7. Forward
+simulation is the same across both builds, so the path is reachable in the
+current build and the defect had to be in search bookkeeping. That eliminated
+half the search space for the diagnosis in ninety seconds and is the cheapest
+test run this session. **Before hunting a search regression, verify that the
+target path still simulates.**
+
+**Reproducibility note.** 30fe2b7 is deterministic to the byte: rerun today it
+produced a `best.txt` identical to the earlier run and reached 78.90% at
+9,376,954 steps / 6m42s against 9,406,613 / 6m38s. The budget-gate
+instrumentation costs nothing measurable.
+
+**The fix is not to restore the bug.** Leaving rhythm state from an abandoned
+branch is not defensible on its own terms; it only helps by accident. The
+principled version is to **order Tap decisions by whether a tap is needed**
+(falling and low -> try tap first), which sets `choice = true` deliberately and,
+by the same asymmetric cost rule, makes the fallback free. That is the air
+decision ordering item, promoted from "later" to "next".
+
+**Stopping rule for Theory of Everything.** The ordered list below is what gets
+tried. If it runs dry, ToE is parked and other levels continue. The three fake
+corridor sections are a rare and specific structure; if they turn out to be the
+only thing gating progress, they are not worth blocking the project on, and the
+level can be revisited once the archive or a stronger search exists.
+
+Order:
+
+1. Faithful hybrid port (drop the tap-state restore) - confirms the diagnosis.
+2. Tap decision ordering by need - the principled replacement for the accident.
+3. Eleven-level regression check, then commit.
+4. Forward-simulation comparison: restore-to-air vs replay-forward-to-air, byte
+   compared.
+5. The knobs: widening factor, `minCommittedFraction` clamp, anchor release.
+6. The Go-Explore archive on top of the DFS.
+7. Deferred: frame budget, transposition table, beam-stack, reachable-set.

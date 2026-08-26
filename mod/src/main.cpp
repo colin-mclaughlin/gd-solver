@@ -30,6 +30,7 @@
 #include <cstring>
 #include <unordered_set>
 #include <unordered_map>
+#include <map>
 #include <cctype>
 #include <memory>
 
@@ -136,6 +137,34 @@ struct Config {
 	// over beam. Set stallLimit to 0 to disable and get pure DFS back.
 	int stallLimit  = 400;
 	int escapeJump  = 200;
+
+	// Never restore directly to an AIR decision: restore the nearest CUBE
+	// ancestor (whose checkpoint is exact) and replay the macro forward through
+	// the air section.
+	//
+	// This was retired in 6257b89 on the grounds that the direct-load restore is
+	// exact in every mode, which it is - measured on Theory of Everything itself,
+	// UFO SOUND and AIR 3/3. MEASURED CONSEQUENCE ANYWAY: Theory of Everything
+	// went 78.90% -> 32.49% in that commit, and every search-tuning constant
+	// across it is byte-identical, so the hybrid was supplying something beyond a
+	// workaround for inexact air restores. Plan 13.13.
+	//
+	// Note what Probe 4b actually proves: restoring and re-running reproduces
+	// what running produced - SELF-CONSISTENCY. It does not prove the restored
+	// state equals the state forward simulation reaches. Replay-forward cannot be
+	// wrong about that by construction, which is the leading explanation for a
+	// gap no amount of soundness testing has closed.
+	bool hybridRestore = true;
+
+	// Census of the cells the DFS visits. Read-only: it records bands and counts
+	// and nothing reads them back, so it cannot alter a decision the search
+	// makes. Its only cost is one hash and one map lookup per step.
+	bool cellProbeEnabled = true;
+
+	// Ceiling on distinct cells held. ~80 bytes each, so 300k is ~24 MB. Past
+	// the cap new cells are counted and dropped rather than stored, which keeps
+	// the census honest about having been truncated instead of silently lying.
+	int  cellProbeCap     = 300000;
 
 	// Iterative deepening on air toggle count. Starts at 1 so the very first
 	// things tried are "never change the input" and "change it exactly once" -
@@ -1513,6 +1542,16 @@ ModeClass classifyMode(PlayerObject* p) {
 	return ModeClass::Ground;                                 // cube, ball, spider, robot
 }
 
+// The coarse bucket a state falls into: "somewhere like here", not "exactly
+// here". Lifted out of goCellKey so the archive and the census that measures
+// whether the archive is worth building cannot drift apart - the same reason
+// RestoreState came out of Decision and atDecisionPoint came out of the beam.
+struct CellCoords {
+	int32_t  x, y, vy;
+	uint32_t mode;
+	uint32_t flags;
+};
+
 // Budget cost of taking `choice` at this decision.
 //   Hold : a toggle (changing the hold state) costs 1; continuing is free.
 //   Tap  : a tap costs 1; not tapping is free. Crucially a tap is ONE unit, not
@@ -1711,6 +1750,22 @@ int decisionCost(Decision const& d, bool choice) {
 	}
 }
 
+// One refusal by the toggle-budget gate.
+//
+// The gate is inside solverBacktrack, which is the stepping path, so this
+// RECORDS and never logs - the vector is reserved up front and never grows
+// there. Dumped to a file at deepening and on stop, where I/O is allowed.
+//
+// Why it exists: with hybridRestore ON the current build still exhausts budget 3
+// in Theory of Everything's UFO corridor and 30fe2b7 does not, while
+// decisionCost, this gate, togglesBefore, move ordering and isDecisionPoint are
+// all byte-identical between them. Diffing the two pop sequences locates the
+// first real difference instead of inferring it. Plan 13.13.
+struct BudgetPop {
+	int step, togglesBefore, floorToggles, spent, budget, floorIdx, stackSize;
+	int mode;
+};
+
 struct Solver {
 	bool                  running    = false;
 	std::vector<Decision> stack;
@@ -1777,6 +1832,12 @@ struct Solver {
 	int                   resumeToggles  = 0;
 	int                   resumeBranch   = 0;
 	uint64_t              replayBacktracks = 0;
+
+	// Anchor replay: walking the macro forward from a cube ancestor to reach an
+	// air decision that carries no checkpoint of its own.
+	bool                  anchorReplaying    = false;
+	int                   anchorReplayTarget = 0;
+	uint64_t              anchorReplays      = 0;
 	bool                  tapping            = false; // rhythm state (persists)
 	bool                  resumeTapping      = false;
 	int                   tapRemaining       = 0;   // steps left in the current tap
@@ -1827,9 +1888,19 @@ struct Solver {
 		tapping = false;
 		resumeTapping = false;
 		tapRemaining = 0;
+		anchorReplaying    = false;
+		anchorReplayTarget = 0;
+		anchorReplays      = 0;
 		resyncTarget = 0;
 		lastResyncStep = 0;
 		resyncs = resyncFailures = 0;
+		budgetPops.clear();
+		budgetPops.reserve(200000);
+		budgetPopCount = 0;
+		budgetGateEvals = 0;
+		budgetGateWouldToggle = 0;
+		budgetMaxSpent = -1;
+		budgetPopsFull = false;
 		resyncMacro.clear();
 		lastGoodMacro.clear();
 		bestMacro.clear();
@@ -1849,6 +1920,15 @@ struct Solver {
 		bestPct = 0.f;
 		deaths = restores = steps = 0;
 	}
+
+	// Reserved once in clear(); the stepping path only ever push_back()s into
+	// the reserved capacity and stops recording when it is full.
+	std::vector<BudgetPop> budgetPops;
+	uint64_t               budgetPopCount = 0;
+	uint64_t               budgetGateEvals = 0;        // gate reached at all
+	uint64_t               budgetGateWouldToggle = 0;  // ...and the branch costs a toggle
+	int                    budgetMaxSpent = -1;        // highest `spent` ever seen
+	bool                   budgetPopsFull = false;
 
 	static Solver& get() { static Solver s; return s; }
 };
@@ -2110,6 +2190,113 @@ struct GoExplore {
 	static GoExplore& get() { static GoExplore g; return g; }
 };
 
+// A read-only census of the cells the DFS actually visits.
+//
+// It exists to settle one question BEFORE anything is built on the answer:
+// when the search stalls in a fake corridor, did it ever touch the other
+// corridors at all? An archive can only ever return a search to somewhere it
+// has already been. If every cell around the stall sits at a single height,
+// then an archive-backed restart has nowhere else to send it and would hand
+// back the same corridor forever - so it should not be built.
+//
+// Deliberately stores NO checkpoint. Capturing one is only ~12 us (Probe 5) and
+// would be affordable, but it would add thousands of live checkpoints to the
+// DFS and so perturb the very restore cost that is being measured separately.
+// What is stored is bands and counts, and nothing in the solver reads any of it
+// back, so this cannot change a single decision the search takes.
+//
+// Caveat worth knowing when reading a dump: reported x is corrupted for the ~95
+// steps of a mirror-portal camera flip (see Solver::PendingExtra::cameraFlip),
+// so a handful of wildly out-of-range x bands around a flip are an artifact of
+// the reporting, not places the player went.
+struct CellProbe {
+	struct Cell {
+		int32_t  xb = 0, yb = 0, vyb = 0;
+		uint32_t mode = 0, flags = 0;
+		uint64_t seen = 0;       // steps that landed in this cell
+		float    firstPct = 0.f;
+		int      firstStep = 0;
+	};
+	std::unordered_map<uint64_t, Cell> cells;
+	uint64_t recorded = 0;   // steps censused
+	uint64_t capped   = 0;   // new cells dropped because the map was full
+	uint64_t lastDump = 0;   // ticks, for throttling the file write
+
+	void clear() { cells.clear(); recorded = capped = 0; lastDump = 0; }
+	static CellProbe& get() { static CellProbe c; return c; }
+};
+
+// Write the census out. Called at stalls and at the end of a search, never
+// from the hot loop - this formats and does file I/O. Touches no player state,
+// so the key handler can call it too.
+void cellProbeDump(const char* why) {
+	auto& cp = CellProbe::get();
+	auto& sv = Solver::get();
+	if (!g_config.cellProbeEnabled || cp.cells.empty()) return;
+
+	// Collapse to x band -> y band -> visits. The y SPREAD inside the bands
+	// around the stall is the entire answer being sought: several occupied
+	// heights means the search did touch more than one corridor and an archive
+	// would have somewhere else to send it; one height means it never did, and
+	// a restart could only ever hand back the same corridor.
+	std::map<int32_t, std::map<int32_t, uint64_t>> byX;
+	std::map<int32_t, float> minPct;
+	for (auto const& kv : cp.cells) {
+		auto const& e = kv.second;
+		byX[e.xb][e.yb] += e.seen;
+		auto it = minPct.find(e.xb);
+		if (it == minPct.end() || e.firstPct < it->second) minPct[e.xb] = e.firstPct;
+	}
+
+	const std::string path = levelFilePath("cells.txt");
+	std::FILE* f = std::fopen(path.c_str(), "wb");
+	if (!f) return;
+	std::fprintf(f, "# gd-solver cell census (%s)\n", why);
+	std::fprintf(f, "# best %.2f%%  step %d  deaths %llu  escapes %llu\n",
+	             sv.bestPct, sv.step,
+	             static_cast<unsigned long long>(sv.deaths),
+	             static_cast<unsigned long long>(sv.escapes));
+	std::fprintf(f, "# cells %zu  steps censused %llu  dropped at cap %llu\n",
+	             cp.cells.size(),
+	             static_cast<unsigned long long>(cp.recorded),
+	             static_cast<unsigned long long>(cp.capped));
+	std::fprintf(f, "# cell size: x %.0f units, y %.0f units, vy %.2f (signed sqrt)\n",
+	             g_config.goCellX, g_config.goCellY, g_config.goCellVy);
+	std::fprintf(f,
+	    "#\n"
+	    "# One row per x band. `heights` is the number of DISTINCT y bands the\n"
+	    "# search ever occupied there, counting cells it entered once and then\n"
+	    "# abandoned. Across a fork, heights=1 means the search never saw the\n"
+	    "# alternative and an archive has nothing to offer it; heights>1 means\n"
+	    "# it did see one, and a restart has somewhere real to send it.\n"
+	    "#\n"
+	    "# ybands are band(visits); one band is %.0f units of height.\n"
+	    "#\n", g_config.goCellY);
+	std::fprintf(f, "# %-7s %-9s %-7s %-8s %s\n",
+	             "xband", "x", "pct", "heights", "ybands(visits)");
+	for (auto const& xk : byX) {
+		auto const& ys = xk.second;
+		const auto pit = minPct.find(xk.first);
+		std::fprintf(f, "%-9d %-9.0f %-7.2f %-8zu ",
+		             xk.first,
+		             static_cast<double>(xk.first) * g_config.goCellX,
+		             pit == minPct.end() ? 0.f : pit->second,
+		             ys.size());
+		int n = 0;
+		for (auto const& yk : ys) {
+			if (n++ == 16) { std::fprintf(f, "..."); break; }
+			std::fprintf(f, "%d(%llu) ", yk.first,
+			             static_cast<unsigned long long>(yk.second));
+		}
+		std::fputc('\n', f);
+	}
+	std::fclose(f);
+	log::info("Solver: cell census ({}) -> {}  |  {} cells over {} x bands from {} "
+	          "steps{}", why, path, cp.cells.size(), byX.size(), cp.recorded,
+	          cp.capped ? fmt::format(" ({} dropped at cap - census truncated)",
+	                                  cp.capped) : std::string());
+}
+
 // Write the furthest-reaching path, so a stall can be replayed and watched at
 // normal speed instead of diagnosed from death counts.
 void solverWriteBestMacro();
@@ -2133,6 +2320,37 @@ void solverWriteMacro(const char* name) {
 // Write the furthest-reaching path the search has found. When the solver stalls,
 // the counters say WHERE it stops but never WHY - this lets the best attempt be
 // replayed and watched at normal speed instead of inferred from death counts.
+void solverWriteBudgetPops(const char* why) {
+	auto& sv = Solver::get();
+	const std::string path = levelFilePath("budgetpops.txt");
+	std::FILE* f = std::fopen(path.c_str(), "wb");
+	if (!f) return;
+	std::fprintf(f, "# gd-solver toggle-budget gate refusals (%s)\n", why);
+	std::fprintf(f, "# %llu refusals, %zu recorded%s\n",
+	             static_cast<unsigned long long>(sv.budgetPopCount),
+	             sv.budgetPops.size(),
+	             sv.budgetPopsFull ? " (BUFFER FULL - truncated)" : "");
+	std::fprintf(f, "# gate evaluated %llu times, %llu of those on a toggling branch\n",
+	             static_cast<unsigned long long>(sv.budgetGateEvals),
+	             static_cast<unsigned long long>(sv.budgetGateWouldToggle));
+	std::fprintf(f, "# highest `spent` observed: %d (budget %d)\n",
+	             sv.budgetMaxSpent, g_config.toggleBudget);
+	std::fprintf(f, "# mode: 0=Ground 1=Hold 2=Tap\n");
+	std::fprintf(f, "# %-8s %-5s %-8s %-8s %-6s %-7s %-9s %s\n",
+	             "step", "mode", "tgBefore", "floorTg", "spent", "budget",
+	             "floorIdx", "stack");
+	for (auto const& b : sv.budgetPops) {
+		std::fprintf(f, "%-9d %-5d %-8d %-8d %-6d %-7d %-9d %d\n",
+		             b.step, b.mode, b.togglesBefore, b.floorToggles, b.spent,
+		             b.budget, b.floorIdx, b.stackSize);
+	}
+	std::fclose(f);
+	log::info("Solver: budget gate ({}) - {} refusals from {} evaluations ({} on a "
+	          "toggling branch), max spent {} against budget {} -> {}",
+	          why, sv.budgetPopCount, sv.budgetGateEvals, sv.budgetGateWouldToggle,
+	          sv.budgetMaxSpent, g_config.toggleBudget, path);
+}
+
 void solverWriteBestMacro() {
 	auto& sv = Solver::get();
 	if (sv.bestMacro.empty()) return;
@@ -2624,8 +2842,12 @@ void pollHotkeys() {
 		auto& sv = Solver::get();
 		if (sv.running) {
 			log::info("Solver: stopped by user at best {:.2f}%", sv.bestPct);
+			solverWriteBudgetPops("stopped");
 			solverWriteMacro("partial.txt");
 			solverWriteBestMacro();
+			// Snapshot the census on the way out: a run stopped by hand is the
+			// usual way a stall gets inspected, and the map dies with sv.clear().
+			cellProbeDump("stopped");
 			sv.clear();
 			st.mode = Mode::Idle;
 		} else if (PlayLayer::get()) {
@@ -2638,6 +2860,7 @@ void pollHotkeys() {
 			PlayLayer::get()->m_isPracticeMode = true;
 
 			sv.clear();
+			CellProbe::get().clear();
 			sv.running    = true;
 			sv.startTicks = probe::nowTicks();
 			sv.lastReport = sv.startTicks;
@@ -2662,6 +2885,10 @@ void pollHotkeys() {
 			sv.pathTrace.reserve(65536);
 			sv.pathTraceFull = false;
 
+			log::info("Solver: hybrid restore is {} - air decisions {} their own "
+			          "checkpoint. Plan 13.13.",
+			          g_config.hybridRestore ? "ON" : "OFF",
+			          g_config.hybridRestore ? "do NOT carry" : "carry");
 			log::info("Solver: starting DFS. air branch interval {} steps, "
 			          "release-before-hold ordering. F2 again to stop.",
 			          g_config.airBranchInterval);
@@ -4136,7 +4363,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// restore is exact in every mode (8/8), so that replay is pure cost:
 		// backtracking into a ship or UFO section is now O(1) instead of
 		// re-simulating the whole section. The price is ~22 KB per air decision.
-		if (!g_config.noSavestates) captureRestoreState(d.rs);
+		// Under hybridRestore an air decision is never restored to directly, so
+		// capturing one is ~22 KB and a createCheckpoint call wasted per decision
+		// - and air sections have by far the most decisions.
+		const bool needsCheckpoint = !g_config.noSavestates &&
+		                             !(g_config.hybridRestore && d.airPolicy);
+		if (needsCheckpoint) captureRestoreState(d.rs);
 		d.enteringHold  = sv.hold;
 		d.togglesBefore = d.airPolicy ? sv.togglesUsed : 0;
 
@@ -4947,14 +5179,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	// vertical velocity is included because arriving at the same point rising
 	// and falling are completely different situations, and collapsing them would
 	// throw away the distinction that decides whether a gap is clearable.
-	uint64_t goCellKey() {
+	CellCoords goCellCoords() {
+		CellCoords c{};
 		auto* p = m_player1;
-		if (!p) return 0;
-		struct Cell {
-			int32_t  x, y, vy;
-			uint32_t mode;
-			uint32_t flags;
-		} c{};
+		if (!p) return c;
 		c.x    = static_cast<int32_t>(std::floor(p->getPositionX() / std::max(1.0, g_config.goCellX)));
 		c.y    = static_cast<int32_t>(std::floor(p->getPositionY() / std::max(1.0, g_config.goCellY)));
 		{
@@ -4967,8 +5195,41 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (p->m_isUpsideDown) f |= 1u << 0;  // gravity direction changes everything
 		if (p->m_isOnGround)   f |= 1u << 1;
 		c.flags = f;
+		return c;
+	}
+
+	uint64_t goCellKey() {
+		if (!m_player1) return 0;
+		const CellCoords c = goCellCoords();
 		return probe::fnv1a(&c, sizeof(c));
 	}
+
+	// Census one step of the DFS. One hash and one map lookup; no checkpoint,
+	// no allocation past the map's own growth, and nothing read back.
+	void cellProbeRecord() {
+		if (!g_config.cellProbeEnabled) return;
+		auto* p  = m_player1;
+		auto* pl = PlayLayer::get();
+		if (!p || !pl || p->m_isDead) return;
+
+		auto& cp = CellProbe::get();
+		const CellCoords c = goCellCoords();
+		const uint64_t key = probe::fnv1a(&c, sizeof(c));
+		cp.recorded++;
+
+		auto it = cp.cells.find(key);
+		if (it != cp.cells.end()) { it->second.seen++; return; }
+		if (cp.cells.size() >= static_cast<size_t>(g_config.cellProbeCap)) { cp.capped++; return; }
+
+		CellProbe::Cell e;
+		e.xb = c.x; e.yb = c.y; e.vyb = c.vy;
+		e.mode = c.mode; e.flags = c.flags;
+		e.seen      = 1;
+		e.firstPct  = pl->getCurrentPercent();
+		e.firstStep = Solver::get().step;
+		cp.cells.emplace(key, e);
+	}
+
 
 	// Record the current state in the archive.
 	//
@@ -5374,9 +5635,42 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			return false;
 		}
 
-		// No checkpoint: only reachable with noSavestates set, or if
-		// createCheckpoint failed. Replay from frame 0 - needs no checkpoint at
-		// all, so it is always available and always exact.
+		// No checkpoint of its own. Prefer the nearest CUBE ancestor plus a
+		// forward replay: bounded by the air section rather than by the whole
+		// prefix, and exact by construction because it IS forward simulation.
+		if (g_config.hybridRestore && !g_config.noSavestates && !sv.stack.empty()) {
+			size_t ai = sv.stack.size() - 1;
+			bool found = false;
+			while (true) {
+				if (!sv.stack[ai].airPolicy && sv.stack[ai].rs.cp) { found = true; break; }
+				if (ai == 0) break;
+				ai--;
+			}
+			if (found) {
+				Decision& anchor = sv.stack[ai];
+				solverRestoreState(anchor);
+				sv.step = anchor.step;
+				// The trace has to rewind with the player, or the recorded
+				// trajectory and the actual one drift apart silently.
+				if (sv.pathTrace.size() > static_cast<size_t>(anchor.step))
+					sv.pathTrace.resize(static_cast<size_t>(anchor.step));
+				if (sv.step < d.step) {
+					sv.anchorReplaying    = true;
+					sv.anchorReplayTarget = d.step;
+					sv.anchorReplays++;
+					return true;
+				}
+				sv.hold         = sv.resumeHold;
+				sv.tapping      = sv.resumeTapping;
+				sv.tapRemaining = sv.resumeTap;
+				sv.togglesUsed  = sv.resumeToggles;
+				sv.lastBranch   = sv.resumeBranch;
+				return false;
+			}
+		}
+
+		// Last resort: replay from frame 0 - needs no checkpoint at all, so it is
+		// always available and always exact.
 		sv.resyncMacro.assign(sv.macro.begin(),
 			sv.macro.begin() + std::min<size_t>(d.step, sv.macro.size()));
 		sv.resyncTarget       = static_cast<int>(sv.resyncMacro.size());
@@ -5482,6 +5776,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			          sv.step, stepTo, deltaSteps, deltaSteps / 240.0);
 			log::info("  stack composition: {} air-policy, {} cube-policy of {} total",
 			          airCount, sv.stack.size() - airCount, sv.stack.size());
+
+			// The counters say the search is stuck; they cannot say whether it is
+			// stuck because it never SAW the alternative or because it saw one and
+			// walked away. The census can. Throttled - this writes a file.
+			{
+				auto& cpr = CellProbe::get();
+				const uint64_t nowT = probe::nowTicks();
+				if (probe::ticksToMicros(nowT - cpr.lastDump) > 30'000'000.0) {
+					cpr.lastDump = nowT;
+					cellProbeDump("stall");
+				}
+			}
 		}
 
 		// Stop at the committed prefix rather than the bottom of the stack.
@@ -5496,14 +5802,33 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// that toggles. Refuse it when the path is already at the toggle
 			// budget; the bound rises when the whole tree at this bound is done.
 			if (d.tried != 0b11 && d.airPolicy) {
+				sv.budgetGateEvals++;
 				const bool wouldToggle = decisionCost(d, !d.choice) > 0;
+				if (wouldToggle) sv.budgetGateWouldToggle++;
 				// Relative to the committed prefix: toggles spent inside a
 				// frozen, already-working prefix must not count against the
 				// budget for the part still being solved.
 				const int floorToggles = floor < sv.stack.size()
 				                       ? sv.stack[floor].togglesBefore : 0;
 				const int spent = d.togglesBefore - floorToggles;
+				if (spent > sv.budgetMaxSpent) sv.budgetMaxSpent = spent;
 				if (wouldToggle && spent >= g_config.toggleBudget) {
+					// Record BEFORE the pop: d is about to be destroyed.
+					sv.budgetPopCount++;
+					if (sv.budgetPops.size() < sv.budgetPops.capacity()) {
+						BudgetPop bp;
+						bp.step          = d.step;
+						bp.togglesBefore = d.togglesBefore;
+						bp.floorToggles  = floorToggles;
+						bp.spent         = spent;
+						bp.budget        = g_config.toggleBudget;
+						bp.floorIdx      = static_cast<int>(floor);
+						bp.stackSize     = static_cast<int>(sv.stack.size());
+						bp.mode          = static_cast<int>(d.modeClass);
+						sv.budgetPops.push_back(bp);
+					} else {
+						sv.budgetPopsFull = true;
+					}
 					releaseCheckpoint(d.rs.cp);
 					sv.stack.pop_back();
 					continue;
@@ -5553,9 +5878,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// GAME seconds plays back in a fraction of a wall-clock second. Game time
 		// and wall-clock time are not interchangeable here.
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
-		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
+		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
+		          "anchorReplays {}  ({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
 		          g_config.toggleBudget, sv.commitDepth, sv.lookbackSteps, sv.resyncs, sv.resyncFailures,
+		          CellProbe::get().cells.size(), sv.anchorReplays,
 		          stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
 	}
@@ -5711,6 +6038,80 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			return true;
 		}
 
+		// Anchor replay: walk the macro forward from the cube ancestor to the air
+		// decision being backtracked to. Structurally a resync bounded by the air
+		// section instead of by the whole prefix.
+		if (sv.anchorReplaying) {
+			const size_t idx = static_cast<size_t>(sv.step);
+			const bool pressed = idx < sv.macro.size() && sv.macro[idx] != 0;
+			applyInput(pressed);
+			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+			sv.step++;
+			sv.steps++;
+			solverRecordPath(pressed);
+
+			if (m_player1->m_isDead) {
+				// The replayed prefix should not die: it is the path that got
+				// here. If it does, the macro and the anchor disagree, which is
+				// a real defect - fall back to a frame-0 replay rather than
+				// leaving a dead player for the next step to trip over.
+				log::warn("Solver: anchor replay died at step {} (target {}) - macro "
+				          "and anchor disagree. Falling back to a frame-0 replay.",
+				          sv.step, sv.anchorReplayTarget);
+				sv.anchorReplaying = false;
+				sv.resyncMacro.assign(sv.macro.begin(),
+					sv.macro.begin() + std::min<size_t>(sv.anchorReplayTarget,
+					                                    sv.macro.size()));
+				sv.resyncTarget       = static_cast<int>(sv.resyncMacro.size());
+				sv.resyncing          = true;
+				sv.resyncForBacktrack = true;
+				sv.step               = 0;
+				sv.hold               = false;
+				sv.replayBacktracks++;
+				ProbeState::get().resetPending = true;
+				return true;
+			}
+
+			if (sv.step >= sv.anchorReplayTarget) {
+				sv.anchorReplaying = false;
+				sv.hold         = sv.resumeHold;
+				sv.togglesUsed  = sv.resumeToggles;
+				sv.lastBranch   = sv.resumeBranch;
+				sv.macro.resize(static_cast<size_t>(sv.step), 0);
+
+				// tapping/tapRemaining are deliberately NOT restored here, and
+				// that is the whole difference between 78.90% and 32.49%.
+				//
+				// My first port of this block restored them, which reads as the
+				// obviously correct thing to do - and it silently changed the
+				// search. Restoring resumeTap sets tapRemaining to
+				// tapLengthSteps, so sv.hold self-releases after 2 steps.
+				// Leaving it stale (almost always 0) means the countdown in
+				// solverStep never fires, so sv.hold = resumeHold survives the
+				// full 4-step branch interval to the next push.
+				//
+				// That matters because of decisionCost's asymmetry:
+				//   Tap: return choice ? 1 : 0
+				// A Tap decision pushed while sv.hold is TRUE gets choice=true,
+				// so its untried alternative (no tap) costs ZERO and the toggle
+				// budget never gates it. Pushed while hold is false, the
+				// alternative is a tap, costs 1, and is refused the moment the
+				// budget is spent.
+				//
+				// MEASURED, same level, same 5243 identical gate refusals up to
+				// the split: 30fe2b7 evaluated the gate 22675 times with 1756
+				// (7.7%) on a FREE alternative and never exhausted budget 3;
+				// this build with the restore in place evaluated 67995 times
+				// with 3 free, exhausted budget 3, and stalled. Plan 13.13.
+				//
+				// This is a bug that happens to help. The principled version is
+				// to order Tap decisions by whether a tap is needed - which sets
+				// choice=true on purpose and makes the fallback free by the same
+				// cost rule - and that is the next change, not this one.
+			}
+			return true;
+		}
+
 		// A restore is supposed to revive the player. If GD instead requires
 		// its respawn sequence, the search would stall here forever - so say so
 		// loudly once rather than spinning silently.
@@ -5781,6 +6182,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			log::info("  {} resyncs ({} failed) - prefix re-derived from frame 0 without "
 			          "savestates {} time(s)", sv.resyncs, sv.resyncFailures, sv.resyncs);
 			solverWriteMacro("solution.txt");
+			cellProbeDump("solved");
 
 			// Hand the winning trajectory to the verifier. Done here, outside the
 			// stepping path, so the copy costs nothing that matters.
@@ -5840,6 +6242,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				if (g_config.toggleBudget < g_config.maxToggleBudget) {
 					g_config.toggleBudget++;
 					solverReport(true);
+					solverWriteBudgetPops("deepen");
 					log::info("Solver: exhausted every path with <= {} air toggles above "
 					          "the committed prefix (depth {}) at {:.2f}%. Deepening to {}.",
 					          g_config.toggleBudget - 1, sv.commitDepth, sv.bestPct,
@@ -5870,12 +6273,19 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					solverReport(true);
 					log::error("Solver: EXHAUSTED at best {:.2f}% up to {} air toggles.",
 					           sv.bestPct, g_config.maxToggleBudget);
+					cellProbeDump("exhausted");
 					sv.clear();
 					ProbeState::get().mode = Mode::Idle;
 				}
 			}
 			return false;
 		}
+
+		// Census where the search has been. Read-only - see CellProbe. Placed
+		// after the death check so a dead frame is never counted as a place the
+		// player reached, and after the resync early-return so the census covers
+		// search steps only, not prefix replay.
+		cellProbeRecord();
 
 		auto* p = m_player1;
 		const ModeClass mc = classifyMode(p);
