@@ -260,6 +260,30 @@ struct Config {
 	// measure that directly - if the fraction is near 1.0, raise this.
 	double tapNeedFallSpeed = 0.0;
 
+	// Probe 7: read the level's own geometry.
+	//
+	// Every search change this session aimed at a target I had INFERRED from the
+	// cell census, and the census only records where the solver went - it cannot
+	// show where the level is open. Four of those inferences were wrong. This
+	// reads the objects directly, so the corridor map is measured.
+	//
+	// GD classifies its own objects: GameObject::getType() returns a
+	// GameObjectType - Solid=0, Hazard=2, Decoration=7, Breakable=21, Slope=25,
+	// AnimatedHazard=47, and every portal/pad/ring named individually. So there
+	// is no objectID table to maintain and no heuristic to get wrong; the game
+	// is the authority on what a block is. getObjectRect() gives an axis-aligned
+	// hitbox (getOrientedBox() exists for rotated objects if that ever matters).
+	//
+	// Bucketed into the SAME 60x30 bands as the cell census, so "where the level
+	// is open" and "where the solver has been" overlay directly.
+	//
+	// Reading only. Nothing here influences a search decision - that comes later
+	// and starts as move ORDERING, never pruning, because a misclassified object
+	// used for pruning deletes a viable route and nothing reports it.
+	int geomXMin = 18000;   // units; the region around ToE's third corridor set
+	int geomXMax = 21000;
+	bool geomDumpObjects = true;  // also write the raw per-object list
+
 	// Probe 6: the corridor sweep.
 	//
 	// Theory of Everything's third fake-corridor section is three two-block gaps
@@ -2565,6 +2589,119 @@ void solverWriteMacro(const char* name) {
 // Write the furthest-reaching path the search has found. When the solver stalls,
 // the counters say WHERE it stops but never WHY - this lets the best attempt be
 // replayed and watched at normal speed instead of inferred from death counts.
+// Probe 7. One pass over the level's objects, bucketed into census bands.
+void geometryDump() {
+	auto* gl = GJBaseGameLayer::get();
+	if (!gl || !gl->m_objects) { log::error("Probe 7: no level objects"); return; }
+
+	const double xb = std::max(1.0, g_config.goCellX);
+	const double yb = std::max(1.0, g_config.goCellY);
+
+	// band -> what occupies it. Hazard wins the display: a band that is both is
+	// lethal, and that is the fact that matters to a route.
+	std::map<std::pair<int,int>, char> grid;
+	std::map<int, int> typeCount;
+	int scanned = 0, inRange = 0;
+
+	std::string objPath = levelFilePath("geometry_objects.txt");
+	std::FILE* fo = g_config.geomDumpObjects ? std::fopen(objPath.c_str(), "wb") : nullptr;
+	if (fo) std::fprintf(fo, "# %-9s %-9s %-9s %-9s %-6s %-6s %s\n",
+	                     "x", "y", "w", "h", "type", "objID", "class");
+
+	auto* arr = gl->m_objects;
+	for (unsigned int i = 0; i < arr->count(); i++) {
+		auto* o = static_cast<GameObject*>(arr->objectAtIndex(i));
+		if (!o) continue;
+		scanned++;
+
+		const int t = static_cast<int>(o->getType());
+		typeCount[t]++;
+
+		// Decoration has no collision, so it is not part of the route problem.
+		const bool solid  = t == static_cast<int>(GameObjectType::Solid) ||
+		                    t == static_cast<int>(GameObjectType::Slope) ||
+		                    t == static_cast<int>(GameObjectType::Breakable);
+		const bool hazard = t == static_cast<int>(GameObjectType::Hazard) ||
+		                    t == static_cast<int>(GameObjectType::AnimatedHazard);
+		if (!solid && !hazard) continue;
+
+		const cocos2d::CCRect r = o->getObjectRect();
+		if (r.getMaxX() < g_config.geomXMin || r.getMinX() > g_config.geomXMax) continue;
+		inRange++;
+
+		if (fo) std::fprintf(fo, "%-11.2f %-9.2f %-9.2f %-9.2f %-6d %-6d %s\n",
+		                     r.getMinX(), r.getMinY(), r.size.width, r.size.height,
+		                     t, o->m_objectID, hazard ? "HAZARD" : "solid");
+
+		const int x0 = static_cast<int>(std::floor(r.getMinX() / xb));
+		const int x1 = static_cast<int>(std::floor(r.getMaxX() / xb));
+		const int y0 = static_cast<int>(std::floor(r.getMinY() / yb));
+		const int y1 = static_cast<int>(std::floor(r.getMaxY() / yb));
+		for (int x = x0; x <= x1; x++) {
+			for (int y = y0; y <= y1; y++) {
+				char& c = grid[{x, y}];
+				if (hazard || c == 0) c = hazard ? 'H' : 'S';
+			}
+		}
+	}
+	if (fo) std::fclose(fo);
+
+	if (grid.empty()) {
+		log::warn("Probe 7: {} objects scanned, none solid or hazardous in x {}..{}",
+		          scanned, g_config.geomXMin, g_config.geomXMax);
+		return;
+	}
+
+	int xlo = INT_MAX, xhi = INT_MIN, ylo = INT_MAX, yhi = INT_MIN;
+	for (auto const& kv : grid) {
+		xlo = std::min(xlo, kv.first.first);  xhi = std::max(xhi, kv.first.first);
+		ylo = std::min(ylo, kv.first.second); yhi = std::max(yhi, kv.first.second);
+	}
+
+	const std::string path = levelFilePath("geometry.txt");
+	std::FILE* f = std::fopen(path.c_str(), "wb");
+	if (!f) { log::error("Probe 7: cannot write {}", path); return; }
+
+	std::fprintf(f, "# gd-solver level geometry (Probe 7)\n");
+	std::fprintf(f, "# %d objects scanned, %d solid/hazard in x %d..%d\n",
+	             scanned, inRange, g_config.geomXMin, g_config.geomXMax);
+	std::fprintf(f, "# bands: x %.0f units, y %.0f units - the SAME bands as the cell "
+	                "census, so the two overlay\n", xb, yb);
+	std::fprintf(f, "# S = solid, H = hazard, . = OPEN (a route can pass through)\n");
+	std::fprintf(f, "# y bands %d..%d increase upward; each row is one x band\n#\n", ylo, yhi);
+
+	std::fprintf(f, "# %-7s %-9s %-7s ", "xband", "x", "pct");
+	for (int y = yhi; y >= ylo; y--) std::fprintf(f, "%d", std::abs(y) % 10);
+	std::fprintf(f, "  (y%d down to y%d)\n", yhi, ylo);
+
+	auto* pl = PlayLayer::get();
+	const double len = (pl && pl->m_levelLength > 1.f) ? pl->m_levelLength : 0.0;
+	for (int x = xlo; x <= xhi; x++) {
+		const double xu = x * xb;
+		std::fprintf(f, "%-9d %-9.0f %-7.2f ", x, xu,
+		             len > 0.0 ? (xu / len) * 100.0 : 0.0);
+		for (int y = yhi; y >= ylo; y--) {
+			auto it = grid.find({x, y});
+			std::fputc(it == grid.end() ? '.' : it->second, f);
+		}
+		std::fputc('\n', f);
+	}
+	std::fclose(f);
+
+	log::info("Probe 7: {} objects scanned, {} solid/hazard in x {}..{}. "
+	          "x bands {}..{}, y bands {}..{}.",
+	          scanned, inRange, g_config.geomXMin, g_config.geomXMax,
+	          xlo, xhi, ylo, yhi);
+	std::string types;
+	for (auto const& kv : typeCount) {
+		if (!types.empty()) types += " ";
+		types += std::to_string(kv.first) + ":" + std::to_string(kv.second);
+	}
+	log::info("  object types present (type:count) - {}", types);
+	log::info("  map -> {}", path);
+	if (g_config.geomDumpObjects) log::info("  raw objects -> {}", objPath);
+}
+
 void sweepWriteResults() {
 	auto& sw = Sweep::get();
 	const std::string path = levelFilePath("sweep.txt");
@@ -3118,6 +3255,13 @@ void pollHotkeys() {
 			log::info("Go-Explore: starting. F3 again to stop, F4 verifies a finished "
 			          "solution, F9 replays the best path so far.");
 		}
+	}
+
+	// G = dump level geometry (Probe 7). Read-only: no search state is touched,
+	// so this is safe to press at any time, including mid-solve.
+	if (keyPressedEdge('G')) {
+		if (PlayLayer::get()) geometryDump();
+		else log::warn("Probe 7: not in a level");
 	}
 
 	// C = corridor sweep (Probe 6). A letter because every F key is taken.
