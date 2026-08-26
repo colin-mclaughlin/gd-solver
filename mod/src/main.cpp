@@ -1918,7 +1918,19 @@ struct Solver {
 		anchorReleased = false;
 		escapesAtMaxWindow = 0;
 		bestPct = 0.f;
-		deaths = restores = steps = 0;
+		// escapes MUST reset with the rest. It is not just a counter: the
+		// widening gate reads `escapes - escapesAtWiden >= escapesBeforeWidening`,
+		// and escapesAtWiden resets here while escapes did not - so the SECOND
+		// level solved in a session inherited a nonzero escape count against a
+		// zeroed baseline and widened its mutable window on the first stall,
+		// however well the search was actually doing.
+		//
+		// MEASURED: Clutterfunk's first report of a run reads `escapes 25` at 80
+		// deaths, inherited from the Time Machine solve before it. It did not
+		// bite there only because Clutterfunk never stalled, so the gate never
+		// ran. Any level that runs later in a session AND stalls was searching
+		// a different shape than the same level run first.
+		deaths = restores = steps = escapes = 0;
 	}
 
 	// Reserved once in clear(); the stepping path only ever push_back()s into
