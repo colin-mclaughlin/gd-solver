@@ -260,6 +260,49 @@ struct Config {
 	// measure that directly - if the fraction is near 1.0, raise this.
 	double tapNeedFallSpeed = 0.0;
 
+	// Probe 6: the corridor sweep.
+	//
+	// Theory of Everything's third fake-corridor section is three two-block gaps
+	// separated by one-block floors. MEASURED from the cell census over the last
+	// ten x bands before the 78.90% wall: y32 13545 visits, y33 49267, y34 8285,
+	// y35 41469, y36 20261, and y37 AND ABOVE EXACTLY ZERO. Against the corridor
+	// model - bottom y32-33 | floor y34 | middle y35-36 | floor y37 | top y38-39
+	// - the search lives in the bottom and middle and has never once been in the
+	// top, which is the one that continues.
+	//
+	// Two independent claims sit behind a fix, and this probe tests only the
+	// first: (1) a UFO that IS in y38-39 through that section survives and goes
+	// past 78.90%; (2) the reason it never gets there is that the deciding
+	// decision is frozen below the commit floor. Building the search change
+	// while (1) is unverified risks solving the wrong problem, so this replays
+	// the known 78.90% macro with a climb forced into it and reports how high it
+	// reached - no savestates, no restores, no search.
+	//
+	// The step numbers here are LEVEL-SPECIFIC and that is deliberate: this is a
+	// diagnostic, run once and removed. Nothing level-specific goes anywhere
+	// near the solver's decisions.
+	// Search forward from a verified prefix WITH savestates.
+	//
+	// That path forced noSavestates because a restore was not trusted to be
+	// exact, so every branch replayed from frame 0 - 15,113 steps each on
+	// Theory of Everything, about 1.3 branches per second, which is why it was
+	// never usable. The distrust is obsolete: Probe 4b reports CUBE 5/5 and AIR
+	// 3/3 bit-identical, a full Stereo Madness solve replays with zero diverging
+	// steps out of 20,330, and both regression levels searched a BIT-IDENTICAL
+	// tree under two different restore mechanisms. With savestates the same
+	// search runs at ~100 branches/s.
+	//
+	// The result is still verified the same way - a macro only counts if it
+	// replays clean from frame 0 - so this trades an exactness belt for the
+	// braces we already measure.
+	bool   verifiedPrefixSavestates = true;
+
+	int    sweepStepBase   = 15100; // first injection step S
+	int    sweepStepStride = 100;   // S increments by this
+	int    sweepStepCount  = 4;     // how many S values
+	int    sweepMaxTaps    = 8;     // k = 0..this
+	double sweepCorridorX  = 20160.0; // x band 336, 77.98% - the corridor proper
+
 	// Census of the cells the DFS visits. Read-only: it records bands and counts
 	// and nothing reads them back, so it cannot alter a decision the search
 	// makes. Its only cost is one hash and one map lookup per step.
@@ -520,6 +563,8 @@ enum class Mode {
 	Beam,         // deduplicated width-K beam search over the same action space
 	GoExplore,    // archive of cells; return to one, then explore from it
 	Verify,       // replay a found macro from frame 0, no savestates, no practice
+	Sweep,        // Probe 6: replay best.txt with a forced climb injected, and
+	              // report how high it got - geometry, with no search involved
 };
 
 // Which save/restore mechanism the restore test exercises.
@@ -2358,6 +2403,57 @@ struct GoExplore {
 // steps of a mirror-portal camera flip (see Solver::PendingExtra::cameraFlip),
 // so a handful of wildly out-of-range x bands around a flip are an artifact of
 // the reporting, not places the player went.
+// Probe 6 state. One replay per (S, k) variant, back to back at solver speed.
+struct Sweep {
+	static Sweep& get() { static Sweep s; return s; }
+
+	std::vector<uint8_t> base;   // best.txt as loaded
+	std::vector<uint8_t> macro;  // base with this variant's climb injected
+
+	struct Result {
+		int   S, k, endStep, maxY;
+		float pct;
+		bool  died, cleared;
+	};
+	std::vector<Result> results;
+
+	int   variant = 0;
+	int   step    = 0;
+	float bestPct = 0.f;
+	int   maxY    = -9999;   // highest y band seen at x >= sweepCorridorX
+	bool  running = false;
+
+	int variantCount() const {
+		return g_config.sweepStepCount * (g_config.sweepMaxTaps + 1);
+	}
+	int variantS() const {
+		return g_config.sweepStepBase +
+		       (variant / (g_config.sweepMaxTaps + 1)) * g_config.sweepStepStride;
+	}
+	int variantK() const { return variant % (g_config.sweepMaxTaps + 1); }
+
+	void clear() {
+		base.clear(); macro.clear(); results.clear();
+		variant = 0; step = 0; bestPct = 0.f; maxY = -9999; running = false;
+	}
+};
+
+// Build the current variant's macro: k taps from step S, each a 2-step press
+// followed by a 2-step release, on the same 4-step cadence the solver branches
+// on. Everything outside the injected window is the 78.90% macro untouched.
+void sweepBuildMacro() {
+	auto& sw = Sweep::get();
+	sw.macro = sw.base;
+	const int S = sw.variantS();
+	const int k = sw.variantK();
+	for (int i = 0; i < k; i++) {
+		const size_t a = static_cast<size_t>(S + i * 4);
+		if (a + 3 >= sw.macro.size()) break;
+		sw.macro[a] = 1; sw.macro[a + 1] = 1;
+		sw.macro[a + 2] = 0; sw.macro[a + 3] = 0;
+	}
+}
+
 struct CellProbe {
 	struct Cell {
 		int32_t  xb = 0, yb = 0, vyb = 0;
@@ -2469,6 +2565,48 @@ void solverWriteMacro(const char* name) {
 // Write the furthest-reaching path the search has found. When the solver stalls,
 // the counters say WHERE it stops but never WHY - this lets the best attempt be
 // replayed and watched at normal speed instead of inferred from death counts.
+void sweepWriteResults() {
+	auto& sw = Sweep::get();
+	const std::string path = levelFilePath("sweep.txt");
+	std::FILE* f = std::fopen(path.c_str(), "wb");
+
+	log::info("Probe 6: corridor sweep complete - {} variants.", sw.results.size());
+	log::info("  maxY is the highest y band reached at x >= {:.0f}. Corridor model:"
+	          " bottom y32-33 | floor y34 | middle y35-36 | floor y37 | TOP y38-39.",
+	          g_config.sweepCorridorX);
+	log::info("  %-7s %-4s %-8s %-6s %-9s %s", "S", "k", "pct", "maxY", "endStep", "how");
+
+	if (f) {
+		std::fprintf(f, "# gd-solver corridor sweep (Probe 6)\n");
+		std::fprintf(f, "# maxY = highest y band at x >= %.0f\n", g_config.sweepCorridorX);
+		std::fprintf(f, "# corridor model: bottom 32-33 | floor 34 | middle 35-36 | "
+		                "floor 37 | TOP 38-39\n");
+		std::fprintf(f, "# %-7s %-4s %-8s %-6s %-9s %s\n",
+		             "S", "k", "pct", "maxY", "endStep", "how");
+	}
+
+	int bestIdx = -1;
+	for (size_t i = 0; i < sw.results.size(); i++) {
+		auto const& r = sw.results[i];
+		const char* how = r.cleared ? "CLEARED" : (r.died ? "died" : "macro end");
+		log::info("  {:<7} {:<4} {:<8.2f} {:<6} {:<9} {}",
+		          r.S, r.k, r.pct, r.maxY, r.endStep, how);
+		if (f) std::fprintf(f, "%-9d %-4d %-8.2f %-6d %-9d %s\n",
+		                    r.S, r.k, r.pct, r.maxY, r.endStep, how);
+		if (bestIdx < 0 || r.pct > sw.results[bestIdx].pct) bestIdx = static_cast<int>(i);
+	}
+	if (f) std::fclose(f);
+
+	if (bestIdx >= 0) {
+		auto const& b = sw.results[bestIdx];
+		log::info("  best: S {} k {} reached {:.2f}% with maxY {} -> {}", b.S, b.k, b.pct,
+		          b.maxY,
+		          b.maxY >= 38 ? "REACHED THE TOP CORRIDOR (y38+)"
+		                       : "never left the bottom/middle - no variant reached y38");
+	}
+	log::info("  written to {}", path);
+}
+
 void solverWriteBudgetPops(const char* why) {
 	auto& sv = Solver::get();
 	const std::string path = levelFilePath("budgetpops.txt");
@@ -2982,6 +3120,37 @@ void pollHotkeys() {
 		}
 	}
 
+	// C = corridor sweep (Probe 6). A letter because every F key is taken.
+	if (keyPressedEdge('C')) {
+		auto& sw = Sweep::get();
+		auto& st = ProbeState::get();
+		if (sw.running) {
+			log::info("Probe 6: stopped by user after {} variants.", sw.results.size());
+			if (!sw.results.empty()) sweepWriteResults();
+			sw.clear();
+			st.mode = Mode::Idle;
+		} else if (PlayLayer::get()) {
+			bool fix = false;
+			sw.clear();
+			if (!loadMacroFile(levelFilePath("best.txt"), sw.base, &fix) || sw.base.empty()) {
+				log::error("Probe 6: no best.txt to sweep - run a solve first.");
+				return;
+			}
+			g_config.physicsFix = fix;
+			PlayLayer::get()->m_isPracticeMode = false;  // geometry, not search
+			sweepBuildMacro();
+			sw.running = true;
+			st.mode    = Mode::Sweep;
+			st.resetPending = true;
+			log::info("Probe 6: corridor sweep over {} variants - S {}..{} step {}, "
+			          "k 0..{} taps. Base macro {} steps. C again to stop.",
+			          sw.variantCount(), g_config.sweepStepBase,
+			          g_config.sweepStepBase +
+			              (g_config.sweepStepCount - 1) * g_config.sweepStepStride,
+			          g_config.sweepStepStride, g_config.sweepMaxTaps, sw.base.size());
+		}
+	}
+
 	if (keyPressedEdge(VK_F8)) {
 		g_config.resyncEnabled = !g_config.resyncEnabled;
 		log::info("Solver: periodic resync {}", g_config.resyncEnabled ? "ENABLED" : "disabled");
@@ -3022,10 +3191,13 @@ void pollHotkeys() {
 				sv.resyncing    = true;
 				sv.step         = 0;
 				sv.hold         = false;
-				g_config.noSavestates = true;
-				log::info("Solver: starting from a VERIFIED prefix of {} steps. Searching "
-				          "forward WITHOUT savestates - every branch replays from frame 0, "
-				          "so the result is exact by construction.", sv.resyncTarget);
+				g_config.noSavestates = !g_config.verifiedPrefixSavestates;
+				log::info("Solver: starting from a VERIFIED prefix of {} steps, searching "
+				          "forward {}.", sv.resyncTarget,
+				          g_config.verifiedPrefixSavestates
+				            ? "with savestates (~100 branches/s; restores measured exact "
+				              "in every mode, and the macro is still verified from frame 0)"
+				            : "WITHOUT savestates - every branch replays from frame 0");
 			}
 			// Preallocated once, here, so nothing in the stepping path ever
 			// reallocates. 64k rows covers every main level with room to spare
@@ -5391,6 +5563,55 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 	// Census one step of the DFS. One hash and one map lookup; no checkpoint,
 	// no allocation past the map's own growth, and nothing read back.
+	// One step of the corridor sweep. Returns false when the variant is over,
+	// which is also when the reset for the next one is queued.
+	bool sweepStep() {
+		auto& sw = Sweep::get();
+		auto& st = ProbeState::get();
+		auto* pl = PlayLayer::get();
+		if (!pl || !m_player1) return false;
+
+		const bool dead    = m_player1->m_isDead;
+		const bool ranOut  = sw.step >= static_cast<int>(sw.macro.size());
+		if (st.finished || dead || ranOut) {
+			Sweep::Result r{};
+			r.S       = sw.variantS();
+			r.k       = sw.variantK();
+			r.endStep = sw.step;
+			r.maxY    = sw.maxY;
+			r.pct     = sw.bestPct;
+			r.died    = dead;
+			r.cleared = st.finished;
+			sw.results.push_back(r);
+
+			sw.variant++;
+			if (sw.variant >= sw.variantCount()) {
+				sw.running = false;
+				st.mode    = Mode::Idle;
+				sweepWriteResults();
+				return false;
+			}
+			sweepBuildMacro();
+			sw.step = 0; sw.bestPct = 0.f; sw.maxY = -9999;
+			st.resetPending = true;
+			return false;
+		}
+
+		const bool pressed = sw.macro[static_cast<size_t>(sw.step)] != 0;
+		applyInput(pressed);
+		GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+		sw.step++;
+
+		const float pct = pl->getCurrentPercent();
+		if (pct > sw.bestPct) sw.bestPct = pct;
+		if (m_player1->getPositionX() >= g_config.sweepCorridorX) {
+			const int yb = static_cast<int>(
+				std::floor(m_player1->getPositionY() / std::max(1.0, g_config.goCellY)));
+			if (yb > sw.maxY) sw.maxY = yb;
+		}
+		return true;
+	}
+
 	void cellProbeRecord() {
 		if (!g_config.cellProbeEnabled) return;
 		auto* p  = m_player1;
@@ -6613,8 +6834,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// Go-Explore spends most of its time with a dead player too: an episode
 		// ending in death is the normal outcome, and the next return revives it.
 		const bool going   = st.mode == Mode::GoExplore && GoExplore::get().running;
+		// Same reason as the searches: a variant that dies is the normal
+		// outcome, and the sweep has to keep running to record it and reset.
+		const bool sweeping = st.mode == Mode::Sweep && Sweep::get().running;
 		const bool active  = pl && m_player1 &&
-		                     (solving || beaming || going ||
+		                     (solving || beaming || going || sweeping ||
 		                      (!m_player1->m_isDead && !st.finished));
 
 		if (st.mode == Mode::Idle || !active) {
@@ -6684,6 +6908,19 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					             pl->getCurrentPercent());
 					return;
 				}
+			}
+			return;
+		}
+
+		// Same frame-budget loop as the solver: the sweep is ~36 full replays and
+		// would take twenty minutes at real-time pace.
+		if (st.mode == Mode::Sweep) {
+			auto& sw = Sweep::get();
+			const uint64_t frameStart = probe::nowTicks();
+			while (sw.running) {
+				if (!sweepStep()) break;
+				if (probe::ticksToMicros(probe::nowTicks() - frameStart) > kSolverFrameBudgetUs)
+					break;
 			}
 			return;
 		}
