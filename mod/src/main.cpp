@@ -302,6 +302,56 @@ struct Config {
 	// pruning them.
 	bool deadEndProbe = true;
 
+	// Slice width for the interval map. 30 units is the level's own block grid,
+	// which is as fine as the geometry itself.
+	int geomSliceX = 30;
+
+	// The height a gap must have to count as passable. Deliberately the SMALLEST
+	// player hitbox (mini), so the map is permissive and can never reject a gap
+	// some mode would fit through. Per-mode height needs portal positions to
+	// know which mode is active at a given x - a clean follow-up, not this pass.
+	int geomPlayerHeight = 15;
+
+	// Treat entering a dead cell as a death.
+	//
+	// This is the first time geometry touches a search decision, and it is a
+	// PRUNE, which the ordering-before-pruning rule says to avoid. It earns the
+	// exception because the map's error is one-directional: the sweep lets the
+	// player move freely inside a column, so it over-estimates reachability and
+	// under-reports dead space. A cell it marks dead has no forward route under
+	// any physics.
+	//
+	// The point is not the saved simulation. It is WHERE the search backtracks.
+	// Today the bottom corridor is entered at band 335 and kills the player at
+	// band 340, ~240 steps later; the commit floor sits 240 steps behind the
+	// frontier, so by the time the death is recorded the entry decision is
+	// frozen and cannot be retried. Detecting it at band 335 puts the death AT
+	// the entry, which is exactly the decision that needs to change.
+	//
+	// If the map is ever wrong, this deletes a viable route silently - so it is
+	// flagged, counted, and reported.
+	// MEASURED and REVERTED: Theory of Everything went 78.90%% -> 6.27%%, with
+	// 12566 of 45966 deaths called by the map at one x (1620.2, band 27) in
+	// ordinary cube gameplay the solver has crossed thousands of times.
+	//
+	// The cause is resolution, not the idea. Occupancy is per 60x30 cell and a
+	// cell is marked lethal if ANY hazard touches it - but 199 of this level'''s
+	// 257 hazards are 9x7.2 spikes, 3.6%% of a cell. Every spike blankets 28x its
+	// own area, vertical runs terminate that actually continue, and the dead
+	// region cascades left. The corridor result was right by luck of scale: the
+	// four saws there are 44x85 and genuinely fill their cells.
+	//
+	// It also broke my own rule - ordering before pruning - and the failure mode
+	// was exactly the one that rule exists to prevent: routes deleted silently,
+	// visible only as "the search got worse".
+	//
+	// The fix is not a finer grid. At 7.5 units a column is ~6 physics steps and
+	// free vertical movement inside it stops being a safe over-estimate. What
+	// this needs is per-column FREE INTERVALS computed from real object rects
+	// against the player'''s own hitbox height, propagated with physics-bounded
+	// vertical reach - the reachable-interval build, not a bucketed grid.
+	bool geometryDeadPrune = false;
+
 	int geomXMin = 18000;   // units; the region around ToE's third corridor set
 	int geomXMax = 21000;
 	bool geomDumpObjects = true;  // also write the raw per-object list
@@ -2010,6 +2060,7 @@ struct Solver {
 	int                   bestStep     = 0; // solver step at which bestPct was reached
 	uint64_t              deathsAtBest = 0;
 	uint64_t              escapes      = 0;
+	uint64_t              geoDeaths    = 0;   // deaths called by the geometry map
 
 	// How often the tap-ordering rule fires, split by gravity direction. The
 	// point is to catch over-tapping from the FIRST report line rather than by
@@ -2158,6 +2209,7 @@ struct Solver {
 		// ran. Any level that runs later in a session AND stalls was searching
 		// a different shape than the same level run first.
 		deaths = restores = steps = escapes = 0;
+		geoDeaths = 0;
 		tapDecisions = tapFirstChosen = 0;
 	}
 
@@ -2731,20 +2783,73 @@ void geometryDump() {
 	if (g_config.geomDumpObjects) log::info("  raw objects -> {}", objPath);
 }
 
-// Probe 8. Occupancy over the WHOLE level, then a backward flood fill.
-void deadEndDump() {
+// The level's geometry as FREE INTERVALS, shared by the probe and the solver.
+//
+// The previous version bucketed object rects into 60x30 cells and marked a cell
+// lethal if any hazard touched it. MEASURED CONSEQUENCE: 199 of this level's 257
+// hazards are 9x7.2 spikes - 3.6% of a cell - so every spike blanketed 28x its
+// own area, vertical runs terminated that actually continue, and Theory of
+// Everything collapsed 78.90% -> 6.27% with 12,566 deaths called by the map at
+// one x in ordinary cube gameplay.
+//
+// So: no buckets. Per x slice, the real rects give blocked y intervals; the
+// complement is the free intervals. A 7.2-tall spike blocks 7.2 units.
+//
+// The forward sweep then needs NO physics assumption at all. Free interval I at
+// slice x is live if some live interval J at slice x+1 overlaps it by at least
+// the player's height: then the player crosses the boundary without moving
+// vertically. If they do not overlap, crossing means passing through a solid,
+// which is impossible under any physics. Intervals are maximal by construction,
+// so the "free vertical movement inside a column" fudge disappears.
+//
+// The map can only ever prove DEADNESS, never liveness: open geometry is
+// necessary for a route but not sufficient - a corridor can be open and still
+// impossible for a UFO to hold. That one-way implication is what makes it safe,
+// and it only holds while blocked regions are not inflated.
+struct GeoMap {
+	static GeoMap& get() { static GeoMap m; return m; }
+
+	struct Span { float lo, hi; uint8_t type; };      // 1 solid, 2 hazard
+	struct Free { float lo, hi; bool live; };
+
+	int    sx0 = 0, sx1 = -1;      // slice index range
+	double sw  = 30.0;             // slice width in units
+	double yLo = 0.0, yHi = 0.0;   // vertical bounds of the playable region
+	double playerH = 15.0;         // smallest hitbox height: permissive
+	std::vector<std::vector<Span>> blocked;
+	std::vector<std::vector<Free>> freeSpans;
+	int  freeCount = 0, deadCount = 0;
+	bool valid = false;
+
+	int sliceOf(double x) const { return static_cast<int>(std::floor(x / sw)); }
+	bool inRange(int si) const { return valid && si >= sx0 && si <= sx1; }
+
+	// True only for OPEN space with no forward route. Blocked space returns
+	// false: the simulation already handles walls, and claiming them here would
+	// confuse "there is no route" with "there is a wall".
+	bool isDead(double x, double y) const {
+		const int si = sliceOf(x);
+		if (!inRange(si)) return false;
+		for (auto const& f : freeSpans[si - sx0])
+			if (y >= f.lo && y <= f.hi) return !f.live;
+		return false;
+	}
+};
+
+bool geometryBuildMap() {
 	auto* gl = GJBaseGameLayer::get();
-	auto* pl = PlayLayer::get();
-	if (!gl || !gl->m_objects || !pl) { log::error("Probe 8: no level"); return; }
+	if (!gl || !gl->m_objects) return false;
 
-	const double xb = std::max(1.0, g_config.goCellX);
-	const double yb = std::max(1.0, g_config.goCellY);
+	auto& m = GeoMap::get();
+	m.blocked.clear(); m.freeSpans.clear();
+	m.freeCount = m.deadCount = 0; m.valid = false;
+	m.sw = std::max(1.0, static_cast<double>(g_config.geomSliceX));
+	m.playerH = std::max(1.0, static_cast<double>(g_config.geomPlayerHeight));
+
 	const double eps = 1e-6;
-
-	// 0 = open, 1 = solid, 2 = hazard. Both block a route; kept apart so the
-	// map says WHY a pocket is sealed.
-	std::map<std::pair<int,int>, char> cell;
-	int xlo = INT_MAX, xhi = INT_MIN, ylo = INT_MAX, yhi = INT_MIN;
+	std::map<int, std::vector<GeoMap::Span>> byslice;
+	double ylo = 1e18, yhi = -1e18;
+	int sx0 = INT_MAX, sx1 = INT_MIN;
 
 	auto* arr = gl->m_objects;
 	for (unsigned int i = 0; i < arr->count(); i++) {
@@ -2759,109 +2864,140 @@ void deadEndDump() {
 		if (!solid && !hazard) continue;
 
 		const cocos2d::CCRect r = o->getObjectRect();
-		const int x0 = static_cast<int>(std::floor(r.getMinX() / xb));
-		const int x1 = static_cast<int>(std::floor((r.getMaxX() - eps) / xb));
-		const int y0 = static_cast<int>(std::floor(r.getMinY() / yb));
-		const int y1 = static_cast<int>(std::floor((r.getMaxY() - eps) / yb));
-		for (int x = x0; x <= x1; x++)
-			for (int y = y0; y <= y1; y++) {
-				char& c = cell[{x, y}];
-				if (hazard || c == 0) c = hazard ? 2 : 1;
+		const int a = m.sliceOf(r.getMinX());
+		const int b = m.sliceOf(r.getMaxX() - eps);
+		sx0 = std::min(sx0, a); sx1 = std::max(sx1, b);
+		ylo = std::min(ylo, static_cast<double>(r.getMinY()));
+		yhi = std::max(yhi, static_cast<double>(r.getMaxY()));
+		for (int si = a; si <= b; si++)
+			byslice[si].push_back({r.getMinY(), r.getMaxY(),
+			                       static_cast<uint8_t>(hazard ? 2 : 1)});
+	}
+	if (byslice.empty()) return false;
+
+	// Margin so open space above the highest block and below the lowest is part
+	// of the playable region rather than falling outside the map.
+	m.yLo = ylo - 4 * m.sw;
+	m.yHi = yhi + 4 * m.sw;
+	m.sx0 = sx0; m.sx1 = sx1;
+	const int n = sx1 - sx0 + 1;
+	m.blocked.assign(n, {});
+	m.freeSpans.assign(n, {});
+
+	for (int si = sx0; si <= sx1; si++) {
+		auto it = byslice.find(si);
+		std::vector<GeoMap::Span> spans;
+		if (it != byslice.end()) spans = it->second;
+		std::sort(spans.begin(), spans.end(),
+		          [](GeoMap::Span const& a, GeoMap::Span const& b) { return a.lo < b.lo; });
+
+		// Merge overlapping blocked spans; hazard wins so the dump can say why.
+		std::vector<GeoMap::Span> merged;
+		for (auto const& sp : spans) {
+			if (!merged.empty() && sp.lo <= merged.back().hi) {
+				merged.back().hi = std::max(merged.back().hi, sp.hi);
+				if (sp.type == 2) merged.back().type = 2;
+			} else merged.push_back(sp);
+		}
+		m.blocked[si - sx0] = merged;
+
+		// Complement, keeping only gaps the player actually fits through.
+		std::vector<GeoMap::Free> fr;
+		double cur = m.yLo;
+		for (auto const& sp : merged) {
+			if (sp.lo - cur >= m.playerH)
+				fr.push_back({static_cast<float>(cur), sp.lo, false});
+			cur = std::max(cur, static_cast<double>(sp.hi));
+		}
+		if (m.yHi - cur >= m.playerH)
+			fr.push_back({static_cast<float>(cur), static_cast<float>(m.yHi), false});
+		m.freeSpans[si - sx0] = fr;
+	}
+
+	// Forward sweep, right to left. x never decreases in GD: a mirror portal
+	// flips the CAMERA and leaves world coordinates alone (13.11), and a
+	// teleport portal cannot send the player backwards.
+	for (auto& f : m.freeSpans[n - 1]) f.live = true;
+	for (int si = sx1 - 1; si >= sx0; si--) {
+		auto& here = m.freeSpans[si - sx0];
+		auto const& next = m.freeSpans[si - sx0 + 1];
+		for (auto& f : here)
+			for (auto const& g : next) {
+				if (!g.live) continue;
+				const double ov = std::min(f.hi, g.hi) - std::max(f.lo, g.lo);
+				if (ov >= m.playerH) { f.live = true; break; }
 			}
 	}
-	if (cell.empty()) { log::warn("Probe 8: no solid or hazardous objects"); return; }
 
-	for (auto const& kv : cell) {
-		xlo = std::min(xlo, kv.first.first);  xhi = std::max(xhi, kv.first.first);
-		ylo = std::min(ylo, kv.first.second); yhi = std::max(yhi, kv.first.second);
-	}
-	// The playable band is bounded by geometry, but open space extends past the
-	// topmost block, so give the fill a margin to travel through.
-	ylo -= 2; yhi += 2;
+	for (auto const& col : m.freeSpans)
+		for (auto const& f : col) { m.freeCount++; if (!f.live) m.deadCount++; }
 
-	auto blocked = [&](int x, int y) {
-		auto it = cell.find({x, y});
-		return it != cell.end() && it->second != 0;
-	};
+	m.valid = true;
+	return true;
+}
 
-	// Forward reachability, swept right to left - NOT a flood fill.
-	//
-	// MEASURED CONSEQUENCE of the flood: it marked ToE's dead corridors LIVE.
-	// An undirected fill asks "is this cell connected to the end", and it
-	// reached the sealed bottom corridor from the LEFT, through the open air at
-	// band 334 before the corridor walls begin. In a side-scroller you cannot
-	// walk back out; x only ever increases. Connectivity is the wrong question.
-	//
-	// So: a cell is live only if, moving vertically WITHIN ITS OWN COLUMN through
-	// open cells, it can reach some cell that steps right into a live cell. From
-	// the bottom corridor at band 339 the column is bounded by the y34 floor and
-	// every rightward step lands in the saw, so it is dead - correctly.
-	//
-	// Free vertical movement inside one column is still an over-estimate (a
-	// column is 60 units of x, ~46 steps, and no mode can climb arbitrarily in
-	// that), which keeps the error on the safe side: X stays "dead under any
-	// physics".
-	std::set<std::pair<int,int>> live;
-	for (int y = ylo; y <= yhi; y++)
-		if (!blocked(xhi, y)) live.insert({xhi, y});
+// Probe 8. Writes the map geometryBuildMap() computes.
+//
+// Rendered on the cell census's 60x30 bands so the two overlay for reading, by
+// SAMPLING the band centre - the map itself is intervals and keeps full
+// precision; only this picture is bucketed.
+void deadEndDump() {
+	auto* pl = PlayLayer::get();
+	if (!pl) { log::error("Probe 8: no level"); return; }
+	if (!geometryBuildMap()) { log::warn("Probe 8: no solid or hazardous objects"); return; }
 
-	for (int x = xhi - 1; x >= xlo; x--) {
-		int y = ylo;
-		while (y <= yhi) {
-			if (blocked(x, y)) { y++; continue; }
-			// One vertical run of open cells: the player can move freely inside
-			// it while crossing this column.
-			const int runLo = y;
-			while (y <= yhi && !blocked(x, y)) y++;
-			const int runHi = y - 1;
-
-			bool runLive = false;
-			for (int r = runLo; r <= runHi && !runLive; r++)
-				if (!blocked(x + 1, r) && live.count({x + 1, r})) runLive = true;
-
-			if (runLive)
-				for (int r = runLo; r <= runHi; r++) live.insert({x, r});
-		}
-	}
+	auto& m = GeoMap::get();
+	const double yb = std::max(1.0, g_config.goCellY);
+	const int ylo = static_cast<int>(std::floor(m.yLo / yb));
+	const int yhi = static_cast<int>(std::floor(m.yHi / yb));
 
 	const std::string path = levelFilePath("deadends.txt");
 	std::FILE* f = std::fopen(path.c_str(), "wb");
 	if (!f) { log::error("Probe 8: cannot write {}", path); return; }
 
-	std::fprintf(f, "# gd-solver dead-end map (Probe 8)\n");
-	std::fprintf(f, "# bands x %.0f y %.0f, x %d..%d, y %d..%d\n", xb, yb, xlo, xhi, ylo, yhi);
+	std::fprintf(f, "# gd-solver dead-end map (Probe 8, free intervals)\n");
+	std::fprintf(f, "# slices %.0f units wide, x slice %d..%d; player height %.0f\n",
+	             m.sw, m.sx0, m.sx1, m.playerH);
+	std::fprintf(f, "# %d free intervals, %d of them DEAD\n", m.freeCount, m.deadCount);
 	std::fprintf(f, "# S solid  H hazard  . open and CAN reach the level end  "
-	                "X open but DEAD (no path to the end)\n");
-	std::fprintf(f, "# The fill allows free movement between adjacent open cells, so it\n"
-	                "# over-estimates reachability: an X is dead under any physics.\n#\n");
+	                "X open but DEAD (no forward route)\n");
+	std::fprintf(f, "# Blocked spans come from real object hitboxes, so a 7.2-tall spike\n"
+	                "# blocks 7.2 units. Picture is sampled at each 30-unit band centre.\n#\n");
 
 	const double len = pl->m_levelLength > 1.f ? pl->m_levelLength : 0.0;
-	int dead = 0, open = 0;
-	std::fprintf(f, "# %-7s %-9s %-7s ", "xband", "x", "pct");
+	std::fprintf(f, "# %-7s %-9s %-7s ", "slice", "x", "pct");
 	for (int y = yhi; y >= ylo; y--) std::fprintf(f, "%d", std::abs(y) % 10);
 	std::fprintf(f, "  (y%d down to y%d)\n", yhi, ylo);
 
-	for (int x = xlo; x <= xhi; x++) {
-		const double xu = x * xb;
-		std::fprintf(f, "%-9d %-9.0f %-7.2f ", x, xu, len > 0.0 ? (xu / len) * 100.0 : 0.0);
+	for (int si = m.sx0; si <= m.sx1; si++) {
+		const double xu = si * m.sw;
+		std::fprintf(f, "%-9d %-9.0f %-7.2f ", si, xu, len > 0.0 ? (xu / len) * 100.0 : 0.0);
+		auto const& blk = m.blocked[si - m.sx0];
+		auto const& fr  = m.freeSpans[si - m.sx0];
 		for (int y = yhi; y >= ylo; y--) {
-			auto it = cell.find({x, y});
-			const char c = it == cell.end() ? 0 : it->second;
-			if (c == 1) { std::fputc('S', f); continue; }
-			if (c == 2) { std::fputc('H', f); continue; }
-			open++;
-			if (live.count({x, y})) std::fputc('.', f);
-			else { std::fputc('X', f); dead++; }
+			const double yc = (y + 0.5) * yb;   // sample the band centre
+			char c = 0;
+			for (auto const& sp : blk)
+				if (yc >= sp.lo && yc <= sp.hi) { c = sp.type == 2 ? 'H' : 'S'; break; }
+			if (!c) {
+				c = ' ';
+				for (auto const& fs : fr)
+					if (yc >= fs.lo && yc <= fs.hi) { c = fs.live ? '.' : 'X'; break; }
+				// A gap too short for the player is neither free nor blocked.
+				if (c == ' ') c = ':';
+			}
+			std::fputc(c, f);
 		}
 		std::fputc('\n', f);
 	}
 	std::fclose(f);
 
-	log::info("Probe 8: dead-end map over x bands {}..{}, y {}..{} - {} open cells, "
-	          "{} of them DEAD ({:.1f}%).", xlo, xhi, ylo, yhi, open, dead,
-	          open > 0 ? 100.0 * dead / open : 0.0);
-	log::info("  a cell marked X is open space with no path to the end of the level "
-	          "under free movement, so it is dead under any physics -> {}", path);
+	log::info("Probe 8: interval map over slices {}..{} ({:.0f} units each), player "
+	          "height {:.0f} - {} free intervals, {} DEAD ({:.1f}%).",
+	          m.sx0, m.sx1, m.sw, m.playerH, m.freeCount, m.deadCount,
+	          m.freeCount > 0 ? 100.0 * m.deadCount / m.freeCount : 0.0);
+	log::info("  ':' is a gap too short for a {:.0f}-unit player. Blocked spans are real "
+	          "hitboxes, not buckets -> {}", m.playerH, path);
 }
 
 void sweepWriteResults() {
@@ -3492,6 +3628,18 @@ void pollHotkeys() {
 
 			sv.clear();
 			CellProbe::get().clear();
+			if (g_config.geometryDeadPrune) {
+				if (geometryBuildMap()) {
+					auto& m = GeoMap::get();
+					log::info("Solver: geometry map built - {} free intervals, {} dead "
+					          "({:.1f}%). Entering dead space counts as a death.",
+					          m.freeCount, m.deadCount,
+					          m.freeCount > 0 ? 100.0 * m.deadCount / m.freeCount : 0.0);
+				} else {
+					log::warn("Solver: geometry map unavailable - dead-cell pruning off "
+					          "for this run.");
+				}
+			}
 			sv.running    = true;
 			sv.startTicks = probe::nowTicks();
 			sv.lastReport = sv.startTicks;
@@ -6620,12 +6768,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// and wall-clock time are not interchangeable here.
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
-		          "anchorReplays {}  tapFirst {}/{}  "
+		          "anchorReplays {}  tapFirst {}/{}  geoDeaths {}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
 		          g_config.toggleBudget, sv.commitDepth, sv.lookbackSteps, sv.resyncs, sv.resyncFailures,
 		          CellProbe::get().cells.size(), sv.anchorReplays,
-		          sv.tapFirstChosen, sv.tapDecisions,
+		          sv.tapFirstChosen, sv.tapDecisions, sv.geoDeaths,
 		          stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
 	}
@@ -6960,8 +7108,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			return false;
 		}
 
-		if (m_player1->m_isDead) {
+		// A cell the map calls dead has no forward route, so continuing to
+		// simulate it only postpones the same death by a few hundred steps - and
+		// postponing it is what freezes the decision that caused it.
+		bool geoDead = false;
+		if (g_config.geometryDeadPrune && GeoMap::get().valid && !m_player1->m_isDead) {
+			geoDead = GeoMap::get().isDead(m_player1->getPositionX(),
+			                               m_player1->getPositionY());
+		}
+
+		if (m_player1->m_isDead || geoDead) {
 			sv.deaths++;
+			if (geoDead) sv.geoDeaths++;
 			sv.diedAtX = m_player1->getPositionX();
 
 			// Phase A1: what mode is this section actually in, and which branch
@@ -6972,9 +7130,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (sv.deaths <= 20 || sv.deaths % 500 == 0) {
 				auto* p = m_player1;
 				const bool air = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
-				log::info("Solver death #{}: step {} X {:.1f} {:.2f}%  policy={}  "
+				log::info("Solver {} #{}: step {} X {:.1f} {:.2f}%  policy={}  "
 				          "ship={} ufo={} wave={} swing={} ball={} robot={} spider={}  "
 				          "onGround={}/{}/{}/{}  yVel={:.3f}  hold={}",
+				          geoDead ? "DEAD-CELL" : "death",
 				          sv.deaths, sv.step, sv.diedAtX, pl->getCurrentPercent(),
 				          air ? "AIR" : "CUBE",
 				          p->m_isShip, p->m_isBird, p->m_isDart, p->m_isSwing,
