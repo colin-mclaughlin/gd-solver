@@ -352,6 +352,31 @@ struct Config {
 	// vertical reach - the reachable-interval build, not a bucketed grid.
 	bool geometryDeadPrune = false;
 
+	// Use the map for move ORDERING: at an air decision, try first whichever
+	// branch heads toward space that still has a forward route.
+	//
+	// Ordering, never pruning. A wrong map costs search time and cannot delete a
+	// route, because the physics simulation stays the authority on what kills
+	// the player. That is the whole reason this is ordering and the dead-cell
+	// prune was a mistake.
+	//
+	// It only fires when the player is NOT already lined up with a live
+	// interval, so on an ordinary stretch - one open column, or several live
+	// ones - it does nothing and the search behaves exactly as it does today.
+	//
+	// This is also the corrected form of tapOrderByNeed, which lost 32.49% ->
+	// 27.72%. That rule keyed on m_yVelocity and encoded "higher is better",
+	// which is false in a corridor whose correct route is the bottom one. This
+	// keys on which channel actually continues, so it is right in both
+	// directions by construction.
+	bool geometryOrdering = true;
+
+	// How far ahead to look for live space, in units. 300 is ten slices, about
+	// 230 physics steps - close to the 240-step mutable window, and far enough
+	// to see past a fork before reaching it: ToE's corridors split at x 20130
+	// and seal at x 20400, so this sees the seal from x 20100.
+	int geomLookaheadX = 300;
+
 	int geomXMin = 18000;   // units; the region around ToE's third corridor set
 	int geomXMax = 21000;
 	bool geomDumpObjects = true;  // also write the raw per-object list
@@ -2061,6 +2086,8 @@ struct Solver {
 	uint64_t              deathsAtBest = 0;
 	uint64_t              escapes      = 0;
 	uint64_t              geoDeaths    = 0;   // deaths called by the geometry map
+	uint64_t              geoSteers    = 0;   // air decisions the map reordered
+	uint64_t              geoLooks     = 0;   // air decisions the map was consulted on
 
 	// How often the tap-ordering rule fires, split by gravity direction. The
 	// point is to catch over-tapping from the FIRST report line rather than by
@@ -2210,6 +2237,7 @@ struct Solver {
 		// a different shape than the same level run first.
 		deaths = restores = steps = escapes = 0;
 		geoDeaths = 0;
+		geoSteers = geoLooks = 0;
 		tapDecisions = tapFirstChosen = 0;
 	}
 
@@ -2936,6 +2964,50 @@ bool geometryBuildMap() {
 	return true;
 }
 
+// Which way to steer at `(x, y)`: +1 prefer the climbing branch, -1 the falling
+// one, 0 leave the existing ordering alone.
+//
+// 0 is the common answer: if the player is already inside a live interval at the
+// lookahead, nothing needs steering.
+int geometrySteer(double x, double y) {
+	auto const& m = GeoMap::get();
+	if (!m.valid) return 0;
+	const int si = m.sliceOf(x + static_cast<double>(g_config.geomLookaheadX));
+	if (!m.inRange(si)) return 0;
+
+	// Steer ONLY when this altitude lands in dead OPEN space at the lookahead.
+	//
+	// MEASURED CONSEQUENCE of getting this wrong: the first version steered
+	// whenever the player was not inside a LIVE interval, which also fires when
+	// the altitude lands inside a BLOCKED span - a floor or platform ahead at the
+	// current height. That is constant in normal play, so it fired on 34%% of air
+	// decisions (32234/94639), overrode continue-first ordering across the whole
+	// level, and Theory of Everything fell 78.90%% -> 57.54%%, flying low into a
+	// wall because the nearest live interval near the ground is the ground.
+	//
+	// Landing in a wall says nothing about which channel continues. Only dead
+	// open space does.
+	auto const& fr = m.freeSpans[si - m.sx0];
+	bool inDead = false;
+	for (auto const& f : fr)
+		if (y >= f.lo && y <= f.hi) {
+			if (f.live) return 0;      // headed somewhere with a route: leave it
+			inDead = true;
+			break;
+		}
+	if (!inDead) return 0;             // blocked, or a gap too small: no opinion
+
+	double best = 1e18;
+	int dir = 0;
+	for (auto const& f : fr) {
+		if (!f.live) continue;
+		const double c = 0.5 * (static_cast<double>(f.lo) + static_cast<double>(f.hi));
+		const double d = std::abs(c - y);
+		if (d < best) { best = d; dir = c > y ? 1 : -1; }
+	}
+	return dir;
+}
+
 // Probe 8. Writes the map geometryBuildMap() computes.
 //
 // Rendered on the cell census's 60x30 bands so the two overlay for reading, by
@@ -3628,16 +3700,20 @@ void pollHotkeys() {
 
 			sv.clear();
 			CellProbe::get().clear();
-			if (g_config.geometryDeadPrune) {
+			if (g_config.geometryDeadPrune || g_config.geometryOrdering) {
 				if (geometryBuildMap()) {
 					auto& m = GeoMap::get();
 					log::info("Solver: geometry map built - {} free intervals, {} dead "
-					          "({:.1f}%). Entering dead space counts as a death.",
+					          "({:.1f}%). Ordering {}, dead-space pruning {}. Lookahead "
+					          "{} units.",
 					          m.freeCount, m.deadCount,
-					          m.freeCount > 0 ? 100.0 * m.deadCount / m.freeCount : 0.0);
+					          m.freeCount > 0 ? 100.0 * m.deadCount / m.freeCount : 0.0,
+					          g_config.geometryOrdering ? "ON" : "off",
+					          g_config.geometryDeadPrune ? "ON" : "off",
+					          g_config.geomLookaheadX);
 				} else {
-					log::warn("Solver: geometry map unavailable - dead-cell pruning off "
-					          "for this run.");
+					log::warn("Solver: geometry map unavailable - geometry ordering and "
+					          "pruning both off for this run.");
 				}
 			}
 			sv.running    = true;
@@ -5195,7 +5271,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// keyed on m_isOnGround, which is true against the CEILING in ship
 			// mode and so held the ship harder into it; velocity has no such
 			// second meaning, and this is confined to Tap so ship is untouched.
-			if (d.modeClass == ModeClass::Tap && g_config.tapOrderByNeed) {
+			// Geometry first, when it has something to say. Climbing means hold
+			// in a Hold mode and a tap in a Tap mode, so one sign drives both.
+			int steer = 0;
+			if (g_config.geometryOrdering && GeoMap::get().valid) {
+				sv.geoLooks++;
+				steer = geometrySteer(m_player1->getPositionX(),
+				                      m_player1->getPositionY());
+				if (steer != 0) sv.geoSteers++;
+			}
+			if (steer != 0) {
+				d.choice = steer > 0;
+			} else if (d.modeClass == ModeClass::Tap && g_config.tapOrderByNeed) {
 				d.choice = tapFirst;
 				sv.tapDecisions++;
 				if (tapFirst) sv.tapFirstChosen++;
@@ -6768,12 +6855,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// and wall-clock time are not interchangeable here.
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
-		          "anchorReplays {}  tapFirst {}/{}  geoDeaths {}  "
+		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
 		          g_config.toggleBudget, sv.commitDepth, sv.lookbackSteps, sv.resyncs, sv.resyncFailures,
 		          CellProbe::get().cells.size(), sv.anchorReplays,
-		          sv.tapFirstChosen, sv.tapDecisions, sv.geoDeaths,
+		          sv.tapFirstChosen, sv.tapDecisions, sv.geoSteers, sv.geoLooks,
 		          stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
 	}
