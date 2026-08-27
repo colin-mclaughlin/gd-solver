@@ -384,7 +384,69 @@ struct Config {
 	// lined up. Generous is the SAFE setting for ordering - a window that is too
 	// wide simply steers less often, while one that is too narrow steers when it
 	// need not. 60 units is two blocks per 30 units of travel.
+	// 120 after the Probe 9 sweep. Everything saturates by 120-240 and dead
+	// counts barely move past it (ToE 174 -> 172, so the corridors stay
+	// flagged), while constrained intervals drop - Clutterfunk 382 -> 356, ToE
+	// 262 -> 216. Reach 0 is catastrophic (1627 constrained on Clutterfunk),
+	// which is what makes the cap necessary at all.
 	int geomVerticalReach = 60;
+
+	// How far OUTSIDE the live window the player must be before steering fires.
+	//
+	// Probe 9 measured the mean window at 97-98% of its gap, so the great
+	// majority of narrowings are a unit or two - real, but meaningless. Steering
+	// on those overrides continue-first ordering for nothing, and that ordering
+	// is load-bearing: it is what makes a sustained hold cost one decision
+	// instead of many. MEASURED price of steering indiscriminately: Clutterfunk
+	// 34s -> 45s and Time Machine 2m00 -> 2m38 against the pre-geometry
+	// baseline, both +32%, on levels with no fake corridors.
+	//
+	// Raising reach does NOT fix this - Clutterfunk's constrained count is flat
+	// at ~350 for every reach >= 15, so the pinches are real. The fix is to
+	// ignore the ones the player is only marginally outside of.
+	//
+	// One block. Applies only to being outside a live window; DEAD space always
+	// steers, because there is nothing marginal about a corridor that ends.
+	// MEASURED and REVERTED to 0 (off). At 30 - one block - Theory of Everything
+	// stopped solving entirely (stalled 75.52%) and Clutterfunk went 45s -> 3m06s
+	// with its steer rate cut 7.4%% -> 1.0%%.
+	//
+	// Two things wrong with it. An ABSOLUTE margin cannot work when passages run
+	// from 90 units (ToE's pillar gap) to 300: 30 units is a third of the former
+	// and a tenth of the latter. And the premise was wrong - cutting Clutterfunk's
+	// steering made it FOUR TIMES slower, so the steering was helping, and the
+	// 34s -> 45s I called a tax was not caused by what I assumed.
+	//
+	// A relative margin - a fraction of the window height - might still work.
+	// This one does not.
+	int geomSteerMargin = 0;   // superseded by geomClearanceBand
+
+	// How far off-centre the player may drift inside the live window before
+	// steering fires, as a FRACTION of the window's height.
+	//
+	// This exists because exact-x taught us something backwards. Making the map
+	// accurate made the solver WORSE - Clutterfunk 34s -> stalled at 36.25%, ToE
+	// 26s -> stalled at 96.29% - because reach now scales with segment width, so
+	// a 500-unit open stretch credits 1000 units of climb and the window widens
+	// to fill its whole gap. That is physically right: given 500 units of travel
+	// you really can get anywhere.
+	//
+	// So the window's value was never its accuracy, it was its TIGHTNESS. A
+	// pessimistic window approximated "stay away from walls", and stripping the
+	// pessimism removed a heuristic that was quietly doing most of the work -
+	// which is also why cutting Clutterfunk's steering 7.4%% -> 1.0%% earlier made
+	// it four times slower.
+	//
+	// Two signals were being conflated. LIVENESS - which gaps continue - is
+	// sparse, exact, and is what beat ToE's fake corridors. CLEARANCE - stay off
+	// the walls - is dense and purely heuristic. This restores clearance
+	// deliberately instead of getting it by accident from a wrong model.
+	//
+	// Relative, not absolute, so it scales: in a 300-unit gap it only fires
+	// within ~40 units of a wall, in a 90-unit pillar slot it fires almost at
+	// once. 0.5 reproduces the old behaviour exactly (fire only when outside the
+	// window), so this is a strict generalisation.
+	double geomClearanceBand = 0.25;
 
 	// 0/0 means the WHOLE level. The dead-end map has always covered everything
 	// (slices -1..848 on ToE, x -30..25440 against a 25855-unit level); it was
@@ -2100,6 +2162,8 @@ struct Solver {
 	uint64_t              escapes      = 0;
 	uint64_t              geoDeaths    = 0;   // deaths called by the geometry map
 	uint64_t              geoSteers    = 0;   // air decisions the map reordered
+	uint64_t              geoSteerDead = 0;   // ...because the player was in dead space
+	uint64_t              geoSteerWin  = 0;   // ...because it was outside a live window
 	uint64_t              geoLooks     = 0;   // air decisions the map was consulted on
 
 	// How often the tap-ordering rule fires, split by gravity direction. The
@@ -2251,6 +2315,7 @@ struct Solver {
 		deaths = restores = steps = escapes = 0;
 		geoDeaths = 0;
 		geoSteers = geoLooks = 0;
+		geoSteerDead = geoSteerWin = 0;
 		tapDecisions = tapFirstChosen = 0;
 	}
 
@@ -2826,63 +2891,67 @@ void geometryDump() {
 	if (g_config.geomDumpObjects) log::info("  raw objects -> {}", objPath);
 }
 
-// The level's geometry as FREE INTERVALS, shared by the probe and the solver.
+// The level's geometry as FREE INTERVALS over EXACT x segments.
 //
-// The previous version bucketed object rects into 60x30 cells and marked a cell
-// lethal if any hazard touched it. MEASURED CONSEQUENCE: 199 of this level's 257
-// hazards are 9x7.2 spikes - 3.6% of a cell - so every spike blanketed 28x its
-// own area, vertical runs terminated that actually continue, and Theory of
-// Everything collapsed 78.90% -> 6.27% with 12,566 deaths called by the map at
-// one x in ordinary cube gameplay.
+// Neither axis is on a grid now. y was freed first: bucketing it into 30-unit
+// rows made a 7.2-tall spike block 30 units, which blanketed the level in false
+// hazard and collapsed Theory of Everything to 6.27%.
 //
-// So: no buckets. Per x slice, the real rects give blocked y intervals; the
-// complement is the free intervals. A 7.2-tall spike blocks 7.2 units.
+// x was still sliced every 30 units, and that had the same shape of error in
+// miniature: everything overlapping a slice blocked that slice's full width, so
+// an object spanning x 24885..24915 blocked both 24870..24900 and 24900..24930
+// across its whole y extent. Over-blocking narrows windows, and narrow windows
+// are what make the solver steer.
 //
-// The forward sweep then needs NO physics assumption at all. Free interval I at
-// slice x is live if some live interval J at slice x+1 overlaps it by at least
-// the player's height: then the player crosses the boundary without moving
-// vertically. If they do not overlap, crossing means passing through a solid,
-// which is impossible under any physics. Intervals are maximal by construction,
-// so the "free vertical movement inside a column" fudge disappears.
+// The fix needs no approximation at all. An object blocks a y range over
+// [minX, maxX], so the set of blocking objects changes ONLY at an object edge.
+// Sort every edge; between two consecutive edges the blocked set is identical by
+// construction, so one segment represents that stretch exactly.
 //
-// The map can only ever prove DEADNESS, never liveness: open geometry is
-// necessary for a route but not sufficient - a corridor can be open and still
-// impossible for a UFO to hold. That one-way implication is what makes it safe,
-// and it only holds while blocked regions are not inflated.
+// Segments have variable width, so the vertical reach scales with width rather
+// than being a flat per-slice constant: geomVerticalReach is still expressed per
+// geomSliceX units of travel, which keeps 60 meaning what it always meant.
 struct GeoMap {
 	static GeoMap& get() { static GeoMap m; return m; }
 
 	struct Span { float lo, hi; uint8_t type; };      // 1 solid, 2 hazard
 	// `lo..hi` is the open gap. `wlo..whi` is the part of it from which the end
-	// of the level is still reachable - the LIVE WINDOW.
-	//
-	// A boolean was not enough. MEASURED at ToE's last ship section: the gap at
-	// x 24870 is 750..1050, 300 units, and 30 units later the only way through
-	// is 810..900. Marking the whole 300 live meant a ship at y 760 was "in live
-	// space" while already committed to the pillar it died on at x 24872.7.
+	// of the level is still reachable - the LIVE WINDOW. A boolean was not
+	// enough: at ToE's last ship section the gap at x 24870 is 300 units and the
+	// only way through is 90, and marking the whole 300 live meant a ship at
+	// y 760 was "in live space" while already committed to the pillar.
 	struct Free { float lo, hi, wlo, whi; bool live; };
 
-	int    sx0 = 0, sx1 = -1;      // slice index range
-	double sw  = 30.0;             // slice width in units
-	double yLo = 0.0, yHi = 0.0;   // vertical bounds of the playable region
-	double playerH = 15.0;         // smallest hitbox height: permissive
+	std::vector<double> xs;        // segment boundaries; segment i is [xs[i], xs[i+1])
 	std::vector<std::vector<Span>> blocked;
 	std::vector<std::vector<Free>> freeSpans;
+	double yLo = 0.0, yHi = 0.0;
+	double playerH = 15.0;         // smallest hitbox height: permissive
 	int  freeCount = 0, deadCount = 0;
 	bool valid = false;
 
-	int sliceOf(double x) const { return static_cast<int>(std::floor(x / sw)); }
-	bool inRange(int si) const { return valid && si >= sx0 && si <= sx1; }
+	int segments() const { return static_cast<int>(xs.size()) - 1; }
+
+	// Which segment contains x, or -1 outside the mapped range.
+	int segIndex(double x) const {
+		if (!valid || xs.size() < 2 || x < xs.front() || x >= xs.back()) return -1;
+		return static_cast<int>(std::upper_bound(xs.begin(), xs.end(), x) - xs.begin()) - 1;
+	}
 
 	// True only for OPEN space with no forward route. Blocked space returns
 	// false: the simulation already handles walls, and claiming them here would
 	// confuse "there is no route" with "there is a wall".
 	bool isDead(double x, double y) const {
-		const int si = sliceOf(x);
-		if (!inRange(si)) return false;
-		for (auto const& f : freeSpans[si - sx0])
+		const int si = segIndex(x);
+		if (si < 0) return false;
+		for (auto const& f : freeSpans[si])
 			if (y >= f.lo && y <= f.hi) return !f.live;
 		return false;
+	}
+
+	void clear() {
+		xs.clear(); blocked.clear(); freeSpans.clear();
+		freeCount = deadCount = 0; valid = false;
 	}
 };
 
@@ -2891,15 +2960,15 @@ bool geometryBuildMap() {
 	if (!gl || !gl->m_objects) return false;
 
 	auto& m = GeoMap::get();
-	m.blocked.clear(); m.freeSpans.clear();
-	m.freeCount = m.deadCount = 0; m.valid = false;
-	m.sw = std::max(1.0, static_cast<double>(g_config.geomSliceX));
+	m.clear();
 	m.playerH = std::max(1.0, static_cast<double>(g_config.geomPlayerHeight));
 
 	const double eps = 1e-6;
-	std::map<int, std::vector<GeoMap::Span>> byslice;
+
+	struct Obj { double x0, x1; float lo, hi; uint8_t type; };
+	std::vector<Obj> objs;
+	std::vector<double> edges;
 	double ylo = 1e18, yhi = -1e18;
-	int sx0 = INT_MAX, sx1 = INT_MIN;
 
 	auto* arr = gl->m_objects;
 	for (unsigned int i = 0; i < arr->count(); i++) {
@@ -2914,34 +2983,53 @@ bool geometryBuildMap() {
 		if (!solid && !hazard) continue;
 
 		const cocos2d::CCRect r = o->getObjectRect();
-		const int a = m.sliceOf(r.getMinX());
-		const int b = m.sliceOf(r.getMaxX() - eps);
-		sx0 = std::min(sx0, a); sx1 = std::max(sx1, b);
-		ylo = std::min(ylo, static_cast<double>(r.getMinY()));
-		yhi = std::max(yhi, static_cast<double>(r.getMaxY()));
-		for (int si = a; si <= b; si++)
-			byslice[si].push_back({r.getMinY(), r.getMaxY(),
-			                       static_cast<uint8_t>(hazard ? 2 : 1)});
+		Obj ob;
+		ob.x0 = r.getMinX(); ob.x1 = r.getMaxX();
+		ob.lo = r.getMinY(); ob.hi = r.getMaxY();
+		ob.type = static_cast<uint8_t>(hazard ? 2 : 1);
+		if (ob.x1 - ob.x0 < eps) continue;
+		objs.push_back(ob);
+		edges.push_back(ob.x0);
+		edges.push_back(ob.x1);
+		ylo = std::min(ylo, static_cast<double>(ob.lo));
+		yhi = std::max(yhi, static_cast<double>(ob.hi));
 	}
-	if (byslice.empty()) return false;
+	if (objs.empty()) return false;
 
-	// Margin so open space above the highest block and below the lowest is part
-	// of the playable region rather than falling outside the map.
-	m.yLo = ylo - 4 * m.sw;
-	m.yHi = yhi + 4 * m.sw;
-	m.sx0 = sx0; m.sx1 = sx1;
-	const int n = sx1 - sx0 + 1;
+	std::sort(edges.begin(), edges.end());
+	// Collapse edges closer together than a hundredth of a unit: they would make
+	// degenerate segments whose scaled reach is zero.
+	std::vector<double> xs;
+	for (double e : edges)
+		if (xs.empty() || e - xs.back() > 0.01) xs.push_back(e);
+	if (xs.size() < 2) return false;
+
+	m.xs = xs;
+	const int n = m.segments();
 	m.blocked.assign(n, {});
 	m.freeSpans.assign(n, {});
+	m.yLo = ylo - 120.0;
+	m.yHi = yhi + 120.0;
 
-	for (int si = sx0; si <= sx1; si++) {
-		auto it = byslice.find(si);
-		std::vector<GeoMap::Span> spans;
-		if (it != byslice.end()) spans = it->second;
+	// Each object contributes its y span to every segment it covers.
+	for (auto const& ob : objs) {
+		// Direct lookup, NOT segIndex: that early-returns -1 while m.valid is
+		// still false, which is the whole of the build. MEASURED CONSEQUENCE:
+		// every object fell back to segment 0 and was smeared from the level
+		// start to its own right edge, the blocked spans merged into one mass,
+		// and the map reported 5927 free intervals with ZERO dead - inert, so
+		// Clutterfunk fell back to its pre-geometry 34s and ToE walled at 78.90%.
+		int a = static_cast<int>(
+			std::upper_bound(m.xs.begin(), m.xs.end(), ob.x0) - m.xs.begin()) - 1;
+		if (a < 0) a = 0;
+		for (int si = a; si < n && m.xs[si] < ob.x1 - eps; si++)
+			m.blocked[si].push_back({ob.lo, ob.hi, ob.type});
+	}
+
+	for (int si = 0; si < n; si++) {
+		auto& spans = m.blocked[si];
 		std::sort(spans.begin(), spans.end(),
 		          [](GeoMap::Span const& a, GeoMap::Span const& b) { return a.lo < b.lo; });
-
-		// Merge overlapping blocked spans; hazard wins so the dump can say why.
 		std::vector<GeoMap::Span> merged;
 		for (auto const& sp : spans) {
 			if (!merged.empty() && sp.lo <= merged.back().hi) {
@@ -2949,7 +3037,7 @@ bool geometryBuildMap() {
 				if (sp.type == 2) merged.back().type = 2;
 			} else merged.push_back(sp);
 		}
-		m.blocked[si - sx0] = merged;
+		m.blocked[si] = merged;
 
 		// Complement, keeping only gaps the player actually fits through.
 		std::vector<GeoMap::Free> fr;
@@ -2963,36 +3051,30 @@ bool geometryBuildMap() {
 		if (m.yHi - cur >= m.playerH)
 			fr.push_back({static_cast<float>(cur), static_cast<float>(m.yHi),
 			              static_cast<float>(cur), static_cast<float>(m.yHi), false});
-		m.freeSpans[si - sx0] = fr;
+		m.freeSpans[si] = fr;
 	}
 
 	// Forward sweep, right to left. x never decreases in GD: a mirror portal
 	// flips the CAMERA and leaves world coordinates alone (13.11), and a
 	// teleport portal cannot send the player backwards.
-	const double reach = std::max(0.0, static_cast<double>(g_config.geomVerticalReach));
+	const double reachPerUnit = static_cast<double>(g_config.geomVerticalReach) /
+	                            std::max(1.0, static_cast<double>(g_config.geomSliceX));
+
 	for (auto& f : m.freeSpans[n - 1]) { f.live = true; f.wlo = f.lo; f.whi = f.hi; }
 
-	for (int si = sx1 - 1; si >= sx0; si--) {
-		auto& here = m.freeSpans[si - sx0];
-		auto const& next = m.freeSpans[si - sx0 + 1];
+	for (int si = n - 2; si >= 0; si--) {
+		// Reach scales with how much x this segment actually spans.
+		const double reach = reachPerUnit * (m.xs[si + 1] - m.xs[si]);
+		auto& here = m.freeSpans[si];
+		auto const& next = m.freeSpans[si + 1];
 		for (auto& f : here) {
-			// The window is the part of this gap that can reach a live window at
-			// the next slice, widened by how far the player can climb or fall
-			// while crossing. Taking the hull of the pieces rather than tracking
-			// them separately is permissive, which is the safe direction here.
 			double wlo = 1e18, whi = -1e18;
 			for (auto const& g : next) {
 				if (!g.live) continue;
 				// Clipped to g's OWN gap: the player may move vertically while
 				// crossing, but only inside the gap they are in - never through
-				// the floor between two gaps.
-				//
-				// MEASURED CONSEQUENCE of leaving it unclipped: ToE's top
-				// corridor window 1140..1200 widened to 1080..1260, overlapped
-				// the MIDDLE corridor 1050..1110 through the solid floor between
-				// them, and marked it live. Dead intervals fell 171 -> 27, the
-				// fake corridors stopped being flagged, and the level went
-				// straight back to stalling at 78.90%.
+				// the floor between two gaps. Unclipped, ToE's top corridor
+				// window leaked into the middle one and un-flagged both.
 				const double glo = std::max(static_cast<double>(g.lo),
 				                            static_cast<double>(g.wlo) - reach);
 				const double ghi = std::min(static_cast<double>(g.hi),
@@ -3026,8 +3108,8 @@ bool geometryBuildMap() {
 int geometrySteer(double x, double y) {
 	auto const& m = GeoMap::get();
 	if (!m.valid) return 0;
-	const int si = m.sliceOf(x + static_cast<double>(g_config.geomLookaheadX));
-	if (!m.inRange(si)) return 0;
+	const int si = m.segIndex(x + static_cast<double>(g_config.geomLookaheadX));
+	if (si < 0) return 0;
 
 	// Steer ONLY when this altitude lands in dead OPEN space at the lookahead.
 	//
@@ -3041,16 +3123,21 @@ int geometrySteer(double x, double y) {
 	//
 	// Landing in a wall says nothing about which channel continues. Only dead
 	// open space does.
-	auto const& fr = m.freeSpans[si - m.sx0];
+	auto const& fr = m.freeSpans[si];
 	bool inDead = false;
 	for (auto const& f : fr) {
 		if (y < f.lo || y > f.hi) continue;
 		if (f.live) {
-			// Inside the gap, but is it inside the part that gets through? At a
-			// pinch the window is far narrower than the gap, and this is the
-			// difference between routing and not.
-			if (y >= f.wlo && y <= f.whi) return 0;
-			return y < f.wlo ? 1 : -1;
+			// Aim for the middle of the window rather than merely being inside
+			// it. Being outside is subsumed: outside means further than half the
+			// height from centre, which any band below 0.5 already catches.
+			const double lo = static_cast<double>(f.wlo);
+			const double hi = static_cast<double>(f.whi);
+			const double centre = 0.5 * (lo + hi);
+			const double band = std::max(0.0, g_config.geomClearanceBand) * (hi - lo);
+			if (std::abs(y - centre) <= band) return 0;
+			Solver::get().geoSteerWin++;
+			return y < centre ? 1 : -1;
 		}
 		inDead = true;
 		break;
@@ -3065,7 +3152,60 @@ int geometrySteer(double x, double y) {
 		const double d = std::abs(c - y);
 		if (d < best) { best = d; dir = c > y ? 1 : -1; }
 	}
+	if (dir != 0) Solver::get().geoSteerDead++;
 	return dir;
+}
+
+// Probe 9. What geomVerticalReach costs, measured without running a search.
+//
+// Reach decides how much of a gap counts as the usable window, which is the only
+// thing driving how often geometrySteer fires - and steering is not free.
+// MEASURED against the pre-geometry baseline: Clutterfunk 34s -> 45s and Time
+// Machine 2m00 -> 2m38, both +32%, on levels with no fake corridors where the
+// map has nothing useful to say. That tax is the price of catching ToE's
+// corridors, and this finds out how much of it is necessary.
+//
+// Rebuilding the map is instant, so this tries every value in one keypress
+// rather than one rebuild-and-solve per value. The proxy for steering pressure
+// is `constrained`: intervals whose window is narrower than the gap, since those
+// are the only places geometrySteer can return non-zero.
+void geometryReachSweep() {
+	if (!GJBaseGameLayer::get()) { log::warn("Probe 9: not in a level"); return; }
+
+	const int saved = g_config.geomVerticalReach;
+	const int values[] = {0, 15, 30, 60, 120, 240, 480, 960};
+
+	log::info("Probe 9: geomVerticalReach sweep. `constrained` is intervals whose "
+	          "window is narrower than the gap - the only places steering can fire.");
+	log::info("  %-8s %-8s %-7s %-12s %-8s", "reach", "free", "dead", "constrained", "meanWin%");
+
+	for (int v : values) {
+		g_config.geomVerticalReach = v;
+		if (!geometryBuildMap()) { log::warn("  reach {}: map build failed", v); continue; }
+		auto const& m = GeoMap::get();
+
+		int constrained = 0;
+		double ratioSum = 0.0;
+		int live = 0;
+		for (auto const& col : m.freeSpans)
+			for (auto const& f : col) {
+				if (!f.live) continue;
+				live++;
+				const double gap = static_cast<double>(f.hi) - static_cast<double>(f.lo);
+				const double win = static_cast<double>(f.whi) - static_cast<double>(f.wlo);
+				if (gap > 0.0) {
+					ratioSum += win / gap;
+					if (win < gap - 0.5) constrained++;
+				}
+			}
+		log::info("  {:<8} {:<8} {:<7} {:<12} {:.1f}", v, m.freeCount, m.deadCount,
+		          constrained, live > 0 ? 100.0 * ratioSum / live : 0.0);
+	}
+
+	// Leave the map as the solver expects to find it.
+	g_config.geomVerticalReach = saved;
+	geometryBuildMap();
+	log::info("  restored reach {} and rebuilt.", saved);
 }
 
 // Probe 8. Writes the map geometryBuildMap() computes.
@@ -3088,8 +3228,8 @@ void deadEndDump() {
 	if (!f) { log::error("Probe 8: cannot write {}", path); return; }
 
 	std::fprintf(f, "# gd-solver dead-end map (Probe 8, free intervals)\n");
-	std::fprintf(f, "# slices %.0f units wide, x slice %d..%d; player height %.0f\n",
-	             m.sw, m.sx0, m.sx1, m.playerH);
+	std::fprintf(f, "# %d exact x segments (object edges, variable width); "
+	                "player height %.0f\n", m.segments(), m.playerH);
 	std::fprintf(f, "# %d free intervals, %d of them DEAD\n", m.freeCount, m.deadCount);
 	std::fprintf(f, "# S solid  H hazard  . inside the live window  o open and live but "
 	                "OUTSIDE the window  X dead\n");
@@ -3101,11 +3241,11 @@ void deadEndDump() {
 	for (int y = yhi; y >= ylo; y--) std::fprintf(f, "%d", std::abs(y) % 10);
 	std::fprintf(f, "  (y%d down to y%d)\n", yhi, ylo);
 
-	for (int si = m.sx0; si <= m.sx1; si++) {
-		const double xu = si * m.sw;
-		std::fprintf(f, "%-9d %-9.0f %-7.2f ", si, xu, len > 0.0 ? (xu / len) * 100.0 : 0.0);
-		auto const& blk = m.blocked[si - m.sx0];
-		auto const& fr  = m.freeSpans[si - m.sx0];
+	for (int si = 0; si < m.segments(); si++) {
+		const double xu = m.xs[si];
+		std::fprintf(f, "%-9d %-9.1f %-7.2f ", si, xu, len > 0.0 ? (xu / len) * 100.0 : 0.0);
+		auto const& blk = m.blocked[si];
+		auto const& fr  = m.freeSpans[si];
 		for (int y = yhi; y >= ylo; y--) {
 			const double yc = (y + 0.5) * yb;   // sample the band centre
 			char c = 0;
@@ -3129,9 +3269,9 @@ void deadEndDump() {
 	}
 	std::fclose(f);
 
-	log::info("Probe 8: interval map over slices {}..{} ({:.0f} units each), player "
+	log::info("Probe 8: interval map over {} exact x segments (x {:.0f}..{:.0f}), player "
 	          "height {:.0f} - {} free intervals, {} DEAD ({:.1f}%).",
-	          m.sx0, m.sx1, m.sw, m.playerH, m.freeCount, m.deadCount,
+	          m.segments(), m.xs.front(), m.xs.back(), m.playerH, m.freeCount, m.deadCount,
 	          m.freeCount > 0 ? 100.0 * m.deadCount / m.freeCount : 0.0);
 	log::info("  ':' is a gap too short for a {:.0f}-unit player. Blocked spans are real "
 	          "hitboxes, not buckets -> {}", m.playerH, path);
@@ -3698,6 +3838,10 @@ void pollHotkeys() {
 		if (PlayLayer::get()) geometryDump();
 		else log::warn("Probe 7: not in a level");
 	}
+
+	// R = reach sweep (Probe 9). Read-only; rebuilds the map several times and
+	// leaves it as it found it.
+	if (keyPressedEdge('R')) geometryReachSweep();
 
 	// H = dead-end map (Probe 8). Read-only, same as G.
 	if (keyPressedEdge('H')) {
@@ -6932,12 +7076,13 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// and wall-clock time are not interchangeable here.
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
-		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{}  "
+		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
 		          g_config.toggleBudget, sv.commitDepth, sv.lookbackSteps, sv.resyncs, sv.resyncFailures,
 		          CellProbe::get().cells.size(), sv.anchorReplays,
 		          sv.tapFirstChosen, sv.tapDecisions, sv.geoSteers, sv.geoLooks,
+		          sv.geoSteerDead, sv.geoSteerWin,
 		          stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
 	}
