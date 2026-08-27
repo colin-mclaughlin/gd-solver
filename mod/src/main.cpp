@@ -5346,7 +5346,19 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				if (steer != 0) sv.geoSteers++;
 			}
 			if (steer != 0) {
-				d.choice = steer > 0;
+				// geometrySteer speaks in WORLD y: +1 means get higher. Hold and
+				// tap thrust toward the player's own up, which is world-DOWN
+				// under inverted gravity - so which branch climbs flips with the
+				// gravity direction.
+				//
+				// MEASURED CONSEQUENCE of assuming hold always climbs: Cycles has
+				// a ship stretch alternating normal and reversed gravity portals
+				// between spikes. There the steer pushed AWAY from the window,
+				// which put the player further outside it, which made it steer
+				// again - 27888 steers from 67978 air decisions (41%), against
+				// 0.74% on a level it solves, and a hard stall at 58.12%.
+				const bool climb = steer > 0;
+				d.choice = m_player1->m_isUpsideDown ? !climb : climb;
 			} else if (d.modeClass == ModeClass::Tap && g_config.tapOrderByNeed) {
 				d.choice = tapFirst;
 				sv.tapDecisions++;
