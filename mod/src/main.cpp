@@ -377,8 +377,21 @@ struct Config {
 	// and seal at x 20400, so this sees the seal from x 20100.
 	int geomLookaheadX = 300;
 
-	int geomXMin = 18000;   // units; the region around ToE's third corridor set
-	int geomXMax = 21000;
+	// How far the player can move vertically while crossing one slice, in units.
+	//
+	// Used to widen the live window as it propagates backwards: far from a pinch
+	// you have room to manoeuvre into it, close to one you must already be
+	// lined up. Generous is the SAFE setting for ordering - a window that is too
+	// wide simply steers less often, while one that is too narrow steers when it
+	// need not. 60 units is two blocks per 30 units of travel.
+	int geomVerticalReach = 60;
+
+	// 0/0 means the WHOLE level. The dead-end map has always covered everything
+	// (slices -1..848 on ToE, x -30..25440 against a 25855-unit level); it was
+	// only this raw object listing that was windowed, which made a section look
+	// empty when it had simply never been dumped.
+	int geomXMin = 0;
+	int geomXMax = 0;
 	bool geomDumpObjects = true;  // also write the raw per-object list
 
 	// Probe 6: the corridor sweep.
@@ -2728,7 +2741,9 @@ void geometryDump() {
 		if (!solid && !hazard) continue;
 
 		const cocos2d::CCRect r = o->getObjectRect();
-		if (r.getMaxX() < g_config.geomXMin || r.getMinX() > g_config.geomXMax) continue;
+		const bool wholeLevel = g_config.geomXMin == 0 && g_config.geomXMax == 0;
+		if (!wholeLevel &&
+		    (r.getMaxX() < g_config.geomXMin || r.getMinX() > g_config.geomXMax)) continue;
 		inRange++;
 
 		if (fo) std::fprintf(fo, "%-11.2f %-9.2f %-9.2f %-9.2f %-6d %-6d %s\n",
@@ -2838,7 +2853,14 @@ struct GeoMap {
 	static GeoMap& get() { static GeoMap m; return m; }
 
 	struct Span { float lo, hi; uint8_t type; };      // 1 solid, 2 hazard
-	struct Free { float lo, hi; bool live; };
+	// `lo..hi` is the open gap. `wlo..whi` is the part of it from which the end
+	// of the level is still reachable - the LIVE WINDOW.
+	//
+	// A boolean was not enough. MEASURED at ToE's last ship section: the gap at
+	// x 24870 is 750..1050, 300 units, and 30 units later the only way through
+	// is 810..900. Marking the whole 300 live meant a ship at y 760 was "in live
+	// space" while already committed to the pillar it died on at x 24872.7.
+	struct Free { float lo, hi, wlo, whi; bool live; };
 
 	int    sx0 = 0, sx1 = -1;      // slice index range
 	double sw  = 30.0;             // slice width in units
@@ -2934,27 +2956,59 @@ bool geometryBuildMap() {
 		double cur = m.yLo;
 		for (auto const& sp : merged) {
 			if (sp.lo - cur >= m.playerH)
-				fr.push_back({static_cast<float>(cur), sp.lo, false});
+				fr.push_back({static_cast<float>(cur), sp.lo,
+				              static_cast<float>(cur), sp.lo, false});
 			cur = std::max(cur, static_cast<double>(sp.hi));
 		}
 		if (m.yHi - cur >= m.playerH)
-			fr.push_back({static_cast<float>(cur), static_cast<float>(m.yHi), false});
+			fr.push_back({static_cast<float>(cur), static_cast<float>(m.yHi),
+			              static_cast<float>(cur), static_cast<float>(m.yHi), false});
 		m.freeSpans[si - sx0] = fr;
 	}
 
 	// Forward sweep, right to left. x never decreases in GD: a mirror portal
 	// flips the CAMERA and leaves world coordinates alone (13.11), and a
 	// teleport portal cannot send the player backwards.
-	for (auto& f : m.freeSpans[n - 1]) f.live = true;
+	const double reach = std::max(0.0, static_cast<double>(g_config.geomVerticalReach));
+	for (auto& f : m.freeSpans[n - 1]) { f.live = true; f.wlo = f.lo; f.whi = f.hi; }
+
 	for (int si = sx1 - 1; si >= sx0; si--) {
 		auto& here = m.freeSpans[si - sx0];
 		auto const& next = m.freeSpans[si - sx0 + 1];
-		for (auto& f : here)
+		for (auto& f : here) {
+			// The window is the part of this gap that can reach a live window at
+			// the next slice, widened by how far the player can climb or fall
+			// while crossing. Taking the hull of the pieces rather than tracking
+			// them separately is permissive, which is the safe direction here.
+			double wlo = 1e18, whi = -1e18;
 			for (auto const& g : next) {
 				if (!g.live) continue;
-				const double ov = std::min(f.hi, g.hi) - std::max(f.lo, g.lo);
-				if (ov >= m.playerH) { f.live = true; break; }
+				// Clipped to g's OWN gap: the player may move vertically while
+				// crossing, but only inside the gap they are in - never through
+				// the floor between two gaps.
+				//
+				// MEASURED CONSEQUENCE of leaving it unclipped: ToE's top
+				// corridor window 1140..1200 widened to 1080..1260, overlapped
+				// the MIDDLE corridor 1050..1110 through the solid floor between
+				// them, and marked it live. Dead intervals fell 171 -> 27, the
+				// fake corridors stopped being flagged, and the level went
+				// straight back to stalling at 78.90%.
+				const double glo = std::max(static_cast<double>(g.lo),
+				                            static_cast<double>(g.wlo) - reach);
+				const double ghi = std::min(static_cast<double>(g.hi),
+				                            static_cast<double>(g.whi) + reach);
+				const double lo = std::max(static_cast<double>(f.lo), glo);
+				const double hi = std::min(static_cast<double>(f.hi), ghi);
+				if (hi - lo < m.playerH) continue;
+				wlo = std::min(wlo, lo);
+				whi = std::max(whi, hi);
 			}
+			if (whi - wlo >= m.playerH) {
+				f.live = true;
+				f.wlo  = static_cast<float>(wlo);
+				f.whi  = static_cast<float>(whi);
+			}
+		}
 	}
 
 	for (auto const& col : m.freeSpans)
@@ -2989,12 +3043,18 @@ int geometrySteer(double x, double y) {
 	// open space does.
 	auto const& fr = m.freeSpans[si - m.sx0];
 	bool inDead = false;
-	for (auto const& f : fr)
-		if (y >= f.lo && y <= f.hi) {
-			if (f.live) return 0;      // headed somewhere with a route: leave it
-			inDead = true;
-			break;
+	for (auto const& f : fr) {
+		if (y < f.lo || y > f.hi) continue;
+		if (f.live) {
+			// Inside the gap, but is it inside the part that gets through? At a
+			// pinch the window is far narrower than the gap, and this is the
+			// difference between routing and not.
+			if (y >= f.wlo && y <= f.whi) return 0;
+			return y < f.wlo ? 1 : -1;
 		}
+		inDead = true;
+		break;
+	}
 	if (!inDead) return 0;             // blocked, or a gap too small: no opinion
 
 	double best = 1e18;
@@ -3031,8 +3091,8 @@ void deadEndDump() {
 	std::fprintf(f, "# slices %.0f units wide, x slice %d..%d; player height %.0f\n",
 	             m.sw, m.sx0, m.sx1, m.playerH);
 	std::fprintf(f, "# %d free intervals, %d of them DEAD\n", m.freeCount, m.deadCount);
-	std::fprintf(f, "# S solid  H hazard  . open and CAN reach the level end  "
-	                "X open but DEAD (no forward route)\n");
+	std::fprintf(f, "# S solid  H hazard  . inside the live window  o open and live but "
+	                "OUTSIDE the window  X dead\n");
 	std::fprintf(f, "# Blocked spans come from real object hitboxes, so a 7.2-tall spike\n"
 	                "# blocks 7.2 units. Picture is sampled at each 30-unit band centre.\n#\n");
 
@@ -3054,7 +3114,12 @@ void deadEndDump() {
 			if (!c) {
 				c = ' ';
 				for (auto const& fs : fr)
-					if (yc >= fs.lo && yc <= fs.hi) { c = fs.live ? '.' : 'X'; break; }
+					if (yc >= fs.lo && yc <= fs.hi) {
+						// 'o' is open and live but OUTSIDE the window that gets
+						// through - the part a route must not be in.
+						c = !fs.live ? 'X' : (yc >= fs.wlo && yc <= fs.whi) ? '.' : 'o';
+						break;
+					}
 				// A gap too short for the player is neither free nor blocked.
 				if (c == ' ') c = ':';
 			}
