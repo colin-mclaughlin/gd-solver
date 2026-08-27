@@ -446,7 +446,17 @@ struct Config {
 	// within ~40 units of a wall, in a 90-unit pillar slot it fires almost at
 	// once. 0.5 reproduces the old behaviour exactly (fire only when outside the
 	// window), so this is a strict generalisation.
-	double geomClearanceBand = 0.25;
+	// 0.25 works but over-fires: Theory of Everything solved in 1m08s with
+	// steering on 58.5%% of air decisions, against 26s and 10.7%% on the older
+	// grid map. 0.5 is the other endpoint and stalls both levels outright. The
+	// useful value is between them and this is the first probe.
+	//
+	// Tuning against ToE alone would be a mistake: it is the atypical level,
+	// the only one in the set with fake corridors (254 dead steers). Clutterfunk
+	// took ZERO dead steers and depends on clearance for all of its benefit, so
+	// the band is the only thing that matters there. Sweep across levels of
+	// different character, not against the one that motivated the feature.
+	double geomClearanceBand = 0.35;
 
 	// 0/0 means the WHOLE level. The dead-end map has always covered everything
 	// (slices -1..848 on ToE, x -30..25440 against a 25855-unit level); it was
@@ -3134,7 +3144,18 @@ int geometrySteer(double x, double y) {
 			const double lo = static_cast<double>(f.wlo);
 			const double hi = static_cast<double>(f.whi);
 			const double centre = 0.5 * (lo + hi);
-			const double band = std::max(0.0, g_config.geomClearanceBand) * (hi - lo);
+			// The deadband is a fraction of the SLACK, not of the window height.
+			//
+			// The player fits while |y - centre| <= (height - playerH)/2, so that
+			// is the hard limit and the deadband should be a fraction of it. A
+			// flat fraction of height is far too loose at a pinch and about right
+			// in the open: MEASURED at band 0.35, ToE stalled at 96.29% because
+			// its pillar slot is 90 units and 0.35 of that is 31.5 - most of the
+			// way to the wall - while the same value took Time Machine from a
+			// 2m00 baseline to 50s. The value was not wrong; what it multiplied
+			// was.
+			const double slack = 0.5 * std::max(0.0, (hi - lo) - m.playerH);
+			const double band  = std::max(0.0, g_config.geomClearanceBand) * slack;
 			if (std::abs(y - centre) <= band) return 0;
 			Solver::get().geoSteerWin++;
 			return y < centre ? 1 : -1;
