@@ -377,6 +377,73 @@ struct Config {
 	// and seal at x 20400, so this sees the seal from x 20100.
 	int geomLookaheadX = 300;
 
+	// Lead term: steer on where the player is HEADING, not where it is, in steps
+	// of current vertical velocity.
+	//
+	// Comparing current y against a window 300 units ahead assumes y will not
+	// change over that stretch, which makes the steer a proportional controller
+	// on position with no velocity term. On a double integrator - hold
+	// accelerates up, release accelerates down - a P controller overshoots, and
+	// against a MOVING reference it never catches up at all: tracking a ramp with
+	// P alone leaves permanent error.
+	//
+	// MEASURED: all four remaining stalls are air modes in tunnels that rise and
+	// fall - Clutterfunk 56% (mini ship, saw-lined tunnel), Theory of Everything
+	// 33% and 77% (UFO, neither a fake corridor), Time Machine's last ship
+	// section (up-and-down tunnel through a gravity portal). Not one is a static
+	// passage, and not one is a routing failure. That is the signature of lag
+	// against a moving target, not of a wrong route.
+	//
+	// y + lead*vy is where constant velocity puts the player in `lead` steps.
+	//
+	// Split by MODE CLASS, not tuned per level. A single lead of 8 took Time
+	// Machine from 59s to 8 seconds - budget 1, zero escapes, 742 deaths - while
+	// roughly doubling deaths on Clutterfunk (4196 -> 7722) and Theory of
+	// Everything (7870 -> 15855). That split follows the action model exactly:
+	//
+	//   Hold modes (ship, wave) accelerate continuously, so vy changes smoothly
+	//   and projecting several steps ahead forecasts well. Time Machine's stall
+	//   was a rising-and-falling ship tunnel, which is why it benefited most.
+	//
+	//   Tap modes (UFO, swing) are impulsive: vy jumps at every tap, so sampled
+	//   just after one it projects far up and just before one far down. Beyond a
+	//   step or two the projection is noise, and steering on noise is what made
+	//   ToE's UFO sections worse - its dead-space steers went 254 -> 1071, i.e.
+	//   it was being pushed INTO corridors it had been avoiding.
+	//
+	// Keying on the action model rather than on which levels happen to be under
+	// test is the point: mode dynamics generalise, level results do not.
+	double geomLeadHold = 8.0;   // ship, wave, normal size
+	double geomLeadTap  = 2.0;   // UFO, swing
+
+	// Mini ship and wave move faster and climb at a steeper slope, so the same
+	// number of steps of vy projects much further. MEASURED: lead 8 took Time
+	// Machine's normal-ship tunnel from 59s to 7s, and left Clutterfunk - whose
+	// remaining stall is a MINI ship tunnel - at 1m09s against 49s with no lead
+	// at all. Same mode class, opposite result, and the difference between them
+	// is size.
+	//
+	// Shorter rather than longer: a bigger vy over the same horizon overshoots,
+	// so the horizon has to come down to compensate.
+	double geomLeadMini = 4.0;   // mini ship, mini wave
+
+	// Following the geometry costs no toggle budget; deviating from it still
+	// does.
+	//
+	// The toggle budget was chosen when the solver was blind. It prices every
+	// input change identically, so a tap that climbs into the correct corridor
+	// costs exactly as much as a random one - which is why ToE's corridors were
+	// unreachable until geometry supplied the ordering. What is worth bounding
+	// now is not HOW MANY inputs a path uses but HOW FAR it departs from the
+	// route the level implies.
+	//
+	// Setting decisionCost to 0 outright would remove the bound, but the
+	// escalation ladder is keyed to it: solverBacktrack stops at the commit
+	// floor and returns false, which deepens the budget and reopens the
+	// frontier. With nothing to deepen that becomes a spin, so the bound has to
+	// stay meaningful rather than be deleted.
+	bool geomFreeFollowing = true;
+
 	// How far the player can move vertically while crossing one slice, in units.
 	//
 	// Used to widen the live window as it propagates backwards: far from a pinch
@@ -456,7 +523,7 @@ struct Config {
 	// took ZERO dead steers and depends on clearance for all of its benefit, so
 	// the band is the only thing that matters there. Sweep across levels of
 	// different character, not against the one that motivated the feature.
-	double geomClearanceBand = 0.35;
+	double geomClearanceBand = 0.25;
 
 	// 0/0 means the WHOLE level. The dead-end map has always covered everything
 	// (slices -1..848 on ToE, x -30..25440 against a 25855-unit level); it was
@@ -2092,6 +2159,11 @@ struct Decision {
 	int  tapsBefore    = 0;     // taps used on the path up to this decision
 	bool modeTransition = false; // pushed because the game mode changed here
 
+	// What the geometry asked for at this decision, if anything. Stored because
+	// decisionCost sees only the Decision, long after the player has moved on.
+	bool hasSteer    = false;
+	bool steerChoice = false;
+
 	RestoreState rs;            // the state entering this decision
 };
 
@@ -2114,6 +2186,8 @@ int tapAllowance(int window) {
 }
 
 int decisionCost(Decision const& d, bool choice) {
+	// Free if it is what the map asked for.
+	if (g_config.geomFreeFollowing && d.hasSteer && choice == d.steerChoice) return 0;
 	switch (d.modeClass) {
 		// A tap costs 1. Charging per RHYTHM CHANGE instead (cheap bursts,
 		// expensive isolated taps) was tried and regressed Theory of Everything
@@ -3115,9 +3189,15 @@ bool geometryBuildMap() {
 //
 // 0 is the common answer: if the player is already inside a live interval at the
 // lookahead, nothing needs steering.
-int geometrySteer(double x, double y) {
+int geometrySteer(double x, double y, double vy, double lead) {
 	auto const& m = GeoMap::get();
 	if (!m.valid) return 0;
+
+	// Everything below asks about the player's altitude at the lookahead. Answer
+	// with the projected altitude rather than the current one - see
+	// geomLeadHold / geomLeadTap. World coordinates throughout: the caller flips the sign
+	// for inverted gravity when turning this into hold or tap.
+	y += lead * vy;
 	const int si = m.segIndex(x + static_cast<double>(g_config.geomLookaheadX));
 	if (si < 0) return 0;
 
@@ -3144,18 +3224,15 @@ int geometrySteer(double x, double y) {
 			const double lo = static_cast<double>(f.wlo);
 			const double hi = static_cast<double>(f.whi);
 			const double centre = 0.5 * (lo + hi);
-			// The deadband is a fraction of the SLACK, not of the window height.
-			//
-			// The player fits while |y - centre| <= (height - playerH)/2, so that
-			// is the hard limit and the deadband should be a fraction of it. A
-			// flat fraction of height is far too loose at a pinch and about right
-			// in the open: MEASURED at band 0.35, ToE stalled at 96.29% because
-			// its pillar slot is 90 units and 0.35 of that is 31.5 - most of the
-			// way to the wall - while the same value took Time Machine from a
-			// 2m00 baseline to 50s. The value was not wrong; what it multiplied
-			// was.
-			const double slack = 0.5 * std::max(0.0, (hi - lo) - m.playerH);
-			const double band  = std::max(0.0, g_config.geomClearanceBand) * slack;
+			// Fraction of the window HEIGHT. Slack-relative was tried and is
+			// worse overall: it made narrow windows demand near-perfect centring
+			// (a 20-unit gap has 2.5 units of slack, so under a unit of
+			// deadband), which took Time Machine to 28s - its fastest ever - and
+			// collapsed Theory of Everything to 29.65% with steering on 61% of
+			// decisions. Three levels wanted three different values, which is
+			// overfitting rather than tuning, so this is back to the only setting
+			// that solved all of them.
+			const double band = std::max(0.0, g_config.geomClearanceBand) * (hi - lo);
 			if (std::abs(y - centre) <= band) return 0;
 			Solver::get().geoSteerWin++;
 			return y < centre ? 1 : -1;
@@ -5506,11 +5583,22 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			int steer = 0;
 			if (g_config.geometryOrdering && GeoMap::get().valid) {
 				sv.geoLooks++;
+				// GD's mini is vehicleSize 0.6 against 1.0 normal; the death log
+				// prints the observed value so the threshold can be checked
+				// rather than assumed.
+				const bool mini = m_player1->m_vehicleSize < 0.9f;
+				const double lead =
+					(d.modeClass == ModeClass::Tap) ? g_config.geomLeadTap
+					: mini                          ? g_config.geomLeadMini
+					                                : g_config.geomLeadHold;
 				steer = geometrySteer(m_player1->getPositionX(),
-				                      m_player1->getPositionY());
+				                      m_player1->getPositionY(),
+				                      static_cast<double>(m_player1->m_yVelocity),
+				                      lead);
 				if (steer != 0) sv.geoSteers++;
 			}
 			if (steer != 0) {
+				d.hasSteer = true;
 				// geometrySteer speaks in WORLD y: +1 means get higher. Hold and
 				// tap thrust toward the player's own up, which is world-DOWN
 				// under inverted gravity - so which branch climbs flips with the
@@ -5524,6 +5612,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				// 0.74% on a level it solves, and a hard stall at 58.12%.
 				const bool climb = steer > 0;
 				d.choice = m_player1->m_isUpsideDown ? !climb : climb;
+				d.steerChoice = d.choice;
 			} else if (d.modeClass == ModeClass::Tap && g_config.tapOrderByNeed) {
 				d.choice = tapFirst;
 				sv.tapDecisions++;
@@ -7462,14 +7551,14 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				const bool air = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
 				log::info("Solver {} #{}: step {} X {:.1f} {:.2f}%  policy={}  "
 				          "ship={} ufo={} wave={} swing={} ball={} robot={} spider={}  "
-				          "onGround={}/{}/{}/{}  yVel={:.3f}  hold={}",
+				          "onGround={}/{}/{}/{}  yVel={:.3f}  size={:.2f}  hold={}",
 				          geoDead ? "DEAD-CELL" : "death",
 				          sv.deaths, sv.step, sv.diedAtX, pl->getCurrentPercent(),
 				          air ? "AIR" : "CUBE",
 				          p->m_isShip, p->m_isBird, p->m_isDart, p->m_isSwing,
 				          p->m_isBall, p->m_isRobot, p->m_isSpider,
 				          p->m_isOnGround, p->m_isOnGround2, p->m_isOnGround3, p->m_isOnGround4,
-				          p->m_yVelocity, sv.hold);
+				          p->m_yVelocity, p->m_vehicleSize, sv.hold);
 			}
 
 			if (!solverBacktrack()) {
