@@ -115,6 +115,48 @@ struct Config {
 	// knob to tighten if a section proves unsolvable.
 	int airBranchInterval = 4;
 
+	// Branch where the LEVEL changes, not on a metronome.
+	//
+	// Air decisions land every airBranchInterval steps whether or not anything
+	// is happening. In a long featureless corridor that is many identical
+	// decisions, each costing a ~22 KB checkpoint, none of which the level ever
+	// asked for. Branching when the live interval ahead actually changes puts
+	// decisions where the geometry demands a choice and skips the rest.
+	//
+	// Segment boundaries only exist at object edges, so "the interval ahead
+	// changed" is close to "an edge that matters was crossed" - the map's own
+	// structure supplies the cadence and no new constant does.
+	//
+	// airBranchIntervalMax bounds it: after that many steps a decision is forced
+	// regardless, so a stretch the map has no opinion about can never go
+	// unbranched. Completeness is unaffected either way - this changes WHERE
+	// decisions sit, and every input sequence remains reachable.
+	//
+	// Unlike the forward scan this does NOT raise the steer rate, which the
+	// session's evidence says is the variable that decides whether the map helps
+	// (36% solves, 69% and 93% stall). M toggles it.
+	// 0 off (flat cadence), 1 change-gated, 2 change-gated EXCEPT in tight
+	// corridors, which keep the full cadence.
+	//
+	// MEASURED, Clutterfunk: mode 1 blew past the 35.53%% wall the flat cadence
+	// had never beaten, reaching 55.65%%, with throughput more than doubled
+	// (8530 steps/s against 4000) because branches run far longer before dying.
+	// Then it stalled at the mini ship.
+	//
+	// The reason is that geometry change is not control difficulty. A long
+	// straight narrow tunnel has almost no object edges, so the corridor never
+	// "changes" and the gate suppresses decisions - in exactly the place a mini
+	// ship needs one every few steps. Mode 2 keys density on how TIGHT the
+	// corridor is instead, which is what control difficulty actually tracks.
+	int  geomBranchMode = 0;
+	int  airBranchIntervalMax = 16;
+
+	// A corridor narrower than this many player heights is "tight" and keeps the
+	// full branch cadence. In player heights rather than units so it means the
+	// same thing for every hitbox: 6 is a corridor with under three body-widths
+	// of slack either side.
+	double geomTightHeights = 6.0;
+
 	// How long a discrete tap holds the button. Only needs to outlast the
 	// measured one-step injection latency so the press registers as an edge;
 	// holding longer does nothing in UFO or swing and would only crowd the next
@@ -375,7 +417,158 @@ struct Config {
 	// 230 physics steps - close to the 240-step mutable window, and far enough
 	// to see past a fork before reaching it: ToE's corridors split at x 20130
 	// and seal at x 20400, so this sees the seal from x 20100.
-	int geomLookaheadX = 300;
+	// Lookahead as a REACTION TIME in steps, converted to distance with the
+	// player's own measured horizontal speed.
+	//
+	// It used to be a flat 300 units, which silently assumes one speed. At 2x
+	// speed the player covers 300 units in half the time, so it gets half the
+	// warning; at 3x, a third. Electrodynamix introduces 2x and 3x and stalls
+	// three times (34.89%, 73.65%, 94.01% - 67 of its 111 seconds), which is
+	// what that would look like.
+	//
+	// 229 steps is 300 units at 1x, so this is inert on every level that already
+	// solves and only changes behaviour where the speed does.
+	//
+	// Measured rather than read from speed portals on purpose: the player is
+	// right here, so its actual dx per step is available and is the truth,
+	// including anything we have not modelled. Portals are needed for the map's
+	// vertical reach, where the player is NOT there to measure.
+	int geomLookaheadSteps = 229;
+
+	// Scale the lookahead with measured speed. OFF: MEASURED, Electrodynamix went
+	// from a 1m51s clear to stalling at 92.92%% twice, with dx 1.95 turning the
+	// 300-unit lookahead into 447.
+	//
+	// The reason is a coupling. geomVerticalReach is still 60 units of y per 30
+	// units of x, which at 1.5x speed is far too generous - the player has fewer
+	// steps to cross those 30 units, so it cannot climb that far - and the fast
+	// sections windows are correspondingly too wide. The fixed 300-unit lookahead
+	// was COMPENSATING for that: looking a shorter distance ahead made the
+	// over-wide windows matter less. Fixing one error alone removed the
+	// cancellation.
+	//
+	// Both constants are distance-based and both are wrong under a speed change,
+	// in opposite directions. They have to be fixed together, and reach needs the
+	// speed-portal scan because the player is not there to be measured.
+	// OFF. MEASURED, three builds:
+	//   both off ................. Electrodynamix 1m51s CLEAR
+	//   lookahead only ........... 92.92%% stall
+	//   lookahead + reach ........ 29.47%% stall
+	//
+	// The pair does not cancel after all, and the reach half is what does the
+	// damage - see geomSpeedReach. Back to the configuration that clears while
+	// the climb rate is measured.
+	bool geomLookaheadScaleWithSpeed = false;
+	int  geomLookaheadFixedX = 300;   // used while the above is off
+
+	// Read the level's speed rather than assuming one. MEASURED from
+	// Electrodynamix's own object list: exactly two speed portals in the whole
+	// level, objID 202 at x 2353.5 and objID 203 at x 19906.5, and the reported
+	// dx per step was 1.61 before the second and 1.95 after - which is Fast and
+	// Faster to three decimals. Both are GameObjectType 20, the same type as the
+	// level's 208 colour triggers, so objectID is the only usable discriminator.
+	bool geomSpeedScan = true;
+
+	// Forward scan. OFF samples ONE slice at x + lookahead, which is what the
+	// steer has always done and means a constriction anywhere in between is
+	// invisible - at ToE's last ship section the lookahead lands 270 units past
+	// the pillar it needs to thread.
+	//
+	// ON walks every slice from the player to the lookahead, following the
+	// corridor it is actually in, and intersects the live intervals as it goes.
+	// The running intersection is the set of altitudes that can see straight
+	// through; when it would pinch below a player height the scan stops and
+	// aims at the last one that fits. That targets the gap the player must
+	// thread next, and it needs no constant - the geometry decides where to
+	// stop.
+	//
+	// Deliberately conservative: it ignores that the player can move vertically
+	// while crossing, so it never claims a line-of-sight it does not have. It
+	// only picks a steering target, never marks anything dead, so being tight
+	// cannot produce the false-dead failure that killed the per-speed reach.
+	//
+	// N toggles it. The prior from this session is that it will NOT help -
+	// window propagation delivered the same information at ToE's pillar and was
+	// worth 2%, while the escalation ladder was worth 22% - but the two are not
+	// the same mechanism and this has never actually been measured.
+	bool geomForwardScan = false;
+
+	// Divide the map's vertical reach by the segment's speed. MEASURED: OFF.
+	// Electrodynamix went from a 1m51s clear to a 29.47%% stall - worse than the
+	// lookahead change alone managed - and the run says exactly why. Dead
+	// intervals went 167 -> 338 and dead-space steers went from 31 across the
+	// whole old run to 696 in half of this one, with the steer rate 35%% -> 67%%.
+	// Reachable space was marked dead and the steering then pushed the player
+	// away from the route it needed.
+	//
+	// The reasoning behind the change is sound for a PHYSICAL bound: vertical
+	// motion is per-step, so crossing the same 30 units at 2x gives 0.80 of the
+	// steps and 0.80 of the climb. The error was assuming geomVerticalReach IS
+	// that bound. It is a tightness heuristic, and being deliberately tighter
+	// than physics is what produces dead detection at all - so it was already
+	// sitting near a cliff, and 20%% more broke it.
+	//
+	// Whether this can be turned on depends on how far 60 sits from the real
+	// climb rate, which is what the climb instrumentation below measures.
+	bool geomSpeedReach = false;
+
+	// Liveness: propagate the live window backward from the end of the level so
+	// a gap that leads nowhere can be told from one that leads out. OFF means
+	// infinite reach - every free interval connects to every free interval in
+	// the next slice, so everything is live and dead-space steering never fires.
+	//
+	// Switchable because reach has ALWAYS been one fitted constant - 60 per 30
+	// units, every mode, every speed, every size, the whole level - and nothing
+	// has ever measured what the signal it produces is worth. What survives with
+	// it off: exact walls, free intervals and their centres (clearance
+	// steering), the player-fits-through test, the ceiling. What dies:
+	// fake-corridor routing.
+	//
+	// The test case is unambiguous. Clutterfunk takes ZERO dead steers and gains
+	// entirely from clearance, so it should be unaffected. Theory of Everything
+	// uses both. If ToE holds up with this off, the whole reachability model -
+	// per-mode reach, (y, vy) propagation, terminal velocity, pads and rings as
+	// transitions - is unnecessary and should not be built.
+	//
+	// CORRECTION to the note above: reach does NOT decide whether a gap is live.
+	// The sweep requires two intervals to OVERLAP in y by a player height before
+	// they connect at all; reach only widens a gap's window WITHIN its own gap.
+	// So with reach infinite the sweep is still a real backward connectivity
+	// flood, and fake corridors are still excluded - the bottom corridor is
+	// walled off at the pinch and separated from the top by a floor, so nothing
+	// coming backward from the end can enter it.
+	//
+	// What reach actually buys is WINDOW NARROWING: carrying a distant pinch
+	// backward. ToE's last ship section is a 300-unit gap where only 90 units
+	// lead anywhere, and reach is what propagates that 90.
+	//
+	// So there are three settings worth measuring, not two:
+	//   0 Windowed  - today. Overlap flood + reach-propagated narrowing.
+	//   1 Overlap   - infinite reach. Full connectivity flood, NO narrowing and
+	//                 no fitted constant anywhere. Fake corridors still routed.
+	//   2 AllLive   - liveness off entirely. Clearance only, for reference.
+	//
+	// L cycles them and rebuilds the map, so one session measures all three.
+	//
+	// MEASURED on Theory of Everything, all three built from the same level in
+	// one session:
+	//   WINDOWED  5610 free, 266 dead (4.7%), mean live window 564
+	//   OVERLAP   5610 free, 248 dead (4.4%), mean live window 563
+	//   ALLLIVE   5610 free,   0 dead (0.0%), mean live window 542
+	// and then solved in OVERLAP in 20 SECONDS against a previous best of 21.
+	//
+	// So reach contributed nothing. 93%% of the dead intervals are found by
+	// overlap connectivity alone, the mean window differs by one unit, and the
+	// level that depends on liveness most solves at least as fast without it.
+	// Fake corridors are excluded because they are walled off at the pinch and
+	// separated from the real corridor by a floor, so a strictly backward flood
+	// can never enter them - no reach constant is involved in that at all.
+	//
+	// OVERLAP is now the default and geomVerticalReach is dead weight kept only
+	// so WINDOWED stays measurable. What this deletes: the per-mode reach model,
+	// (y, vy) propagation, terminal-velocity measurement, a calibration level,
+	// and pads/rings as reachability transitions.
+	int geomReachMode = 1;
 
 	// Lead term: steer on where the player is HEADING, not where it is, in steps
 	// of current vertical velocity.
@@ -642,7 +835,27 @@ struct Config {
 	// ran the whole ladder in ~2 minutes, before the search had meaningfully
 	// explored any single window. Escapes come cheaply early in a level, so the
 	// trigger must be slow enough that widening means "genuinely exhausted".
-	int escapesBeforeWidening  = 6;
+	// Escapes with no progress before the mutable window is widened. With
+	// stallLimit at 400 deaths per escape, 6 means 2400 deaths of thrashing
+	// before the ladder moves at all.
+	//
+	// MEASURED as the single largest block of wasted time left. Clutterfunk,
+	// 48 seconds total: 4s of fast progress to 35.53%, then 21 SECONDS stuck
+	// waiting out this counter, then the widen at 240 -> 480, then 23s to solve.
+	// Nothing in that 21s moved best% by a hundredth.
+	//
+	// J cycles 6 / 3 / 1 so the direction can be measured rather than guessed.
+	// Widening early is not free - it lowers the commit floor, so more of the
+	// prefix becomes mutable and the search re-explores ground it had settled.
+	//
+	// MEASURED on Clutterfunk, three runs back to back in one session:
+	//   6  49s, 189644 steps
+	//   3  38s, 154152 steps   <- optimum, both neighbours worse
+	//   1  66s, 255074 steps
+	// At 1 the ladder escalated four times in eleven seconds, 240 -> 3840, blew
+	// past the commit floor and re-explored settled ground. A real optimum, not
+	// "smaller is better".
+	int escapesBeforeWidening  = 3;
 	int wideningFactor         = 2;
 	int maxCommitLookbackSteps = 7680; // 32 s
 
@@ -2250,6 +2463,64 @@ struct Solver {
 	uint64_t              geoSteerWin  = 0;   // ...because it was outside a live window
 	uint64_t              geoLooks     = 0;   // air decisions the map was consulted on
 
+	// The player's horizontal speed, measured. Held across restores rather than
+	// recomputed, because a restore jumps x backwards and the delta across one
+	// is meaningless.
+	double                prevX        = 0.0;
+	double                dxPerStep    = 1.31;  // 1x; replaced on the first step
+
+	// The largest vertical move the player has actually made in one step, per
+	// air mode, in world units - the same units the map's reach is in.
+	//
+	// geomVerticalReach = 60 per geomSliceX = 30 makes the map's implied climb
+	// 2.60 units per step at 1x. Nothing has ever checked that against the game.
+	// If the real figure is far higher then the map is not modelling reach at
+	// all, it is applying a deliberate tightness that happens to produce useful
+	// dead detection - and that changes what a speed correction should even do.
+	//
+	// Same guard as dxPerStep: only counted on a step that was a real forward
+	// step, never across a restore.
+	double                prevY        = 0.0;
+
+	// The live interval ahead as it was at the last air decision, so a change
+	// can be noticed. See geomBranchMode.
+	double                lastGeoLo    = 0.0;
+	double                lastGeoHi    = 0.0;
+
+	// [mode][size][speed][direction], where mode is 0 ship, 1 wave, 2 UFO,
+	// 3 anything else; size is 0 normal, 1 mini; speed is 0..4 slow to fastest;
+	// direction is 0 up, 1 down.
+	//
+	// SPEED IS IN HERE TO FALSIFY AN ASSUMPTION, not because it is believed to
+	// matter. The reach model assumes vertical acceleration is per-step and
+	// independent of horizontal speed - which would make a 3x ship's path look
+	// flatter while its vy is unchanged. If that holds, a mode's up figure is
+	// the same across every speed column and the columns can be collapsed. If
+	// it does not, the columns differ and the model needs a speed term. Reading
+	// one aggregate number could not tell the two apart.
+	//
+	// Up and down are kept apart because they are not the same number in GD -
+	// a ship's climb and its fall are separate accelerations - and the map's
+	// backward sweep widens a window in BOTH directions from one figure, so it
+	// is currently using the wrong one in at least one of them.
+	//
+	// The largest single-step move is terminal vertical velocity in the map's
+	// own units, which is exactly the constant an (y, vy) propagation needs.
+	// Caveat worth remembering when reading it: this is the max OBSERVED, so it
+	// is a LOWER bound on capability. It can prove 2.60 is too tight; it cannot
+	// prove 2.60 is enough.
+	double                maxClimb[4][2][5][2] = {};
+
+	// Which speed column a measured dx belongs in: nearest of the five, split
+	// at the midpoints.
+	static int speedBucket(double dx) {
+		if (dx < 1.172) return 0;
+		if (dx < 1.456) return 1;
+		if (dx < 1.782) return 2;
+		if (dx < 2.175) return 3;
+		return 4;
+	}
+
 	// How often the tap-ordering rule fires, split by gravity direction. The
 	// point is to catch over-tapping from the FIRST report line rather than by
 	// inferring it from a stalled percentage an hour later.
@@ -2400,6 +2671,11 @@ struct Solver {
 		geoDeaths = 0;
 		geoSteers = geoLooks = 0;
 		geoSteerDead = geoSteerWin = 0;
+		prevX = 0.0;
+		dxPerStep = 1.31;
+		prevY = 0.0;
+		lastGeoLo = lastGeoHi = 0.0;
+		std::memset(maxClimb, 0, sizeof(maxClimb));
 		tapDecisions = tapFirstChosen = 0;
 	}
 
@@ -2881,7 +3157,17 @@ void geometryDump() {
 		const int t = static_cast<int>(o->getType());
 		typeCount[t]++;
 
-		// Decoration has no collision, so it is not part of the route problem.
+		// Everything except pure decoration is written to the object listing:
+		// portals, pads and rings are invisible to the map today and are exactly
+		// what it needs next - speed for the vertical reach, mode for per-mode
+		// player height and ground. Only solid and hazard enter the grid.
+		if (fo && t != static_cast<int>(GameObjectType::Decoration)) {
+			const cocos2d::CCRect rr = o->getObjectRect();
+			std::fprintf(fo, "%-11.2f %-9.2f %-9.2f %-9.2f %-6d %-6d %s\n",
+			             rr.getMinX(), rr.getMinY(), rr.size.width, rr.size.height,
+			             t, o->m_objectID, "other");
+		}
+
 		const bool solid  = t == static_cast<int>(GameObjectType::Solid) ||
 		                    t == static_cast<int>(GameObjectType::Slope) ||
 		                    t == static_cast<int>(GameObjectType::Breakable);
@@ -2995,6 +3281,51 @@ void geometryDump() {
 // Segments have variable width, so the vertical reach scales with width rather
 // than being a flat per-slice constant: geomVerticalReach is still expressed per
 // geomSliceX units of travel, which keeps 60 meaning what it always meant.
+// GD's five speeds, in world units per 1/240 physics step.
+//
+// The two the solver has actually seen are confirmed against the player's own
+// motion: Electrodynamix reported dx 1.61 through its objID-202 section and
+// 1.95 through its objID-203 section, matching Fast and Faster here. The other
+// three are the same well-known series and are checked the same way the moment
+// a level uses one - solverReport prints measured dx beside the map's expected
+// dx, so a wrong entry shows up as a mismatch rather than as a silent stall.
+constexpr double kSpeedSlow    = 251.16 / 240.0;   // 1.0465
+constexpr double kSpeedNormal  = 311.58 / 240.0;   // 1.2983
+constexpr double kSpeedFast    = 387.42 / 240.0;   // 1.6143
+constexpr double kSpeedFaster  = 468.00 / 240.0;   // 1.9500
+constexpr double kSpeedFastest = 576.00 / 240.0;   // 2.4000
+
+// Speed portals. objectID is the discriminator: these share GameObjectType 20
+// with colour and pulse triggers, so the type says nothing.
+double speedForPortalID(int objID) {
+	switch (objID) {
+		case 200:  return kSpeedSlow;
+		case 201:  return kSpeedNormal;
+		case 202:  return kSpeedFast;
+		case 203:  return kSpeedFaster;
+		case 1334: return kSpeedFastest;
+		default:   return 0.0;   // not a speed portal
+	}
+}
+
+const char* geomReachModeName(int mode) {
+	switch (mode) {
+		case 1:  return "OVERLAP (infinite, no narrowing)";
+		case 2:  return "ALLLIVE (liveness off)";
+		default: return "WINDOWED";
+	}
+}
+
+double speedForStartSetting(int startSpeed) {
+	switch (startSpeed) {
+		case 1:  return kSpeedSlow;      // Speed::Slow
+		case 2:  return kSpeedFast;      // Speed::Fast
+		case 3:  return kSpeedFaster;    // Speed::Faster
+		case 4:  return kSpeedFastest;   // Speed::Fastest
+		default: return kSpeedNormal;    // Speed::Normal
+	}
+}
+
 struct GeoMap {
 	static GeoMap& get() { static GeoMap m; return m; }
 
@@ -3009,6 +3340,11 @@ struct GeoMap {
 	std::vector<double> xs;        // segment boundaries; segment i is [xs[i], xs[i+1])
 	std::vector<std::vector<Span>> blocked;
 	std::vector<std::vector<Free>> freeSpans;
+
+	// Horizontal units per physics step in each segment, from the level's start
+	// speed and its speed portals. The map is built before the run, so unlike
+	// the lookahead this cannot be measured off the player - it has to be read.
+	std::vector<float> segSpeed;
 	double yLo = 0.0, yHi = 0.0;
 	double playerH = 15.0;         // smallest hitbox height: permissive
 	int  freeCount = 0, deadCount = 0;
@@ -3033,8 +3369,15 @@ struct GeoMap {
 		return false;
 	}
 
+	// Units per step at x, or the 1x value outside the mapped range.
+	double speedAt(double x) const {
+		const int si = segIndex(x);
+		if (si < 0 || si >= static_cast<int>(segSpeed.size())) return kSpeedNormal;
+		return segSpeed[si];
+	}
+
 	void clear() {
-		xs.clear(); blocked.clear(); freeSpans.clear();
+		xs.clear(); blocked.clear(); freeSpans.clear(); segSpeed.clear();
 		freeCount = deadCount = 0; valid = false;
 	}
 };
@@ -3054,11 +3397,22 @@ bool geometryBuildMap() {
 	std::vector<double> edges;
 	double ylo = 1e18, yhi = -1e18;
 
+	// (x, units per step) for every speed portal, collected in the same pass.
+	std::vector<std::pair<double, double>> speedPortals;
+
 	auto* arr = gl->m_objects;
 	for (unsigned int i = 0; i < arr->count(); i++) {
 		auto* o = static_cast<GameObject*>(arr->objectAtIndex(i));
 		if (!o) continue;
 		const int t = static_cast<int>(o->getType());
+
+		// Before the solid/hazard filter: portals are neither.
+		if (g_config.geomSpeedScan) {
+			const double sp = speedForPortalID(o->m_objectID);
+			if (sp > 0.0) speedPortals.emplace_back(
+				static_cast<double>(o->getPositionX()), sp);
+		}
+
 		const bool solid  = t == static_cast<int>(GameObjectType::Solid) ||
 		                    t == static_cast<int>(GameObjectType::Slope) ||
 		                    t == static_cast<int>(GameObjectType::Breakable);
@@ -3138,17 +3492,65 @@ bool geometryBuildMap() {
 		m.freeSpans[si] = fr;
 	}
 
+	// Speed per segment: the level's start speed until the first portal, then
+	// whatever the last portal to the left of the segment set. Portals are
+	// sorted because m_objects is in no particular x order.
+	{
+		double startSpeed = kSpeedNormal;
+		if (g_config.geomSpeedScan && gl->m_levelSettings)
+			startSpeed = speedForStartSetting(
+				static_cast<int>(gl->m_levelSettings->m_startSpeed));
+
+		std::sort(speedPortals.begin(), speedPortals.end());
+		m.segSpeed.assign(n, static_cast<float>(startSpeed));
+		size_t pi = 0;
+		double cur = startSpeed;
+		for (int si = 0; si < n; si++) {
+			while (pi < speedPortals.size() && speedPortals[pi].first <= m.xs[si]) {
+				cur = speedPortals[pi].second;
+				pi++;
+			}
+			m.segSpeed[si] = static_cast<float>(cur);
+		}
+	}
+
 	// Forward sweep, right to left. x never decreases in GD: a mirror portal
 	// flips the CAMERA and leaves world coordinates alone (13.11), and a
 	// teleport portal cannot send the player backwards.
-	const double reachPerUnit = static_cast<double>(g_config.geomVerticalReach) /
-	                            std::max(1.0, static_cast<double>(g_config.geomSliceX));
+	// geomVerticalReach is how far the player can climb over geomSliceX units of
+	// x - but that is only true at ONE speed. What is actually constant is the
+	// climb per STEP: vy is bounded by the mode, and x speed does not enter it.
+	// At 2x the player crosses the same 30 units in 0.80 of the steps and at 3x
+	// in 0.67, so a distance-based reach over-credits it by exactly that factor
+	// and the map's live windows come out too wide.
+	//
+	// Calibrate the per-step rate off the 1x meaning of the existing constant,
+	// so this is arithmetically inert on every level that runs at one speed and
+	// changes behaviour only where the speed does.
+	const double climbPerStep = static_cast<double>(g_config.geomVerticalReach) /
+	                            std::max(1.0, static_cast<double>(g_config.geomSliceX)) *
+	                            kSpeedNormal;
+
+	// AllLive: no flood at all. Every gap live, window is the whole gap, so
+	// clearance still has a centre to aim at and liveness contributes nothing.
+	if (g_config.geomReachMode == 2) {
+		for (auto& fr : m.freeSpans)
+			for (auto& f : fr) { f.live = true; f.wlo = f.lo; f.whi = f.hi; }
+	} else {
 
 	for (auto& f : m.freeSpans[n - 1]) { f.live = true; f.wlo = f.lo; f.whi = f.hi; }
 
 	for (int si = n - 2; si >= 0; si--) {
-		// Reach scales with how much x this segment actually spans.
-		const double reach = reachPerUnit * (m.xs[si + 1] - m.xs[si]);
+		// Reach scales with how many STEPS this segment takes to cross, which is
+		// its width divided by the speed in force there.
+		const double segDx = g_config.geomSpeedReach
+			? std::max(1e-6, static_cast<double>(m.segSpeed[si]))
+			: kSpeedNormal;
+		// Overlap mode: reach is unbounded, so a gap's window is its whole gap
+		// and the sweep reduces to pure overlap connectivity.
+		const double reach = g_config.geomReachMode == 1
+			? 1e18
+			: climbPerStep * (m.xs[si + 1] - m.xs[si]) / segDx;
 		auto& here = m.freeSpans[si];
 		auto const& next = m.freeSpans[si + 1];
 		for (auto& f : here) {
@@ -3177,6 +3579,8 @@ bool geometryBuildMap() {
 		}
 	}
 
+	}   // geomReachMode
+
 	for (auto const& col : m.freeSpans)
 		for (auto const& f : col) { m.freeCount++; if (!f.live) m.deadCount++; }
 
@@ -3189,7 +3593,7 @@ bool geometryBuildMap() {
 //
 // 0 is the common answer: if the player is already inside a live interval at the
 // lookahead, nothing needs steering.
-int geometrySteer(double x, double y, double vy, double lead) {
+int geometrySteer(double x, double y, double vy, double lead, double lookaheadUnits) {
 	auto const& m = GeoMap::get();
 	if (!m.valid) return 0;
 
@@ -3198,7 +3602,7 @@ int geometrySteer(double x, double y, double vy, double lead) {
 	// geomLeadHold / geomLeadTap. World coordinates throughout: the caller flips the sign
 	// for inverted gravity when turning this into hold or tap.
 	y += lead * vy;
-	const int si = m.segIndex(x + static_cast<double>(g_config.geomLookaheadX));
+	const int si = m.segIndex(x + lookaheadUnits);
 	if (si < 0) return 0;
 
 	// Steer ONLY when this altitude lands in dead OPEN space at the lookahead.
@@ -3213,6 +3617,54 @@ int geometrySteer(double x, double y, double vy, double lead) {
 	//
 	// Landing in a wall says nothing about which channel continues. Only dead
 	// open space does.
+	// Forward scan: replace the single sampled slice with the corridor the
+	// player is in, walked forward and intersected. See geomForwardScan.
+	double scanLo = 0.0, scanHi = 0.0;
+	double rawLo  = 0.0, rawHi  = 0.0;
+	bool   scanned = false;
+	if (g_config.geomForwardScan) {
+		const int s0 = m.segIndex(x);
+		if (s0 >= 0 && si >= s0) {
+			// Start from the live interval the player is actually in.
+			for (auto const& f : m.freeSpans[s0]) {
+				if (!f.live || y < f.lo || y > f.hi) continue;
+				scanLo = f.lo; scanHi = f.hi; scanned = true;
+				rawLo  = f.lo; rawHi  = f.hi;   // kept for the deadband
+				break;
+			}
+			for (int t = s0 + 1; scanned && t <= si; t++) {
+				double bestLo = 0.0, bestHi = 0.0, bestW = -1.0;
+				for (auto const& f : m.freeSpans[t]) {
+					if (!f.live) continue;
+					const double lo = std::max(scanLo, static_cast<double>(f.lo));
+					const double hi = std::min(scanHi, static_cast<double>(f.hi));
+					if (hi - lo > bestW) { bestW = hi - lo; bestLo = lo; bestHi = hi; }
+				}
+				// Pinched out: stop here and steer at the last gap that fits.
+				if (bestW < m.playerH) break;
+				scanLo = bestLo; scanHi = bestHi;
+			}
+		}
+		if (scanned) {
+			const double centre = 0.5 * (scanLo + scanHi);
+			// Band from the RAW interval the player is in, not from the scan's
+			// intersection. MEASURED: scaling it to the intersection fired the
+			// steer on 92.6%% of decisions against 36.7%% without the scan, and
+			// Clutterfunk stalled at 33.72%% instead of solving in 38s.
+			//
+			// A narrower target getting LESS tolerance is backwards, and it is
+			// the same slack-relative failure recorded below - a 285-unit
+			// corridor gives 71 units of deadband, a 90-unit threaded gap gives
+			// 22. The target should tighten; the tolerance should not.
+			const double band = std::max(0.0, g_config.geomClearanceBand) *
+			                    (rawHi - rawLo);
+			if (std::abs(y - centre) <= band) return 0;
+			Solver::get().geoSteerWin++;
+			return y < centre ? 1 : -1;
+		}
+		// Not in live space at all - fall through to the dead-space logic below.
+	}
+
 	auto const& fr = m.freeSpans[si];
 	bool inDead = false;
 	for (auto const& f : fr) {
@@ -3252,6 +3704,24 @@ int geometrySteer(double x, double y, double vy, double lead) {
 	}
 	if (dir != 0) Solver::get().geoSteerDead++;
 	return dir;
+}
+
+// Bounds of the LIVE interval containing `y` at `x`, or false if the altitude
+// is blocked, in dead space, or off the map. Used to notice when the corridor
+// ahead changes - see geomBranchMode.
+bool geometryWindowAt(double x, double y, double* lo, double* hi) {
+	auto const& m = GeoMap::get();
+	if (!m.valid) return false;
+	const int si = m.segIndex(x);
+	if (si < 0) return false;
+	for (auto const& f : m.freeSpans[si]) {
+		if (y < f.lo || y > f.hi) continue;
+		if (!f.live) return false;
+		*lo = static_cast<double>(f.lo);
+		*hi = static_cast<double>(f.hi);
+		return true;
+	}
+	return false;
 }
 
 // Probe 9. What geomVerticalReach costs, measured without running a search.
@@ -3937,6 +4407,81 @@ void pollHotkeys() {
 		else log::warn("Probe 7: not in a level");
 	}
 
+	// L = cycle the reach mode and rebuild the map, so one session can measure
+	// windowed against pure overlap against no liveness at all.
+	if (keyPressedEdge('L')) {
+		g_config.geomReachMode = (g_config.geomReachMode + 1) % 3;
+		if (PlayLayer::get() && geometryBuildMap()) {
+			auto const& m = GeoMap::get();
+			double sumW = 0.0; int liveN = 0;
+			for (auto const& fr : m.freeSpans)
+				for (auto const& f : fr)
+					if (f.live) { sumW += (double)f.whi - (double)f.wlo; liveN++; }
+			log::info("Reach {} - map rebuilt: {} free intervals, {} dead ({:.1f}%), "
+			          "mean live window {:.0f} units. F2 to solve with this.",
+			          geomReachModeName(g_config.geomReachMode),
+			          m.freeCount, m.deadCount,
+			          m.freeCount > 0 ? 100.0 * m.deadCount / m.freeCount : 0.0,
+			          liveN ? sumW / liveN : 0.0);
+		} else {
+			log::info("Reach {} - not in a level, applies at the next solve.",
+			          geomReachModeName(g_config.geomReachMode));
+		}
+	}
+
+	// K = cycle the clearance deadband. No map rebuild needed - the band is read
+	// at steer time - so this takes effect on the next F2.
+	//
+	// 0.25 is the current value: no steer while the player is within a quarter
+	// of the window height of its centre. 0.00 means the trail drives every
+	// decision. 0.50 steers only when badly off.
+	if (keyPressedEdge('K')) {
+		const double next = g_config.geomClearanceBand < 0.01 ? 0.50
+		                  : g_config.geomClearanceBand < 0.30 ? 0.00
+		                                                      : 0.25;
+		g_config.geomClearanceBand = next;
+		log::info("Clearance band {:.2f} of window height{} - F2 to solve with this.",
+		          g_config.geomClearanceBand,
+		          g_config.geomClearanceBand < 0.01 ? " (trail drives every decision)" : "");
+	}
+
+	// J = cycle escapesBeforeWidening. Read at stall time, so it takes effect on
+	// the next F2 with no rebuild.
+	if (keyPressedEdge('J')) {
+		g_config.escapesBeforeWidening =
+			g_config.escapesBeforeWidening == 6 ? 3 :
+			g_config.escapesBeforeWidening == 3 ? 1 : 6;
+		log::info("Escalation ladder: widen after {} escapes with no progress "
+		          "({} deaths of thrashing at stallLimit {}). F2 to solve with this.",
+		          g_config.escapesBeforeWidening,
+		          g_config.escapesBeforeWidening * g_config.stallLimit,
+		          g_config.stallLimit);
+	}
+
+	// N = toggle the forward scan. Read at steer time, so no rebuild.
+	if (keyPressedEdge('N')) {
+		g_config.geomForwardScan = !g_config.geomForwardScan;
+		log::info("Forward scan {} - {}. F2 to solve with this.",
+		          g_config.geomForwardScan ? "ON" : "off",
+		          g_config.geomForwardScan
+		              ? "walks every slice to the lookahead and aims at the gap it must thread"
+		              : "samples one slice at the lookahead, as before");
+	}
+
+	// M = branch on geometry change rather than on a fixed cadence.
+	if (keyPressedEdge('M')) {
+		g_config.geomBranchMode = (g_config.geomBranchMode + 1) % 3;
+		static const char* kName[3] = {
+			"every airBranchInterval steps, as before",
+			"where the corridor ahead CHANGES",
+			"where it CHANGES, but full cadence in tight corridors"};
+		log::info("Air branching: {} (min {} steps, max {}, tight < {:.0f} units). "
+		          "F2 to solve with this.",
+		          kName[g_config.geomBranchMode],
+		          g_config.airBranchInterval, g_config.airBranchIntervalMax,
+		          g_config.geomTightHeights * GeoMap::get().playerH);
+	}
+
 	// R = reach sweep (Probe 9). Read-only; rebuilds the map several times and
 	// leaves it as it found it.
 	if (keyPressedEdge('R')) geometryReachSweep();
@@ -4012,12 +4557,48 @@ void pollHotkeys() {
 					auto& m = GeoMap::get();
 					log::info("Solver: geometry map built - {} free intervals, {} dead "
 					          "({:.1f}%). Ordering {}, dead-space pruning {}. Lookahead "
-					          "{} units.",
+					          "{} steps. Reach {}. Speed {:.2f}..{:.2f} dx/step over "
+					          "{} segments.",
 					          m.freeCount, m.deadCount,
 					          m.freeCount > 0 ? 100.0 * m.deadCount / m.freeCount : 0.0,
 					          g_config.geometryOrdering ? "ON" : "off",
 					          g_config.geometryDeadPrune ? "ON" : "off",
-					          g_config.geomLookaheadX);
+					          g_config.geomLookaheadSteps,
+					          geomReachModeName(g_config.geomReachMode),
+					          m.segSpeed.empty() ? 0.0f
+					              : *std::min_element(m.segSpeed.begin(), m.segSpeed.end()),
+					          m.segSpeed.empty() ? 0.0f
+					              : *std::max_element(m.segSpeed.begin(), m.segSpeed.end()),
+					          m.segSpeed.size());
+
+					// How much of the mapped band is unreachable sky, and how
+					// wide the live windows are because of it. INERT: nothing
+					// reads m_maxGameplayY yet.
+					//
+					// A free interval with no roof runs all the way to yHi, so
+					// its centre - which is what clearance steering aims at -
+					// sits in empty space far above any route. Counting the
+					// intervals whose top IS yHi says how often that happens.
+					{
+						auto* bgl = GJBaseGameLayer::get();
+						const double ceiling = bgl ? static_cast<double>(bgl->m_maxGameplayY) : 0.0;
+						int openTop = 0, total = 0;
+						double widest = 0.0, sumW = 0.0;
+						for (auto const& fr : m.freeSpans)
+							for (auto const& f : fr) {
+								total++;
+								const double w = static_cast<double>(f.whi) -
+								                 static_cast<double>(f.wlo);
+								if (f.live) { sumW += w; widest = std::max(widest, w); }
+								if (f.hi >= m.yHi - 0.01) openTop++;
+							}
+						log::info("Solver: map band y {:.0f}..{:.0f}, game ceiling "
+						          "m_maxGameplayY {:.0f}. {} of {} free intervals reach "
+						          "the top of the band. Live window mean {:.0f} widest "
+						          "{:.0f} units.",
+						          m.yLo, m.yHi, ceiling, openTop, total,
+						          total ? sumW / total : 0.0, widest);
+					}
 				} else {
 					log::warn("Solver: geometry map unavailable - geometry ordering and "
 					          "pruning both off for this run.");
@@ -5591,10 +6172,14 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					(d.modeClass == ModeClass::Tap) ? g_config.geomLeadTap
 					: mini                          ? g_config.geomLeadMini
 					                                : g_config.geomLeadHold;
+				const double lookaheadUnits =
+					g_config.geomLookaheadScaleWithSpeed
+						? static_cast<double>(g_config.geomLookaheadSteps) * sv.dxPerStep
+						: static_cast<double>(g_config.geomLookaheadFixedX);
 				steer = geometrySteer(m_player1->getPositionX(),
 				                      m_player1->getPositionY(),
 				                      static_cast<double>(m_player1->m_yVelocity),
-				                      lead);
+				                      lead, lookaheadUnits);
 				if (steer != 0) sv.geoSteers++;
 			}
 			if (steer != 0) {
@@ -7184,15 +7769,50 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// the search runs many times faster than real time, so a rewind of 3.3
 		// GAME seconds plays back in a fraction of a wall-clock second. Game time
 		// and wall-clock time are not interchangeable here.
+		// One step's vertical move per mode, size and direction. Its own line
+		// rather than more columns on the report: this is the input to the
+		// reachability model, and it only has to be read once per level.
+		{
+			static const char* kModeName[4] = {"ship", "wave", "ufo ", "othr"};
+			static const char* kSpeedName[5] = {"0.5x", "1x", "2x", "3x", "4x"};
+			bool any = false;
+			for (int mo = 0; mo < 4; mo++)
+				for (int sz = 0; sz < 2; sz++) {
+					std::string row;
+					for (int sp = 0; sp < 5; sp++) {
+						const double up = sv.maxClimb[mo][sz][sp][0];
+						const double dn = sv.maxClimb[mo][sz][sp][1];
+						if (up <= 0.0 && dn <= 0.0) continue;
+						row += fmt::format("{} up {:.3f} dn {:.3f}  ",
+						                   kSpeedName[sp], up, dn);
+					}
+					if (row.empty()) continue;
+					if (!any) {
+						log::info("Solver: climb per step (world units), map assumes "
+						          "{:.3f} at every speed:",
+						          static_cast<double>(g_config.geomVerticalReach) /
+						              std::max(1.0, static_cast<double>(g_config.geomSliceX)) *
+						              kSpeedNormal);
+						any = true;
+					}
+					log::info("  {}{}  {}", kModeName[mo], sz ? "-mini" : "     ", row);
+				}
+		}
+
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
 		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
+		          "dx {:.2f}/{:.2f}  vs map {:.2f}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
 		          g_config.toggleBudget, sv.commitDepth, sv.lookbackSteps, sv.resyncs, sv.resyncFailures,
 		          CellProbe::get().cells.size(), sv.anchorReplays,
 		          sv.tapFirstChosen, sv.tapDecisions, sv.geoSteers, sv.geoLooks,
-		          sv.geoSteerDead, sv.geoSteerWin,
+		          sv.geoSteerDead, sv.geoSteerWin, sv.dxPerStep,
+		          GeoMap::get().valid && m_player1
+		              ? GeoMap::get().speedAt(m_player1->getPositionX()) : 0.0,
+		          static_cast<double>(g_config.geomVerticalReach) /
+		              std::max(1.0, static_cast<double>(g_config.geomSliceX)) * kSpeedNormal,
 		          stepsPerSec, stepsPerSec / 240.0,
 		          secs > 0 ? sv.restores / secs : 0.0);
 	}
@@ -7608,6 +8228,38 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			return false;
 		}
 
+		// Horizontal speed, from the player's own motion. Guarded because a
+		// restore moves x backwards and a portal can change speed mid-stride:
+		// anything outside a sane forward step keeps the previous value rather
+		// than poisoning the lookahead for a frame.
+		{
+			auto& s = Solver::get();
+			const double nx = m_player1->getPositionX();
+			const double ny = m_player1->getPositionY();
+			const double dx = nx - s.prevX;
+			if (dx > 0.01 && dx < 20.0) {
+				s.dxPerStep = dx;
+				// dx being sane means this was one real forward step, so the
+				// matching dy is a real one-step vertical move.
+				const double rawDy = ny - s.prevY;
+				const double dy = std::abs(rawDy);
+				if (dy < 200.0) {
+					// World up, not player up: the map is in world coordinates,
+					// so an inverted-gravity climb belongs in the DOWN bucket.
+					const int mode = m_player1->m_isShip ? 0
+					               : m_player1->m_isDart ? 1
+					               : m_player1->m_isBird ? 2 : 3;
+					const int size = m_player1->m_vehicleSize < 0.9f ? 1 : 0;
+					const int dir  = rawDy >= 0.0 ? 0 : 1;
+					const int spd  = Solver::speedBucket(dx);
+					double& slot = s.maxClimb[mode][size][spd][dir];
+					slot = std::max(slot, dy);
+				}
+			}
+			s.prevX = nx;
+			s.prevY = ny;
+		}
+
 		// Census where the search has been. Read-only - see CellProbe. Placed
 		// after the death check so a dead frame is never counted as a place the
 		// player reached, and after the resync early-return so the census covers
@@ -7635,14 +8287,44 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			return true;
 		}
 
+		// Has the corridor ahead changed since the last decision? Only consulted
+		// between airBranchInterval and airBranchIntervalMax: below the minimum
+		// nothing branches, above the maximum everything does.
+		auto geometryWantsBranch = [&]() -> bool {
+			if (g_config.geomBranchMode == 0 || !GeoMap::get().valid) return true;
+			const uint64_t elapsed = sv.step - sv.lastBranch;
+			if (elapsed >= static_cast<uint64_t>(g_config.airBranchIntervalMax)) return true;
+			const double lookX = m_player1->getPositionX() +
+				(g_config.geomLookaheadScaleWithSpeed
+					? static_cast<double>(g_config.geomLookaheadSteps) * sv.dxPerStep
+					: static_cast<double>(g_config.geomLookaheadFixedX));
+			double glo = 0.0, ghi = 0.0;
+			// No reading means no opinion: keep the old cadence rather than
+			// suppressing a decision the map cannot vouch for.
+			if (!geometryWindowAt(lookX, m_player1->getPositionY(), &glo, &ghi)) return true;
+			// Tight corridor: keep every decision. Suppressing them here is what
+			// cost the mini ship section in mode 1.
+			if (g_config.geomBranchMode >= 2 &&
+			    (ghi - glo) < g_config.geomTightHeights * GeoMap::get().playerH) {
+				sv.lastGeoLo = glo; sv.lastGeoHi = ghi;
+				return true;
+			}
+			const bool changed = std::abs(glo - sv.lastGeoLo) > 0.01 ||
+			                     std::abs(ghi - sv.lastGeoHi) > 0.01;
+			if (changed) { sv.lastGeoLo = glo; sv.lastGeoHi = ghi; }
+			return changed;
+		};
+
 		if (mc == ModeClass::Tap) {
 			// Discrete events: decide whether to tap, on the same cadence. No
 			// hold persists between decisions.
-			if (sv.step - sv.lastBranch >= g_config.airBranchInterval) solverPushDecision();
+			if (sv.step - sv.lastBranch >= g_config.airBranchInterval &&
+			    geometryWantsBranch()) solverPushDecision();
 		} else if (mc == ModeClass::Hold) {
 			// Hold state controls the trajectory continuously, so the action
 			// genuinely is per-segment and persists across the interval.
-			if (sv.step - sv.lastBranch >= g_config.airBranchInterval) solverPushDecision();
+			if (sv.step - sv.lastBranch >= g_config.airBranchInterval &&
+			    geometryWantsBranch()) solverPushDecision();
 		} else if (sv.hold) {
 			// Committed to a jump. Do NOT branch again while still grounded:
 			// re-branching every step overwrote the hold after one step, so no
