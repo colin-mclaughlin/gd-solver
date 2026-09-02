@@ -493,6 +493,66 @@ struct Config {
 	// the same mechanism and this has never actually been measured.
 	bool geomForwardScan = false;
 
+	// Steer only when the gap is about to become UNREACHABLE.
+	//
+	// The clearance steer asks "am I off-centre?" and answers on a quarter of
+	// the window height. That is a position controller: it says where to be and
+	// says it constantly, and it cannot know whether the player is physically
+	// able to comply, because the same button does opposite things from
+	// different vertical velocities.
+	//
+	// This asks the question a pilot actually asks: given how fast I can climb
+	// or fall, and how many steps until that gap, can I still make it if I do
+	// nothing? If yes, say nothing. If no, act now.
+	//
+	// Two properties the measurements say matter. It is VELOCITY AWARE, so it
+	// never demands a move the physics will refuse. And it is QUIET by
+	// construction - it speaks only at the last moment - which is the single
+	// variable that separated every success from every failure this session
+	// (36%% steer rate solves; 61%%, 69%%, 93%%, 97.6%% all stall).
+	//
+	// The speed it divides by is MEASURED during the run, per mode, size and
+	// direction, by the same instrumentation that reported ship up 1.800 and
+	// down 5.419 on Theory of Everything. No hardcoded physics; until a mode has
+	// been observed it falls back to the old clearance rule.
+	//
+	// U toggles it.
+	bool geomUrgencySteer = false;
+
+	// Steer toward the interval the player's OWN corridor leads to, instead of
+	// whichever interval happens to contain the projected altitude.
+	//
+	// The bug this fixes: the steer samples one slice at the lookahead and picks
+	// the live interval containing the projected y, with no check that it is
+	// reachable from the interval the player is in now. Flying at a wall, the
+	// projection lands in a corridor BEHIND that wall and the steer reports
+	// "you are fine, you are in live space".
+	//
+	// MEASURED, both directions in one session: with steering effectively off
+	// Theory of Everything stalls at 32.49%% against a 20s clear, so the signal
+	// is load-bearing - while Clutterfunk goes 38s to 34s, so it is also wrong
+	// often enough to cost time on a level with no deceptive geometry. Right
+	// answer, wrong interval.
+	//
+	// Walks the chain slice by slice, at each step taking the live interval with
+	// the largest overlap with the one before it, and steers at the FULL
+	// interval the chain arrives at.
+	//
+	// Full interval, not the running intersection - that distinction is the
+	// whole difference from the forward scan, which intersected, produced a
+	// narrow tunnel and a proportionally tiny deadband, and fired on 69%% of
+	// decisions. Steer rate is the variable that decides whether the map helps
+	// (36%% solves; 61%%, 69%%, 93%%, 97.6%% all stall), so the target tightens
+	// while the tolerance does not.
+	//
+	// O toggles it.
+	bool geomRouteSteer = false;
+
+	// Act when the required climb rate exceeds this fraction of the fastest the
+	// player has been seen to move. Below 1.0 because arriving exactly at the
+	// rim with zero margin is not arriving.
+	double geomUrgencyFrac = 0.7;
+
 	// Divide the map's vertical reach by the segment's speed. MEASURED: OFF.
 	// Electrodynamix went from a 1m51s clear to a 29.47%% stall - worse than the
 	// lookahead change alone managed - and the run says exactly why. Dead
@@ -932,6 +992,88 @@ struct Config {
 	// nodes explored.
 	int  beamWidth = 64;
 
+	// Rank the frontier by the MAP rather than by progress.
+	//
+	// The beam expands in lockstep, so every candidate at a level sits at almost
+	// the same step and therefore almost the same percent - ranking by progress
+	// is ranking noise, which is the recorded reason the beam was set aside.
+	// The map supplies the discriminator progress cannot: among states that are
+	// equally far along, prefer the one better placed inside the live corridor,
+	// because that is the one more likely to still be alive in fifty steps.
+	//
+	// This is the map used as a VALUE FUNCTION over whole states, not as a
+	// per-decision override. It is the one use that cannot demand a move the
+	// physics will not make - measured this session, every attempt to steer
+	// individual decisions harder (forward scan 69%%, clearance band 97.6%%)
+	// stalled, while the map's cheap global signals cost nothing.
+	//
+	// Ground states are deliberately given a neutral score: on flat ground every
+	// state sits in the same live interval, so the map has nothing to say and
+	// pretending otherwise would rank on noise again.
+	//
+	// V cycles: 0 diversity buckets (as before), 1 progress, 2 geometry.
+	int  beamRankMode = 0;
+
+	// Best-first instead of a width-K beam. P toggles it.
+	//
+	// MEASURED, Clutterfunk, width 64: the beam reached 3.39%% in 50 seconds -
+	// depth 196, 22241 restores, 90 deaths - against the DFS's 35%% in four
+	// seconds. It projects to about 24 minutes for the level.
+	//
+	// The cap was never the problem. `dropped` stayed modest and the frontier
+	// stayed full. The problem is that a beam advances in LOCKSTEP: it expands
+	// all K nodes before moving one level forward, so it pays 2K restores for
+	// every 4 steps of progress and pays that full width in the easy opening
+	// where DFS simply commits and dives. 90 deaths in 22241 restores is a
+	// search meticulously exploring states nothing was threatening.
+	//
+	// Best-first is not lockstep. One priority queue over every generated node,
+	// pop the single most promising, expand it, push both children, discard
+	// NOTHING. While things go well the most promising node is the deepest one,
+	// so it dives exactly like DFS; when a branch dies it resumes from whatever
+	// state is genuinely best anywhere in the tree, rather than the escape
+	// ladder's blind 200-decision rewind.
+	//
+	// That is the property worth having and the reason the earlier analysis
+	// ranked best-first above beam: "build the one without the arbitrary cap
+	// first, then add the cap only if memory forces it."
+	bool beamBestFirst = false;
+
+	// How much the geometry score is worth, in percent of level progress.
+	//
+	// It was written as an exact-tie tiebreak on pct and therefore NEVER FIRED:
+	// pct is a float with about 0.005%% of granularity per step, so two nodes
+	// essentially never compare equal and the geometry branch was dead code.
+	// Ranking mode 2 was behaving identically to mode 1 in every run so far.
+	//
+	// 0.02%% is roughly one decision's worth of progress, so a well-centred
+	// state can outrank one a single decision further along, and no more.
+	double beamGeoWeight = 0.02;
+
+	// How much a cell that kills EVERYTHING entering it is worth, in percent of
+	// progress. Scaled by the cell's death rate, not its death count.
+	//
+	// This is the missing half of best-first. Ranking on progress alone means a
+	// node 500 steps back is strictly worse than a node at the wall, so the
+	// queue keeps handing back wall nodes and each death spawns fresh siblings
+	// at the same depth - the search can never run out of them and is
+	// structurally incapable of backing off. MEASURED on Clutterfunk: 31.05%% in
+	// twelve seconds, then 14299 deaths without moving off 32.50%%.
+	//
+	// Charging progress for local failure is what lets it retreat. A node born
+	// into a cell that has already killed 31 branches scores 2.5%% worse than
+	// its progress suggests, one born into a cell that has killed 1023 scores
+	// 5%% worse - so the frontier drifts back to earlier, cheaper ground on its
+	// own instead of needing an escape ladder to force it.
+	//
+	// Charged at node CREATION rather than at pop: a heap cannot have its keys
+	// mutate underneath it. Newly generated siblings in a hot cell are born
+	// worse, which is what shifts the queue.
+	double beamDeathWeight = 8.0;
+
+	// Cell size for that death count, in world units. One block.
+	int    beamDeathCellSize = 30;
+
 	// A node gets its own checkpoint once it is this far, in steps, from its
 	// nearest checkpointed ancestor.
 	//
@@ -949,7 +1091,7 @@ struct Config {
 	// commitment that traps the DFS. Bucketed selection keeps a quota per
 	// (mode, y band) so both corridors survive. Kept switchable so the
 	// prediction can be tested rather than assumed.
-	bool beamRankByScore = false;
+
 	int  beamYBucketSize = 30;   // world units per diversity bucket
 
 	// --- Go-Explore --------------------------------------------------------
@@ -2307,6 +2449,15 @@ struct BeamNode {
 	int      step     = 0;    // solver step this node sits at
 	uint64_t key      = 0;    // solverStateKey() at this node
 	float    pct      = 0.f;  // progress, for reporting and optional ranking
+
+	// How well this state sits inside the live corridor: 1 dead centre, 0 at the
+	// edge. Computed while the player is actually in the state, like `bucket`,
+	// because it cannot be recovered from the node afterwards.
+	float    geoScore = 0.f;
+
+	// What the heap actually orders by: progress, plus geometry, minus what the
+	// neighbourhood has already cost. Fixed at creation - see beamDeathWeight.
+	float    score    = 0.f;
 	bool     hold     = false;// input applied on the edge from parent to here
 	bool     alive    = true;
 
@@ -2484,6 +2635,22 @@ struct Solver {
 
 	// The live interval ahead as it was at the last air decision, so a change
 	// can be noticed. See geomBranchMode.
+	// Set by the caller before geometrySteer, which is a free function and
+	// cannot reach the modify class's members.
+	PlayerObject*         steerPlayer  = nullptr;
+
+	// Fastest this mode and size has been seen to move in the given world
+	// direction, over every speed column. 0 until something has been observed.
+	double observedClimb(PlayerObject* p, bool up) const {
+		if (!p) return 0.0;
+		const int mode = p->m_isShip ? 0 : p->m_isDart ? 1 : p->m_isBird ? 2 : 3;
+		const int size = p->m_vehicleSize < 0.9f ? 1 : 0;
+		const int dir  = up ? 0 : 1;
+		double v = 0.0;
+		for (int sp = 0; sp < 5; sp++) v = std::max(v, maxClimb[mode][size][sp][dir]);
+		return v;
+	}
+
 	double                lastGeoLo    = 0.0;
 	double                lastGeoHi    = 0.0;
 
@@ -2749,6 +2916,24 @@ struct Beam {
 	int    cpInterval = 240;
 	size_t memAtStart = 0;
 
+	// Best-first's open list: every generated, unexpanded node, kept as a heap.
+	// Unbounded by design - see Config::beamBestFirst.
+	std::vector<int> open;
+
+	// Deaths and expansions per (x, y) cell. The score uses the RATIO.
+	//
+	// MEASURED: a raw death COUNT punishes the correct path. Deaths accumulate
+	// wherever the search actually explores, which is the route, so the route
+	// became the most penalised place on the map and the queue drifted into
+	// untouched sideways cells - in Clutterfunk's cube opening those are all
+	// duplicate grounded states, and the run wedged at 12.44%% with 12776
+	// dedups against 77 deaths. It spread out instead of diving.
+	//
+	// A rate does not have that failure. The route has many expansions and few
+	// deaths; a wall kills nearly everything that enters it.
+	std::unordered_map<uint64_t, uint32_t> cellDeaths;
+	std::unordered_map<uint64_t, uint32_t> cellTries;
+
 	uint64_t startTicks   = 0;
 	uint64_t lastReport   = 0;
 
@@ -2775,6 +2960,9 @@ struct Beam {
 		depth = 0;
 		expandIdx = 0;
 		phase = Phase::Init;
+		open.clear();
+		cellDeaths.clear();
+		cellTries.clear();
 		restoreUs = stepUs = 0.0;
 		cpInterval = 240;
 		memAtStart = 0;
@@ -3588,6 +3776,8 @@ bool geometryBuildMap() {
 	return true;
 }
 
+bool geometryWindowAt(double x, double y, double* lo, double* hi);
+
 // Which way to steer at `(x, y)`: +1 prefer the climbing branch, -1 the falling
 // one, 0 leave the existing ordering alone.
 //
@@ -3601,6 +3791,9 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 	// with the projected altitude rather than the current one - see
 	// geomLeadHold / geomLeadTap. World coordinates throughout: the caller flips the sign
 	// for inverted gravity when turning this into hold or tap.
+	const double yNow = y;          // before the lead projection: where the
+	                                // player IS, which is what decides the
+	                                // corridor it is currently in
 	y += lead * vy;
 	const int si = m.segIndex(x + lookaheadUnits);
 	if (si < 0) return 0;
@@ -3665,6 +3858,84 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 		// Not in live space at all - fall through to the dead-space logic below.
 	}
 
+	// Route steering: follow the player's own corridor forward and aim at what
+	// it leads to. See geomRouteSteer.
+	if (g_config.geomRouteSteer) {
+		const int s0 = m.segIndex(x);
+		if (s0 >= 0 && si >= s0) {
+			double clo = 0.0, chi = 0.0;
+			bool   have = false;
+			for (auto const& f : m.freeSpans[s0]) {
+				if (!f.live || yNow < f.lo || yNow > f.hi) continue;
+				clo = f.lo; chi = f.hi; have = true;
+				break;
+			}
+			if (have) {
+				for (int t = s0 + 1; t <= si; t++) {
+					double blo = 0.0, bhi = 0.0, bw = -1.0;
+					for (auto const& f : m.freeSpans[t]) {
+						if (!f.live) continue;
+						const double lo = std::max(clo, static_cast<double>(f.lo));
+						const double hi = std::min(chi, static_cast<double>(f.hi));
+						// Ranked by overlap with the corridor so far, but the
+						// TARGET is the whole interval - the corridor may widen
+						// or shift, and clipping to the overlap would invent a
+						// tunnel that is not there.
+						if (hi - lo > bw) { bw = hi - lo; blo = f.lo; bhi = f.hi; }
+					}
+					// Chain broken: nothing ahead connects. Aim at the last
+					// interval that did rather than inventing a target.
+					if (bw < m.playerH) break;
+					clo = blo; chi = bhi;
+				}
+
+				const double centre = 0.5 * (clo + chi);
+				const double band = std::max(0.0, g_config.geomClearanceBand) * (chi - clo);
+				if (std::abs(y - centre) <= band) return 0;
+
+				// Urgency gate. Route alone fired on 78.7%% of decisions and
+				// stalled Theory of Everything at 12.74%%: a corridor 300 units
+				// ahead can sit 200 units above the player, so aiming at its
+				// centre demands a position that cannot be reached this
+				// decision - and the demand simply repeats, overriding the
+				// search's own ordering everywhere.
+				//
+				// Three bands, and the third is the one that matters:
+				//   plenty of time  -> quiet
+				//   act now or lose -> steer
+				//   unreachable     -> QUIET. The branch is doomed; jamming the
+				//                      ordering cannot save it, and the escape
+				//                      ladder exists to back out of exactly
+				//                      this. Speaking here is what turned every
+				//                      previous controller into a permanent
+				//                      override.
+				if (g_config.geomUrgencySteer) {
+					auto* pp = Solver::get().steerPlayer;
+					const bool up = centre > yNow;
+					const double need = up ? std::max(0.0, clo - yNow)
+					                       : std::max(0.0, yNow - chi);
+					const double dxs = std::max(0.01, Solver::get().dxPerStep);
+					const double steps = lookaheadUnits / dxs;
+					const double vmax = Solver::get().observedClimb(pp, up);
+					if (need > 0.0 && vmax > 0.0 && steps >= 1.0) {
+						const double required = need / steps;
+						if (required < g_config.geomUrgencyFrac * vmax) return 0;
+						if (required > vmax) return 0;
+					}
+				}
+
+				Solver::get().geoSteerWin++;
+				return y < centre ? 1 : -1;
+			}
+			// Not in live space: fall through to the dead-space logic below.
+		}
+	}
+
+	// The standalone urgency steer is gone. Its gate asked "am I inside ANY
+	// live interval at the lookahead?", which is almost always true, so it
+	// returned no-opinion every time: geoSteer 0/20194 on Clutterfunk. Urgency
+	// is now a GATE on the route target above, which is the question it should
+	// have been asking - can I still reach THE INTERVAL MY CORRIDOR LEADS TO.
 	auto const& fr = m.freeSpans[si];
 	bool inDead = false;
 	for (auto const& f : fr) {
@@ -4400,6 +4671,57 @@ void pollHotkeys() {
 		}
 	}
 
+	// B = beam search.
+	//
+	// The help text has advertised B since the beam was written, but nothing
+	// ever started it: beamInit and beamStep were both complete and
+	// unreachable, so every "the beam was tried" claim in this project rests on
+	// runs made before the entry point went missing. Wired here to match the
+	// Go-Explore start exactly - same physics requirements, same practice-mode
+	// revive path, same shared-buffer reset.
+	//
+	// beamStep dispatches Phase::Init to beamInit on its first call, so all this
+	// has to do is reset the level and hand over.
+	if (keyPressedEdge('B')) {
+		auto& bm = Beam::get();
+		auto& st = ProbeState::get();
+		if (st.mode == Mode::Beam && bm.running) {
+			log::info("Beam: stopped by user at best {:.2f}%, {} expansions, "
+			          "{} dropped by selection.",
+			          bm.bestPct, bm.expansions, bm.dropped);
+			if (!Solver::get().bestMacro.empty()) solverWriteBestMacro();
+			bm.clear();
+			st.mode = Mode::Idle;
+		} else if (PlayLayer::get()) {
+			g_config.physicsFix   = true;
+			g_config.noSavestates = false;
+			PlayLayer::get()->m_isPracticeMode = true;
+
+			Solver::get().clear();   // the searches share the macro buffers
+			CellProbe::get().clear();
+
+			// The beam's geometry ranking needs the map, and unlike F2 nothing
+			// else here builds it.
+			if (!geometryBuildMap())
+				log::warn("Beam: no geometry map - geometry ranking will score "
+				          "every state the same.");
+
+			bm.clear();
+			bm.running    = true;
+			bm.startTicks = probe::nowTicks();
+			bm.lastReport = bm.startTicks;
+			st.mode       = Mode::Beam;
+			st.resetPending = true;
+			static const char* kRank[3] = {
+				"diverse (mode, y-band)", "progress only", "progress, then geometry"};
+			log::info("Beam: starting, width {}, ranking {}. B again to stop, "
+			          "V cycles the ranking.",
+			          g_config.beamWidth, kRank[g_config.beamRankMode]);
+		} else {
+			log::warn("Beam: not in a level");
+		}
+	}
+
 	// G = dump level geometry (Probe 7). Read-only: no search state is touched,
 	// so this is safe to press at any time, including mid-solve.
 	if (keyPressedEdge('G')) {
@@ -4480,6 +4802,46 @@ void pollHotkeys() {
 		          kName[g_config.geomBranchMode],
 		          g_config.airBranchInterval, g_config.airBranchIntervalMax,
 		          g_config.geomTightHeights * GeoMap::get().playerH);
+	}
+
+	// P = best-first instead of width-K beam.
+	if (keyPressedEdge('P')) {
+		g_config.beamBestFirst = !g_config.beamBestFirst;
+		log::info("Frontier search: {}. B to run it.",
+		          g_config.beamBestFirst
+		              ? "BEST-FIRST - one priority queue, nothing discarded, dives like DFS"
+		              : "width-K beam (lockstep, K per level)");
+	}
+
+	// O = route steering: follow the corridor the player is actually in.
+	if (keyPressedEdge('O')) {
+		g_config.geomRouteSteer = !g_config.geomRouteSteer;
+		log::info("Steering: {}. F2 to solve with this.",
+		          g_config.geomRouteSteer
+		              ? "ROUTE - follow this corridor forward and aim at what it leads to"
+		              : "clearance - aim at the interval containing the projected altitude");
+	}
+
+	// U = urgency steering instead of clearance steering.
+	if (keyPressedEdge('U')) {
+		g_config.geomUrgencySteer = !g_config.geomUrgencySteer;
+		log::info("Urgency gate on the route target: {}. Needs O as well.",
+		          g_config.geomUrgencySteer
+		              ? "ON - steer only while the corridor is still catchable at "
+		                "the measured climb rate, silent when there is time and "
+		                "silent when it is already lost"
+		              : "off - steer whenever off-centre");
+	}
+
+	// V = cycle how the beam ranks its frontier.
+	if (keyPressedEdge('V')) {
+		g_config.beamRankMode = (g_config.beamRankMode + 1) % 3;
+		static const char* kName[3] = {
+			"diversity buckets (as before)",
+			"progress only",
+			"progress, then geometry - centredness in the live corridor"};
+		log::info("Beam ranking: {} (width {}). B to run the beam with this.",
+		          kName[g_config.beamRankMode], g_config.beamWidth);
 	}
 
 	// R = reach sweep (Probe 9). Read-only; rebuilds the map several times and
@@ -6176,6 +6538,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					g_config.geomLookaheadScaleWithSpeed
 						? static_cast<double>(g_config.geomLookaheadSteps) * sv.dxPerStep
 						: static_cast<double>(g_config.geomLookaheadFixedX);
+				sv.steerPlayer = m_player1;
 				steer = geometrySteer(m_player1->getPositionX(),
 				                      m_player1->getPositionY(),
 				                      static_cast<double>(m_player1->m_yVelocity),
@@ -6621,6 +6984,54 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		return (m << 24) ^ (static_cast<uint32_t>(band) & 0x00FFFFFFu);
 	}
 
+	// Which death cell the player is standing in.
+	uint64_t beamDeathCell() {
+		auto* p = m_player1;
+		if (!p) return 0;
+		const int c = std::max(1, g_config.beamDeathCellSize);
+		const int64_t bx = static_cast<int64_t>(std::floor(p->getPositionX() / c));
+		const int64_t by = static_cast<int64_t>(std::floor(p->getPositionY() / c));
+		return (static_cast<uint64_t>(bx) << 32) ^ static_cast<uint32_t>(by);
+	}
+
+	// Progress, plus centredness, minus what this neighbourhood has already
+	// cost. Everything in percent-of-level units so the weights are readable.
+	float beamScoreOf(float pct, float geo, uint64_t cell) {
+		auto& bm = Beam::get();
+		const auto id = bm.cellDeaths.find(cell);
+		const auto it = bm.cellTries.find(cell);
+		const double d = id == bm.cellDeaths.end() ? 0.0 : static_cast<double>(id->second);
+		const double t = it == bm.cellTries.end()  ? 0.0 : static_cast<double>(it->second);
+		// Failure rate, damped so a cell with two tries and one death is not
+		// treated as confidently lethal as one with two hundred.
+		const double penalty = g_config.beamDeathWeight * (d / (8.0 + t));
+		return static_cast<float>(pct + g_config.beamGeoWeight * geo - penalty);
+	}
+
+	// Centredness inside the live corridor ahead: 1 dead centre, 0 at the rim,
+	// 0 with no reading at all.
+	//
+	// Uses the same lookahead the steer does, so it scores where the state is
+	// HEADED rather than where it sits. Neutral (0.5) on ground and wherever the
+	// map has no opinion, so those states are neither promoted nor buried.
+	float beamGeoScore() {
+		auto* p = m_player1;
+		if (!p || !GeoMap::get().valid) return 0.5f;
+		if (classifyMode(p) == ModeClass::Ground) return 0.5f;
+
+		const double lookX = p->getPositionX() +
+			(g_config.geomLookaheadScaleWithSpeed
+				? static_cast<double>(g_config.geomLookaheadSteps) * Solver::get().dxPerStep
+				: static_cast<double>(g_config.geomLookaheadFixedX));
+		double glo = 0.0, ghi = 0.0;
+		if (!geometryWindowAt(lookX, p->getPositionY(), &glo, &ghi)) return 0.0f;
+
+		const double half = 0.5 * (ghi - glo);
+		if (half <= 1e-6) return 0.0f;
+		const double off = std::abs(p->getPositionY() - 0.5 * (glo + ghi)) / half;
+		return static_cast<float>(std::max(0.0, 1.0 - off));
+	}
+
 	// --- beam: expansion ----------------------------------------------------
 
 	// Has the run reached the next decision point?
@@ -6657,6 +7068,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		for (int a = 0; a < 2; a++) {
 			if (!beamRestoreNode(idx)) { bm.restoreFails++; return; }
+			// Charged to where the branch STARTS, not where it ends, so deaths
+			// and tries land in the same cell and their ratio is a real rate.
+			const uint64_t cellAtExpand = beamDeathCell();
 			const bool hold = (a != 0);
 
 			int  steps = 0;
@@ -6675,7 +7089,16 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				if (steps >= g_config.maxSegmentSteps) break;
 			}
 
-			if (dead) { bm.deaths++; continue; }
+			// Charge the death to where it happened. That count is what every
+			// node later born nearby pays for, and it is the only thing that
+			// lets a best-first frontier retreat from a wall.
+			if (dead) {
+				bm.deaths++;
+				bm.cellDeaths[cellAtExpand]++;
+				bm.cellTries[cellAtExpand]++;
+				continue;
+			}
+			bm.cellTries[cellAtExpand]++;
 
 			const int childStep = bm.nodes[static_cast<size_t>(idx)].step + steps;
 
@@ -6696,6 +7119,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			bm.nodes[static_cast<size_t>(ci)].key    = key;
 			bm.nodes[static_cast<size_t>(ci)].pct    = pl->getCurrentPercent();
 			bm.nodes[static_cast<size_t>(ci)].bucket = beamBucket();
+			bm.nodes[static_cast<size_t>(ci)].geoScore = beamGeoScore();
+			bm.nodes[static_cast<size_t>(ci)].score =
+				beamScoreOf(bm.nodes[static_cast<size_t>(ci)].pct,
+				            bm.nodes[static_cast<size_t>(ci)].geoScore,
+				            beamDeathCell());
 
 			// Checkpoint once replaying to this node would cost more than
 			// restoring it directly.
@@ -6752,11 +7180,20 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		if (bm.next.size() > K) {
 			bm.dropped += bm.next.size() - K;
-			if (g_config.beamRankByScore) {
+			if (g_config.beamRankMode == 1) {
 				std::partial_sort(bm.next.begin(), bm.next.begin() + K, bm.next.end(),
 					[&](int x, int y) {
 						return bm.nodes[static_cast<size_t>(x)].pct >
 						       bm.nodes[static_cast<size_t>(y)].pct;
+					});
+				bm.next.resize(K);
+			} else if (g_config.beamRankMode == 2) {
+				// The composite score: progress, geometry, local failure. Not a
+				// tiebreak on pct - that never fired, see beamGeoWeight.
+				std::partial_sort(bm.next.begin(), bm.next.begin() + K, bm.next.end(),
+					[&](int x, int y) {
+						return bm.nodes[static_cast<size_t>(x)].score >
+						       bm.nodes[static_cast<size_t>(y)].score;
 					});
 				bm.next.resize(K);
 			} else {
@@ -6766,6 +7203,37 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		bm.frontier.swap(bm.next);
 		bm.next.clear();
+		beamReclaim();
+		bm.depth++;
+	}
+
+	// Best-first selection. Everything generated goes into one heap; one node
+	// comes out. Nothing is ever discarded, so no option can be lost the way a
+	// width cap loses it.
+	//
+	// Progress first so the search dives, geometry as the tiebreak progress
+	// cannot provide - the same order the width-K ranking uses, for the same
+	// reason: ranking on centredness alone would happily prefer a beautifully
+	// placed state that is behind everything else.
+	void beamSelectBestFirst() {
+		auto& bm = Beam::get();
+		auto worse = [&](int x, int y) {          // heap wants "less than"
+			return bm.nodes[static_cast<size_t>(x)].score <
+			       bm.nodes[static_cast<size_t>(y)].score;
+		};
+
+		for (int i : bm.next) {
+			bm.open.push_back(i);
+			std::push_heap(bm.open.begin(), bm.open.end(), worse);
+		}
+		bm.next.clear();
+
+		bm.frontier.clear();
+		if (!bm.open.empty()) {
+			std::pop_heap(bm.open.begin(), bm.open.end(), worse);
+			bm.frontier.push_back(bm.open.back());
+			bm.open.pop_back();
+		}
 		beamReclaim();
 		bm.depth++;
 	}
@@ -6787,6 +7255,14 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		bm.neededScratch.clear();
 		for (int i : bm.frontier) {
+			auto const& n = bm.nodes[static_cast<size_t>(i)];
+			bm.neededScratch.insert(n.rsIndex >= 0 ? i : n.cpAncestor);
+		}
+		// Under best-first every node in the open list is still reachable, so
+		// its checkpoint ancestor must survive. Freeing on frontier membership
+		// alone would drop the state the search is about to return to, and that
+		// failure is silent and arbitrarily delayed.
+		for (int i : bm.open) {
 			auto const& n = bm.nodes[static_cast<size_t>(i)];
 			bm.neededScratch.insert(n.rsIndex >= 0 ? i : n.cpAncestor);
 		}
@@ -6930,8 +7406,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		log::info("Beam: width {}, selection {}. At this restore cost a full 20k-step "
 		          "level projects to ~{:.1f} h of restores alone.",
 		          g_config.beamWidth,
-		          g_config.beamRankByScore ? "SCORE-RANKED (baseline)"
-		                                   : "diverse (mode, y-band)",
+		          g_config.beamRankMode == 1 ? "progress only"
+		          : g_config.beamRankMode == 2 ? "progress, then geometry"
+		                                       : "diverse (mode, y-band)",
 		          hours);
 		if (bm.restoreUs > 10000.0)
 			log::warn("Beam: restores cost >10 ms on this level. Probe 5 calls that "
@@ -6953,6 +7430,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		}
 		bm.nodes[static_cast<size_t>(root)].pct    = pl->getCurrentPercent();
 		bm.nodes[static_cast<size_t>(root)].bucket = beamBucket();
+		bm.nodes[static_cast<size_t>(root)].geoScore = beamGeoScore();
+		bm.nodes[static_cast<size_t>(root)].score =
+			beamScoreOf(bm.nodes[static_cast<size_t>(root)].pct,
+			            bm.nodes[static_cast<size_t>(root)].geoScore, beamDeathCell());
 		bm.visited.insert(solverStateKey());
 		bm.frontier.assign(1, root);
 		bm.expandIdx  = 0;
@@ -6973,11 +7454,14 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (bm.phase == Beam::Phase::Init) return beamInit();
 
 		if (bm.expandIdx >= static_cast<int>(bm.frontier.size())) {
-			beamSelect();
+			if (g_config.beamBestFirst) beamSelectBestFirst();
+			else                        beamSelect();
 			bm.expandIdx = 0;
 			if (bm.frontier.empty()) {
-				log::error("Beam: frontier empty at depth {} - every branch died or "
-				           "deduplicated. The search cannot continue from here.", bm.depth);
+				log::error("Beam: {} at depth {} - every branch died or "
+				           "deduplicated. The search cannot continue from here.",
+				           g_config.beamBestFirst ? "open list empty" : "frontier empty",
+				           bm.depth);
 				beamStop("exhausted");
 				return false;
 			}
