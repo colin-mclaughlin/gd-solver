@@ -181,6 +181,46 @@ struct Config {
 	int stallLimit  = 400;
 	int escapeJump  = 200;
 
+	// Replace the escape heuristic's blind rewind with a return to an archived
+	// cell. A toggles it; default off so the 14-level baseline is untouched.
+	//
+	// What the rewind does today: pop `escapeJump` decisions off the stack and
+	// resume. It has no idea what is back there. MEASURED on Theory of
+	// Everything, route+urgency build: 19 escapes, best%% frozen at 78.90%% for
+	// fifty seconds, the ladder escalating 240 -> 3840 while the search rewound
+	// 1285 steps into a region it had already refuted. The rewind pops
+	// decisions and FORGETS what it learned, so it re-derives the same limit
+	// cycle from a slightly different starting depth every time.
+	//
+	// This is the detachment failure Go-Explore names, and an archive of
+	// diverse promising cells is exactly the memory that fixes it. The DFS's own
+	// traversal fills the archive as a side effect; on a stall we select a cell,
+	// restore to it, and resume the DFS from there.
+	//
+	// Chosen over a transposition table for a reason that is about failure
+	// modes, not power: a bad archive entry is SOFT - a poor representative gets
+	// replaced when a better one arrives - where a bad prune is PERMANENT, and
+	// deletes a viable state with no way to notice. Pruning also only stops the
+	// search REPEATING itself; it does nothing to redirect it, and this log
+	// shows a search that repeats and wanders. The table stays on the shelf and
+	// composes on top of this later.
+	bool escapeArchiveRestart = false;
+
+	// Cells held by the solver's archive.
+	//
+	// Deliberately well below GoExplore's 8000. Each entry holds a checkpoint
+	// (~22 KB), and the DFS already keeps one per stack entry - ~3000 on a long
+	// level. Probe 5 measured restore cost climbing 43 ms -> 165 ms at 1000 live
+	// states, so an archive sized like GoExplore's would risk slowing down every
+	// restore on levels that currently work, which is the one regression this
+	// change must not cause. 2000 cells is ~44 MB.
+	int  solverArchiveCap = 2000;
+
+	// Cells nearer the start than this fraction of best progress are never
+	// selected. Restarting at 4%% when the frontier is at 78%% is a valid move
+	// the weighting would occasionally make, and it throws away a minute of work.
+	double archiveMinPctFrac = 0.35;
+
 	// Never restore directly to an AIR decision: restore the nearest CUBE
 	// ancestor (whose checkpoint is exact) and replay the macro forward through
 	// the air section.
@@ -246,9 +286,78 @@ struct Config {
 	// vector at all. This gives it one, which makes "stale tap state" and
 	// "cube-anchor replay" independently testable for the first time.
 	//
-	// If this reaches 78.90% the hybrid is redundant: exact checkpoints in every
-	// mode AND ~115 restores/s instead of ~15.
-	bool tapStateSurvivesRestore = true;
+	// MEASURED AND RETIRED. The 78.90% vs 32.49% result that justified keeping
+	// this defect was stale evidence: it predates geometry ordering becoming the
+	// default, and predates Theory of Everything solving at all. Re-run at
+	// current defaults, same session, nothing else changed:
+	//
+	//   Theory of Everything   stale 19s, 2065 deaths   clean 19s, 1971 deaths
+	//   Clutterfunk            38s clean - but a NULL TEST, see below
+	//
+	// Clean is equal on time and slightly better on deaths, so the defect buys
+	// nothing and the default is now clean. The leak it created is still real but
+	// far smaller than it was: 130 free Tap alternatives of 18064 gate
+	// evaluations (0.7%) against 36 (0.2%) clean, where the original measurement
+	// saw ~8%. Geometry ordering changed which branch gets pushed first, which
+	// drained most of the valve.
+	//
+	// Clutterfunk reported `free 0T` - it generates no Tap gate evaluations at
+	// all, so it cannot exercise this flag and only shows the absence of a
+	// regression. Theory of Everything is the only level here that tests it.
+	//
+	// Kept as a flag rather than deleted so a regression on a level with heavy
+	// UFO or swing can be bisected against it. Delete once the 14-level suite is
+	// green. T toggles it.
+	//
+	// Confirmation the instrumentation is honest: `free ...H` was identical (852)
+	// in both runs. Hold's cost is symmetric and cannot leak, and it did not move.
+	bool tapStateSurvivesRestore = false;
+
+	// Take Tap decisions out of the toggle budget entirely. Y toggles it.
+	//
+	// The hypothesis this tests, stated so the run can refute it: the stale tap
+	// state is not doing anything clever - it is an accidental RELEASE VALVE on
+	// a budget that is too tight for UFO, and the 78.90%% vs 32.49%% result is
+	// the valve, not the staleness.
+	//
+	// The mechanism, end to end. decisionCost charges Tap as `choice ? 1 : 0` -
+	// adding a tap costs one, removing a tap is free. The budget gate asks
+	// whether the ALTERNATIVE costs anything, so which branch is free depends
+	// entirely on which way the decision was pushed, and a decision is pushed
+	// with `d.choice = sv.hold`:
+	//
+	//   pushed choice=false (no tap)  ->  alternative is tap,    costs 1, GATED
+	//   pushed choice=true  (tap)     ->  alternative is no-tap, costs 0, FREE
+	//
+	// Stale tapRemaining (almost always 0) means the countdown in solverStep
+	// never fires, so sv.hold survives the whole 4-step branch interval instead
+	// of self-releasing after 2 - and the next Tap decision is therefore pushed
+	// with choice=true and gets a free alternative. Clean state releases the
+	// hold, the decision is pushed with choice=false, and it is gated.
+	//
+	// Measured at the time: 1756 free alternatives of 22675 gate evaluations
+	// with the defect, against 3 of 67995 without it. About 8% of Tap decisions
+	// escaping the budget is the whole difference.
+	//
+	// MEASURED AND REFUTED, which is the useful outcome. The prediction above was
+	// that exempting Tap would recover what the defect bought. It did the
+	// opposite: Theory of Everything STALLED AT 33.24% against a 19s clear, with
+	// 4302 free Tap alternatives out of 7515 gate evaluations - 60% of the gate
+	// leaking - and throughput down 5271 -> 1412 steps/s.
+	//
+	// The tell is that the toggle budget stayed pinned at 1 for the whole run and
+	// never deepened. With Tap exempt the budget-1 subtree is effectively
+	// infinite, so iterative deepening can never advance and the search drowns in
+	// tap patterns it should have reached last.
+	//
+	// So the conclusion inverts: the Tap gate is LOAD-BEARING, and it wants to be
+	// tighter rather than looser. It is what forces the UFO section to be
+	// searched simple-first. This does not contradict the tapRateBudget finding
+	// above - that loosened the ALLOWANCE, this changes which ALTERNATIVES are
+	// free, and only the second turned out to be decisive.
+	//
+	// Kept off, as the record of a measured dead end.
+	bool tapBudgetExempt = false;
 
 	// Budget taps as a RATE rather than a count.
 	//
@@ -2534,6 +2643,7 @@ struct Decision {
 // Taps spent by this choice. Always 1 for a tap, independent of the flag - the
 // flag decides which budget it is charged to, not what it costs.
 int tapCost(Decision const& d, bool choice) {
+	if (g_config.tapBudgetExempt) return 0;
 	return (d.modeClass == ModeClass::Tap && choice) ? 1 : 0;
 }
 
@@ -2560,7 +2670,9 @@ int decisionCost(Decision const& d, bool choice) {
 		// one that demonstrably clears more.
 		// Under tapRateBudget a tap is charged to the tap allowance instead, so
 		// it must not also consume the hold-toggle budget or it is counted twice.
-		case ModeClass::Tap:    return g_config.tapRateBudget ? 0 : (choice ? 1 : 0);
+		case ModeClass::Tap:
+			if (g_config.tapBudgetExempt) return 0;
+			return g_config.tapRateBudget ? 0 : (choice ? 1 : 0);
 		case ModeClass::Hold:   return (choice != d.enteringHold) ? 1 : 0;
 		case ModeClass::Ground: default: return 0;
 	}
@@ -2803,6 +2915,7 @@ struct Solver {
 		budgetPopCount = 0;
 		budgetGateEvals = 0;
 		budgetGateWouldToggle = 0;
+		gateFreeTap = gateFreeHold = 0;
 		budgetMaxSpent = -1;
 		budgetPopsFull = false;
 		resyncMacro.clear();
@@ -2852,6 +2965,14 @@ struct Solver {
 	uint64_t               budgetPopCount = 0;
 	uint64_t               budgetGateEvals = 0;        // gate reached at all
 	uint64_t               budgetGateWouldToggle = 0;  // ...and the branch costs a toggle
+
+	// Gate evaluations whose alternative was FREE, split by mode class. This is
+	// the number the stale-tap question turns on: a free alternative is a
+	// decision the budget cannot refuse, so it is the budget leaking. Split
+	// because the leak is specific to Tap's cost asymmetry - Hold charges for a
+	// CHANGE and is symmetric, Tap charges for a TAP and is not.
+	uint64_t               gateFreeTap  = 0;
+	uint64_t               gateFreeHold = 0;
 	int                    budgetMaxSpent = -1;        // highest `spent` ever seen
 	bool                   budgetPopsFull = false;
 
@@ -3013,6 +3134,39 @@ struct GoEntry {
 // commit floor, toggle budget, escape bookkeeping and mode anchors, none of
 // which apply to a bounded local search whose job is to explore one
 // neighbourhood and then hand control back to the archive.
+// The solver's own cell archive, filled by the DFS's traversal and read by the
+// escape path. Separate from GoExplore's so the two searches cannot corrupt
+// each other's memory, but deliberately the SAME cell function and the same
+// entry shape - if the cell abstraction is right for one it is right for both,
+// and having two would mean two things to get wrong.
+struct SolverArchive {
+	std::unordered_map<uint64_t, GoEntry> cells;
+	std::vector<uint64_t> keys;
+
+	uint64_t restarts    = 0;   // escapes served by a return instead of a rewind
+	uint64_t restartFail = 0;   // ...and escapes that fell back to the rewind
+	uint64_t newCells    = 0;
+	uint64_t evicted     = 0;
+
+	// Own RNG, seeded fixed: a run that misbehaves once and never again is not
+	// debuggable. xorshift64*, so the sequence is ours and not the CRT's.
+	uint64_t rng = 0x9E3779B97F4A7C15ull;
+	uint64_t next() {
+		rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
+		return rng * 2685821657736338717ull;
+	}
+
+	void clear() {
+		for (auto& kv : cells) releaseCheckpoint(kv.second.rs.cp);
+		cells.clear();
+		keys.clear();
+		restarts = restartFail = newCells = evicted = 0;
+		rng = 0x9E3779B97F4A7C15ull;
+	}
+
+	static SolverArchive& get() { static SolverArchive a; return a; }
+};
+
 struct GoDecision {
 	RestoreState rs;
 	uint8_t tried        = 0;      // bit0 = tried release, bit1 = tried hold
@@ -4767,6 +4921,34 @@ void pollHotkeys() {
 		          g_config.geomClearanceBand < 0.01 ? " (trail drives every decision)" : "");
 	}
 
+	// T = restore tap state on a reposition instead of letting it go stale.
+	if (keyPressedEdge('T')) {
+		g_config.tapStateSurvivesRestore = !g_config.tapStateSurvivesRestore;
+		log::info("Tap state on a reposition: {}. F2 to solve with this.",
+		          g_config.tapStateSurvivesRestore
+		              ? "SURVIVES (stale, the default - sv.hold outlives the tap and the "
+		                "next Tap decision is pushed held, so its alternative is free)"
+		              : "RESTORED (clean - the tap self-releases and the next Tap "
+		                "decision is pushed released, so its alternative is gated)");
+	}
+
+	// Y = take Tap decisions out of the toggle budget.
+	if (keyPressedEdge('Y')) {
+		g_config.tapBudgetExempt = !g_config.tapBudgetExempt;
+		log::info("Tap decisions are {} the toggle budget. F2 to solve with this.",
+		          g_config.tapBudgetExempt ? "EXEMPT from" : "charged against");
+	}
+
+	// A = archive restart instead of the blind escape rewind.
+	if (keyPressedEdge('A')) {
+		g_config.escapeArchiveRestart = !g_config.escapeArchiveRestart;
+		log::info("Escape: {}. F2 to solve with this.",
+		          g_config.escapeArchiveRestart
+		              ? "ARCHIVE RESTART - on a stall, return to a promising archived "
+		                "cell and resume from there"
+		              : "rewind - pop escapeJump decisions and widen the window");
+	}
+
 	// J = cycle escapesBeforeWidening. Read at stall time, so it takes effect on
 	// the next F2 with no rebuild.
 	if (keyPressedEdge('J')) {
@@ -4914,6 +5096,7 @@ void pollHotkeys() {
 
 			sv.clear();
 			CellProbe::get().clear();
+			SolverArchive::get().clear();
 			if (g_config.geometryDeadPrune || g_config.geometryOrdering) {
 				if (geometryBuildMap()) {
 					auto& m = GeoMap::get();
@@ -7560,6 +7743,150 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		return true;
 	}
 
+	// Drop the least useful cell, sampled rather than scanned: a full pass over
+	// the archive on every insertion at the cap would sit in the stepping path.
+	bool solverArchiveEvict() {
+		auto& ar = SolverArchive::get();
+		if (ar.keys.empty()) return false;
+
+		size_t worstIdx = 0;
+		double worstScore = 0.0;
+		bool found = false;
+		for (int t = 0; t < 32; t++) {
+			const size_t i = static_cast<size_t>(ar.next() % ar.keys.size());
+			auto it = ar.cells.find(ar.keys[i]);
+			if (it == ar.cells.end()) continue;
+			// Low progress and heavily-used cells go first. A cell already
+			// chosen many times has told us what it has to tell us.
+			const double score = it->second.pct - 0.01 * it->second.chosen;
+			if (!found || score < worstScore) { worstScore = score; worstIdx = i; found = true; }
+		}
+		if (!found) return false;
+
+		auto it = ar.cells.find(ar.keys[worstIdx]);
+		if (it != ar.cells.end()) {
+			releaseCheckpoint(it->second.rs.cp);
+			ar.cells.erase(it);
+		}
+		ar.keys[worstIdx] = ar.keys.back();
+		ar.keys.pop_back();
+		ar.evicted++;
+		return true;
+	}
+
+	// Census one step of the DFS into the archive.
+	//
+	// A checkpoint is captured only for a cell that is NEW. Capture is ~12 us
+	// (Probe 5) against a restore's millisecond, but the cost that matters here
+	// is memory and the live-checkpoint count, so a cell seen again is a counter
+	// bump and nothing else. No "improve the representative" rule either: the
+	// DFS reaches a cell by one path and re-capturing on a shorter one would
+	// churn checkpoints in the stepping path for a gain the escape cannot use.
+	void solverArchiveRecord() {
+		if (!g_config.escapeArchiveRestart) return;
+		auto& sv = Solver::get();
+		auto* p  = m_player1;
+		auto* pl = PlayLayer::get();
+		if (!p || !pl || p->m_isDead) return;
+
+		auto& ar = SolverArchive::get();
+		const uint64_t key = goCellKey();
+
+		auto it = ar.cells.find(key);
+		if (it != ar.cells.end()) { it->second.seen++; return; }
+
+		if (ar.cells.size() >= static_cast<size_t>(g_config.solverArchiveCap)
+		    && !solverArchiveEvict()) return;
+
+		GoEntry e;
+		captureRestoreState(e.rs);
+		if (!e.rs.cp) return;
+		// The macro is the input sequence from frame 0 to here, which is what
+		// makes a restart legitimate: the state we return to is reachable from
+		// the start by a sequence we can hand to the verifier. sv.macro is
+		// exactly that, truncated to the current step.
+		e.macro.assign(sv.macro.begin(),
+		               sv.macro.begin() + std::min<size_t>(static_cast<size_t>(sv.step),
+		                                                   sv.macro.size()));
+		e.pct  = pl->getCurrentPercent();
+		e.step = sv.step;
+		e.hold = sv.hold;
+		e.seen = 1;
+		ar.cells.emplace(key, std::move(e));
+		ar.keys.push_back(key);
+		ar.newCells++;
+	}
+
+	// Pick a cell to resume from: promising, and not somewhere we have already
+	// spent our time. Tournament rather than a full scan, for the same reason as
+	// eviction.
+	uint64_t solverArchiveSelect() {
+		auto& ar = SolverArchive::get();
+		auto& sv = Solver::get();
+		if (ar.keys.empty()) return 0;
+
+		// Never restart near the level start when the frontier is far ahead.
+		const float minPct = static_cast<float>(sv.bestPct * g_config.archiveMinPctFrac);
+
+		uint64_t bestKey = 0;
+		double   bestW   = -1.0;
+		const int kTournament = std::max(1, g_config.goTournament);
+		for (int t = 0; t < kTournament; t++) {
+			const uint64_t k = ar.keys[static_cast<size_t>(ar.next() % ar.keys.size())];
+			auto it = ar.cells.find(k);
+			if (it == ar.cells.end() || !it->second.rs.cp) continue;
+			if (it->second.pct < minPct) continue;
+			// Under-chosen and under-visited first. This is what makes the
+			// restart avoid the stall region without being told where it is:
+			// the place the search has been thrashing has an enormous `seen`.
+			double w = 1.0 / std::sqrt(1.0 + static_cast<double>(it->second.chosen));
+			w       /= std::sqrt(1.0 + static_cast<double>(it->second.seen));
+			if (g_config.goProgressBias > 0.0)
+				w *= 1.0 + g_config.goProgressBias * (it->second.pct / 100.0);
+			if (w > bestW) { bestW = w; bestKey = k; }
+		}
+		return bestKey;
+	}
+
+	// Resume the DFS from an archived cell instead of rewinding the stack.
+	//
+	// The stack is abandoned wholesale rather than truncated. A truncation would
+	// be wrong: the entries below a cut belong to the path the DFS walked, and
+	// the cell was reached by its own macro, so nothing guarantees they
+	// correspond. Clearing and treating the cell as a fresh root is the only
+	// consistent choice, and it is sound because the cell carries a frame-0
+	// macro - sv.macro stays a real input sequence throughout.
+	bool solverArchiveRestartTo() {
+		auto& ar = SolverArchive::get();
+		auto& sv = Solver::get();
+
+		const uint64_t key = solverArchiveSelect();
+		if (!key) return false;
+		auto it = ar.cells.find(key);
+		if (it == ar.cells.end() || !it->second.rs.cp) return false;
+
+		applyRestoreState(it->second.rs, it->second.hold);
+
+		for (auto& d : sv.stack) releaseCheckpoint(d.rs.cp);
+		sv.stack.clear();
+		sv.macro       = it->second.macro;
+		sv.step        = it->second.step;
+		sv.hold        = it->second.hold;
+		sv.commitDepth = 0;
+		sv.lastBranch  = sv.step;
+
+		// Toggles are counted relative to the commit floor, and the floor is now
+		// 0. Carrying the old counts forward would put every freshly pushed
+		// decision instantly over budget and gate the entire restarted subtree.
+		sv.togglesUsed = 0;
+		sv.tapsUsed    = 0;
+
+		sv.restores++;
+		it->second.chosen++;
+		ar.restarts++;
+		return true;
+	}
+
 	void cellProbeRecord() {
 		if (!g_config.cellProbeEnabled) return;
 		auto* p  = m_player1;
@@ -8055,6 +8382,25 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// Abandon a chunk of the stack so the search resumes much earlier.
 		if (g_config.stallLimit > 0 &&
 		    sv.deaths - sv.deathsAtBest > static_cast<uint64_t>(g_config.stallLimit)) {
+
+			// Archive restart, when enabled and the archive has somewhere to go.
+			// Taken INSTEAD of the whole rewind-ladder-anchor path: with the
+			// stack cleared the commit floor is 0, so widening a mutable window
+			// and releasing a transition anchor are both no-ops here. They stay
+			// as the fallback for a failed or empty return, which is also what
+			// keeps the default behaviour reachable.
+			if (g_config.escapeArchiveRestart && solverArchiveRestartTo()) {
+				sv.escapes++;
+				sv.deathsAtBest = sv.deaths;
+				auto& ar = SolverArchive::get();
+				log::info("Solver: stalled {} deaths at {:.2f}% - returned to an archived "
+				          "cell at step {} ({} cells, {} restarts, {} fallbacks)",
+				          g_config.stallLimit, sv.bestPct, sv.step,
+				          ar.cells.size(), ar.restarts, ar.restartFail);
+				return true;
+			}
+			if (g_config.escapeArchiveRestart) SolverArchive::get().restartFail++;
+
 			// Never rewind below the committed prefix. The previous version only
 			// held a floor when the stack TOP was an air decision, so once the
 			// air decisions were popped the guard stopped applying and the
@@ -8174,6 +8520,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				                       ? tapCost(d, !d.choice) > 0
 				                       : decisionCost(d, !d.choice) > 0;
 				if (wouldToggle) sv.budgetGateWouldToggle++;
+				else if (d.modeClass == ModeClass::Tap) sv.gateFreeTap++;
+				else                                    sv.gateFreeHold++;
 				// Relative to the committed prefix: toggles spent inside a
 				// frozen, already-working prefix must not count against the
 				// budget for the part still being solved.
@@ -8286,13 +8634,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
 		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
+		          "archive {}c/{}r/{}f  gate {} free {}T/{}H  "
 		          "dx {:.2f}/{:.2f}  vs map {:.2f}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
 		          g_config.toggleBudget, sv.commitDepth, sv.lookbackSteps, sv.resyncs, sv.resyncFailures,
 		          CellProbe::get().cells.size(), sv.anchorReplays,
 		          sv.tapFirstChosen, sv.tapDecisions, sv.geoSteers, sv.geoLooks,
-		          sv.geoSteerDead, sv.geoSteerWin, sv.dxPerStep,
+		          sv.geoSteerDead, sv.geoSteerWin,
+		          SolverArchive::get().cells.size(), SolverArchive::get().restarts,
+		          SolverArchive::get().restartFail,
+		          sv.budgetGateEvals, sv.gateFreeTap, sv.gateFreeHold,
+		          sv.dxPerStep,
 		          GeoMap::get().valid && m_player1
 		              ? GeoMap::get().speedAt(m_player1->getPositionX()) : 0.0,
 		          static_cast<double>(g_config.geomVerticalReach) /
@@ -8749,6 +9102,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// player reached, and after the resync early-return so the census covers
 		// search steps only, not prefix replay.
 		cellProbeRecord();
+
+		// Same placement and the same reasons: after the death check so a dead
+		// frame is never recorded as somewhere the player reached, and after the
+		// resync early-return so prefix replay does not fill the archive with
+		// states the search did not choose.
+		solverArchiveRecord();
 
 		auto* p = m_player1;
 		const ModeClass mc = classifyMode(p);
