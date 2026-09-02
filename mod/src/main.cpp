@@ -943,6 +943,63 @@ struct Config {
 	// makes. Its only cost is one hash and one map lookup per step.
 	bool cellProbeEnabled = true;
 
+	// Probe 9: measure the vertical motion MODEL, not the trajectory.
+	//
+	// Everything the map knows is positional. It reads free intervals off the
+	// level and asks whether the player is inside a live one, which cannot
+	// distinguish the three situations that decide a ship section: needing to
+	// climb while already rising, while flat, and while falling. Same position,
+	// completely different answers. The measured asymmetry says how much that
+	// matters - ship climbs 1.800 units/step and falls 5.986, so it drops 3.3x
+	// faster than it can recover.
+	//
+	// What this records is the one-step transition, which at fixed dt is a
+	// FUNCTION:
+	//
+	//   vy' = f(mode, size, speed, gravity, ground, prevHold, hold, vy)
+	//
+	// Recording the function rather than trajectories is what removes the need
+	// for a custom measurement level. vy is continuous, so any sustained hold
+	// walks through the intermediate values on the way - a 20-step hold hands
+	// over f at 20 consecutive points, and nothing arrives at vy=+4 without
+	// passing +1, +2 and +3. The union over a run is a contiguous BAND, not
+	// scattered samples, and iterating f reconstructs any trajectory inside it.
+	//
+	// It also answers the coverage worry rather than assuming it away: if a
+	// section never reaches terminal velocity then terminal velocity is not part
+	// of that section's answer, because the player cannot get there either. The
+	// band needed is exactly the band traversed. GD's update is vy += a*dt with a
+	// clamp, so f is affine with a flat top and terminal reads off the SHAPE of
+	// the curve rather than being something we have to sit at.
+	//
+	// prevHold is in the key because UFO and swing respond to the PRESS EDGE, not
+	// the held state - holding a UFO gives one impulse and then gravity. That one
+	// field is what lets impulse modes and force modes be measured by the same
+	// passive census instead of two different input patterns.
+	//
+	// Self-validating, and this is the column to read first. f is a function, so
+	// one key must yield one vy'. A key that yields two is a key missing a field,
+	// and the spread column says so directly instead of us discovering it later
+	// through a wrong prune.
+	//
+	// Passive: one hash and one map lookup per step, the same cost as
+	// cellProbeRecord, no allocation past the map's growth, nothing read back and
+	// no file I/O. It changes NO search behaviour - using f to bound reachability
+	// is a separate later change that this measurement exists to justify or kill.
+	//
+	// W dumps it; shift is not needed, it also stays collecting.
+	bool motionModelEnabled = true;
+
+	// Quantisation of vy for the model key, in GD velocity units. Fine, because
+	// this is the input to an affine fit and the clamp point has to be locatable;
+	// too coarse and the ramp and the flat top blur into each other, which is the
+	// one feature the measurement is for.
+	double motionVyBucket = 0.01;
+
+	// Distinct keys kept. A guard against a mode combination we have not
+	// anticipated, not an expected limit.
+	int motionModelCap = 400000;
+
 	// Ceiling on distinct cells held. ~80 bytes each, so 300k is ~24 MB. Past
 	// the cap new cells are counted and dropped rather than stored, which keeps
 	// the census honest about having been truncated instead of silently lying.
@@ -2729,6 +2786,14 @@ struct Solver {
 	// The player's horizontal speed, measured. Held across restores rather than
 	// recomputed, because a restore jumps x backwards and the delta across one
 	// is meaningless.
+	// Probe 9: the previous step's post-update state, which is this step's
+	// PRE-update state. Held rather than recomputed because a restore jumps the
+	// player and the pair either side of one would not be a transition at all -
+	// motionHavePrev is cleared in applyRestoreState for exactly that reason.
+	double                motionPrevVy   = 0.0;
+	bool                  motionPrevHold = false;
+	bool                  motionHavePrev = false;
+
 	double                prevX        = 0.0;
 	double                dxPerStep    = 1.31;  // 1x; replaced on the first step
 
@@ -2920,6 +2985,9 @@ struct Solver {
 		budgetPopsFull = false;
 		resyncMacro.clear();
 		lastGoodMacro.clear();
+		motionPrevVy   = 0.0;
+		motionPrevHold = false;
+		motionHavePrev = false;
 		bestMacro.clear();
 		pathTrace.clear();
 		pathTraceFull = false;
@@ -3139,6 +3207,28 @@ struct GoEntry {
 // each other's memory, but deliberately the SAME cell function and the same
 // entry shape - if the cell abstraction is right for one it is right for both,
 // and having two would mean two things to get wrong.
+// Probe 9: the measured one-step vertical transition. See motionModelEnabled.
+struct MotionModel {
+	struct Row {
+		// The key, kept unpacked so the dump can print it - the map is keyed by
+		// a hash and the fields are not otherwise recoverable.
+		int32_t  vyb   = 0;
+		uint8_t  mode  = 0, size = 0, speed = 0, flags = 0;
+
+		double   vyNextMin =  1e30;  // the two extremes this key ever produced.
+		double   vyNextMax = -1e30;  // any spread means the key is incomplete
+		double   dySum     = 0.0;    // mean world-units moved, for the ramp
+		uint32_t count     = 0;
+	};
+
+	std::unordered_map<uint64_t, Row> rows;
+	uint64_t recorded = 0;
+	uint64_t capped   = 0;
+
+	void clear() { rows.clear(); recorded = capped = 0; }
+	static MotionModel& get() { static MotionModel m; return m; }
+};
+
 struct SolverArchive {
 	std::unordered_map<uint64_t, GoEntry> cells;
 	std::vector<uint64_t> keys;
@@ -3376,6 +3466,109 @@ struct CellProbe {
 	void clear() { cells.clear(); recorded = capped = 0; lastDump = 0; }
 	static CellProbe& get() { static CellProbe c; return c; }
 };
+
+// Probe 9: write the measured motion model out, plus the two summaries that
+// decide whether it can be trusted. File I/O, so never from the stepping path.
+//
+// Read the SPREAD column first. vy' = f(key) is a function; a nonzero spread on
+// any row means that key is missing a field and the model is wrong, and no
+// amount of curve fitting downstream will repair it. Read COVERAGE second: the
+// vy band actually observed per configuration is the band inside which the
+// model can answer, and outside which it must not be asked.
+void motionModelDump(const char* why) {
+	auto& mm = MotionModel::get();
+	if (!g_config.motionModelEnabled || mm.rows.empty()) return;
+
+	const std::string path =
+		probe::outputPath(ProbeState::get().levelKey + "_motion.csv");
+	std::FILE* f = std::fopen(path.c_str(), "w");
+	if (!f) { log::error("Probe 9: cannot write {}", path); return; }
+
+	std::fprintf(f, "# motion model (%s): vy' = f(mode,size,speed,grav,ground,"
+	                "prevHold,hold,vy)\n", why);
+	std::fprintf(f, "# %llu transitions recorded, %llu distinct keys, %llu capped, "
+	                "vy bucket %.4f\n",
+	             static_cast<unsigned long long>(mm.recorded),
+	             static_cast<unsigned long long>(mm.rows.size()),
+	             static_cast<unsigned long long>(mm.capped),
+	             g_config.motionVyBucket);
+	std::fprintf(f, "mode,size,speed,upsideDown,onGround,prevHold,hold,"
+	                "vy,vyNextMin,vyNextMax,spread,dyMean,count\n");
+
+	// Per-configuration coverage and consistency, accumulated while writing.
+	struct Cov {
+		double vyLo = 1e30, vyHi = -1e30;
+		double worstSpread = 0.0;
+		uint64_t rows = 0, conflicts = 0, samples = 0;
+	};
+	std::map<uint32_t, Cov> cov;
+
+	static const char* kMode[8] = {"cube", "ship", "wave", "ufo", "ball",
+	                               "robot", "spider", "swing"};
+
+	// Sorted so the CSV reads as curves rather than hash order - the ramp is
+	// only legible if vy is monotonic within a configuration.
+	std::vector<MotionModel::Row> rows;
+	rows.reserve(mm.rows.size());
+	for (auto const& kv : mm.rows) rows.push_back(kv.second);
+	std::sort(rows.begin(), rows.end(),
+		[](MotionModel::Row const& a, MotionModel::Row const& b) {
+			if (a.mode  != b.mode)  return a.mode  < b.mode;
+			if (a.size  != b.size)  return a.size  < b.size;
+			if (a.speed != b.speed) return a.speed < b.speed;
+			if (a.flags != b.flags) return a.flags < b.flags;
+			return a.vyb < b.vyb;
+		});
+
+	for (auto const& r : rows) {
+		const double vy      = r.vyb * g_config.motionVyBucket;
+		const double spread  = r.vyNextMax - r.vyNextMin;
+		const double dyMean  = r.count ? r.dySum / r.count : 0.0;
+		std::fprintf(f, "%s,%d,%d,%d,%d,%d,%d,%.4f,%.6f,%.6f,%.6f,%.4f,%u\n",
+		             kMode[r.mode & 7], r.size, r.speed,
+		             (r.flags & 1) ? 1 : 0, (r.flags & 8) ? 1 : 0,
+		             (r.flags & 2) ? 1 : 0, (r.flags & 4) ? 1 : 0,
+		             vy, r.vyNextMin, r.vyNextMax, spread, dyMean, r.count);
+
+		const uint32_t ck = (static_cast<uint32_t>(r.mode) << 16)
+		                  | (static_cast<uint32_t>(r.size) << 8)
+		                  | r.speed;
+		auto& c = cov[ck];
+		c.vyLo = std::min(c.vyLo, vy);
+		c.vyHi = std::max(c.vyHi, vy);
+		c.worstSpread = std::max(c.worstSpread, spread);
+		// The tolerance is the BUCKET WIDTH, not zero, and getting this wrong
+		// made the first run look catastrophic. vy' is roughly vy + a, so any
+		// bucket holding two distinct vy values produces up to one bucket of
+		// spread by construction. Measured on Base After Base: p50 0.003, p90
+		// 0.009 against a 0.01 bucket - all quantisation, no disagreement.
+		//
+		// Real disagreements sit far above it and were all one thing: rows with
+		// vyNextMax exactly 0, i.e. the floor and ceiling CLAMP, where contact
+		// overrides the physics. In free air the spread is exactly 0.000000.
+		const double tol = 1.5 * g_config.motionVyBucket;
+		if (spread > tol) c.conflicts++;
+		c.rows++;
+		c.samples += r.count;
+	}
+	std::fclose(f);
+
+	log::info("Probe 9: motion model -> {}  |  {} transitions, {} keys",
+	          path, mm.recorded, mm.rows.size());
+	log::info("  configuration      vy band observed        keys   samples  conflicts");
+	for (auto const& kv : cov) {
+		auto const& c = kv.second;
+		log::info("  {:<6} {} {}x   {:+7.3f} .. {:+7.3f}   {:>6}  {:>8}  {:>6}{}",
+		          kMode[(kv.first >> 16) & 7],
+		          ((kv.first >> 8) & 0xff) ? "mini" : "    ",
+		          (kv.first & 0xff),
+		          c.vyLo, c.vyHi, c.rows, c.samples, c.conflicts,
+		          c.conflicts ? "  <-- KEY IS INCOMPLETE" : "");
+	}
+	log::info("  Conflicts must be 0. A nonzero count means one key produced two "
+	          "different vy', so the key is missing a field and the model cannot "
+	          "be used to bound anything until that field is found.");
+}
 
 // Write the census out. Called at stalls and at the end of a search, never
 // from the hot loop - this formats and does file I/O. Touches no player state,
@@ -4218,7 +4411,7 @@ void deadEndDump() {
 
 	const std::string path = levelFilePath("deadends.txt");
 	std::FILE* f = std::fopen(path.c_str(), "wb");
-	if (!f) { log::error("Probe 8: cannot write {}", path); return; }
+	if (!f) { log::error("Probe 9: cannot write {}", path); return; }
 
 	std::fprintf(f, "# gd-solver dead-end map (Probe 8, free intervals)\n");
 	std::fprintf(f, "# %d exact x segments (object edges, variable width); "
@@ -4919,6 +5112,33 @@ void pollHotkeys() {
 		log::info("Clearance band {:.2f} of window height{} - F2 to solve with this.",
 		          g_config.geomClearanceBand,
 		          g_config.geomClearanceBand < 0.01 ? " (trail drives every decision)" : "");
+	}
+
+	// X = geometry ordering on/off.
+	//
+	// Exists to bisect a regression rather than to tune anything: Base After Base
+	// solved in 13s and VERIFIED when the map held 2034 intervals, and stalls at
+	// 69.09% now that it holds 4199. The map is the one thing known to have
+	// changed, and `dead 0` says it is not pruning anything, so if it is the
+	// cause it can only be through ORDERING. One run with this off separates
+	// those two possibilities.
+	if (keyPressedEdge('X')) {
+		g_config.geometryOrdering = !g_config.geometryOrdering;
+		log::info("Geometry ordering: {}. F2 to solve with this.",
+		          g_config.geometryOrdering
+		              ? "ON - the map chooses which branch an air decision tries first"
+		              : "OFF - release-before-hold everywhere, the map is not consulted");
+	}
+
+	// W = dump the measured motion model (Probe 9).
+	if (keyPressedEdge('W')) {
+		auto& mm = MotionModel::get();
+		if (mm.rows.empty()) {
+			log::warn("Probe 9: nothing recorded yet - run a solve first (F2), then W. "
+			          "Collection is passive and always on.");
+		} else {
+			motionModelDump("on demand");
+		}
 	}
 
 	// T = restore tap state on a reposition instead of letting it go stale.
@@ -6967,6 +7187,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			ps.isHolding = enteringHold;
 		}
 
+		// The step after a reposition has no valid predecessor: pairing across
+		// one would record a "transition" between two unrelated states.
+		Solver::get().motionHavePrev = false;
+
 		// Everything the direct load leaves untouched. Authoritative: this is the
 		// last thing to write PlayerObject, so nothing above can corrupt it.
 		if (auto* p = m_player1; p && !r.playerBytes.empty()) {
@@ -7741,6 +7965,55 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (yb > sw.maxY) sw.maxY = yb;
 		}
 		return true;
+	}
+
+	// Probe 9: one step of the vertical motion model.
+	//
+	// Keyed on everything that can change the answer. If the spread column in the
+	// dump is non-zero, something is missing from exactly this list.
+	void motionModelRecord(double vyBefore, bool prevHold, bool hold, double dy) {
+		auto* p = m_player1;
+		if (!g_config.motionModelEnabled || !p || p->m_isDead) return;
+
+		auto& mm = MotionModel::get();
+		const double q = std::max(1e-4, g_config.motionVyBucket);
+
+		MotionModel::Row k;
+		k.vyb  = static_cast<int32_t>(std::floor(vyBefore / q));
+		// Full mode identity, not just the class: ship and wave are both Hold
+		// and do not share a curve.
+		k.mode = static_cast<uint8_t>(p->m_isShip ? 1 : p->m_isDart ? 2
+		       : p->m_isBird ? 3 : p->m_isBall ? 4 : p->m_isRobot ? 5
+		       : p->m_isSpider ? 6 : p->m_isSwing ? 7 : 0);
+		k.size  = p->m_vehicleSize < 0.9f ? 1 : 0;
+		k.speed = static_cast<uint8_t>(Solver::speedBucket(Solver::get().dxPerStep));
+		k.flags = static_cast<uint8_t>((p->m_isUpsideDown ? 1 : 0)
+		        | (prevHold ? 2 : 0) | (hold ? 4 : 0)
+		        | (p->m_isOnGround ? 8 : 0));
+
+		struct Packed { int32_t vyb; uint8_t mode, size, speed, flags; } pk{
+			k.vyb, k.mode, k.size, k.speed, k.flags };
+		const uint64_t key = probe::fnv1a(&pk, sizeof(pk));
+		mm.recorded++;
+
+		const double vyAfter = p->m_yVelocity;
+		auto it = mm.rows.find(key);
+		if (it == mm.rows.end()) {
+			if (mm.rows.size() >= static_cast<size_t>(g_config.motionModelCap)) {
+				mm.capped++;
+				return;
+			}
+			k.vyNextMin = k.vyNextMax = vyAfter;
+			k.dySum = dy;
+			k.count = 1;
+			mm.rows.emplace(key, k);
+			return;
+		}
+		auto& r = it->second;
+		r.vyNextMin = std::min(r.vyNextMin, vyAfter);
+		r.vyNextMax = std::max(r.vyNextMax, vyAfter);
+		r.dySum += dy;
+		r.count++;
 	}
 
 	// Drop the least useful cell, sampled rather than scanned: a full pass over
@@ -8955,6 +9228,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			          "savestates {} time(s)", sv.resyncs, sv.resyncFailures, sv.resyncs);
 			solverWriteMacro("solution.txt");
 			cellProbeDump("solved");
+			motionModelDump("solved");
 
 			// Hand the winning trajectory to the verifier. Done here, outside the
 			// stepping path, so the copy costs nothing that matters.
@@ -9092,9 +9366,23 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					double& slot = s.maxClimb[mode][size][spd][dir];
 					slot = std::max(slot, dy);
 				}
+
+				// Probe 9, inside this gate deliberately: `dx` being sane is
+				// already the proof that this was ONE real forward step rather
+				// than the far side of a restore, and a transition recorded
+				// across a reposition would be pure noise. sv.hold here is still
+				// the input that was applied during this step - the tap countdown
+				// that can change it runs further down.
+				if (s.motionHavePrev)
+					motionModelRecord(s.motionPrevVy, s.motionPrevHold, sv.hold, rawDy);
 			}
 			s.prevX = nx;
 			s.prevY = ny;
+			// Unconditionally, so the step after a skipped one still pairs
+			// against the state it actually started from.
+			s.motionPrevVy   = m_player1->m_yVelocity;
+			s.motionPrevHold = sv.hold;
+			s.motionHavePrev = true;
 		}
 
 		// Census where the search has been. Read-only - see CellProbe. Placed
