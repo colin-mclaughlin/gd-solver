@@ -522,6 +522,329 @@ struct Config {
 	// directions by construction.
 	bool geometryOrdering = true;
 
+	// Probe 10: measure the ceiling the PLAYER actually has, not the one the
+	// objects imply.
+	//
+	// The map's roof is `highest solid object in the whole level + 120`, one
+	// global number applied at every x (geometryBuildMap, m.yHi). That is wrong
+	// in a way that changed the outcome of a level.
+	//
+	// Base After Base, x 17970: the wall has a hole at y 225-315 with the cube
+	// portal in it, solid at y 315-375, and the map calls y 375+ OPEN and LIVE -
+	// the top band is open at 426 of 428 x bands, so the map believes flying
+	// along the roof is a route to the finish. Geometrically that is TRUE. The
+	// space is really in the level. The player simply cannot get to it: a ship
+	// section imposes a ceiling that is not made of objects, and the roof space
+	// sits above it. The solver flew up, clearance steering re-centred it into
+	// the phantom corridor on every decision, and it never came back down to the
+	// portal. With the map off the same level solves in 15s.
+	//
+	// GD does not expose this as a level constant. m_maxGameplayY is the only
+	// global bound and it reads 2790 against level content around 500, so it is
+	// a no-op; the real ship ceiling is camera-relative and moves. So measure it
+	// instead of guessing at a field.
+	//
+	// Ceiling contact is unambiguous and needs no game knowledge: the player is
+	// RISING, then vertical velocity is forced to zero, and no solid object is
+	// there to have caused it. Recording the y where that happens, per x band,
+	// gives the reachable roof as a function of x, from real play.
+	//
+	// Passive and read-only. It changes nothing yet - the point is to find out
+	// whether the measured ceiling is far below the map's roof, which is the
+	// claim, before clamping anything to it.
+	// OFF by default, and this one is the worse of the two: an ORDERED std::map
+	// lookup per step. Same story - it was measurement scaffolding left running.
+	// W turns it on; the live readout on I does not depend on it.
+	bool ceilingProbe = false;
+
+	// Probe 12: live readout of every ceiling candidate while the level is
+	// played BY HAND.
+	//
+	// Every ceiling measurement so far came out of the solver, and all of them
+	// were contaminated the same way: the search was stalled, so samples piled
+	// up in one x band against one wall and were overwhelmingly ordinary block
+	// collisions rather than the invisible ceiling. Two of my conclusions came
+	// from that data and both were wrong. A snapshot from a wedged search is the
+	// worst available instrument for this.
+	//
+	// Flying it by hand fixes all of it at once: every section can be touched
+	// deliberately, different portals entered on purpose, and the fields watched
+	// moving rather than inferred from two aggregated numbers.
+	//
+	// Manual play only. It logs, and logging has no business in the stepping
+	// path, so it refuses to run while a search is going.
+	//
+	// I toggles it.
+	bool liveCeilingReadout = false;
+
+	// Frames between readout lines. A contact always prints.
+	int liveCeilingEvery = 30;
+
+	// Crop what the map offers to the band the player can actually occupy.
+	// E toggles it.
+	//
+	// The map's roof is one global number - tallest solid in the level + 120 -
+	// so in an air section it offers hundreds of units of space the player is
+	// physically barred from. MEASURED on Base After Base: map roof 630, real
+	// ceiling 255 to 375 depending on section, so up to 375 units of phantom
+	// sky. At x 17970 that phantom space is a second LIVE interval above the
+	// wall, clearance steering re-centred the ship into it on every decision,
+	// and the search never came back down to the cube portal three blocks below.
+	// The same level with the map off solves in 15s.
+	//
+	// Where the ceiling comes from, and why not from the level or the camera:
+	//
+	//   Level data would mean reading portals and assuming which ones get taken,
+	//   in what order. Fake portals exist precisely to break that, portals stack
+	//   at one x, and a wrong static ceiling can mark a REAL route dead and
+	//   delete the solution silently.
+	//
+	//   The camera looked like the answer and is not. MEASURED: over 4312 ceiling
+	//   contacts the camera y read constant at 80 while the real ceiling moved
+	//   120 units between sections, so whatever m_objectLayer's y is, it is not
+	//   the vertical scroll. m_cameraHeight is a flat 320 throughout.
+	//
+	// Learning it from contact was the previous attempt and it is level
+	// dependent: a section whose correct route never touches the roof never
+	// teaches it, and that is exactly the tight section where it would matter.
+	// Dropped.
+	//
+	// GD tracks the anchor itself: GJGameState::m_portalY is the y the camera
+	// snapped to when the player ACTUALLY ENTERED a portal. That is live state,
+	// set by the entry event, so it carries no assumption about which portals
+	// exist, which are fake, what order they are in, or how they stack - a portal
+	// that is flown past never sets it. GJGameState::m_isFreeMode covers the 2.2
+	// free-fly sections where there is no bound at all.
+	//
+	// The ceiling is then m_portalY + geomCeilingOffset.
+	//
+	// Deliberately applied at QUERY time and not baked into liveness. Optimistic
+	// liveness can only fail to prune - it can never prune something reachable -
+	// so leaving the phantom corridor flagged live costs information and cannot
+	// lose a solution. A ceiling baked into the flood could.
+	// Back ON, now that the anchor is the entered portal rather than a field that
+	// read zero. The previous version computed a ceiling of 135 everywhere, which
+	// cropped nearly the whole map and merely switched steering off - Base After
+	// Base "solved" in 14s, which was just the map-off result wearing a disguise.
+	// DEFAULT OFF, after three attempts that each traded one level for another:
+	//
+	//   clip to band        Base After Base 17s, Time Machine 21s (from 12s)
+	//   target check only   Time Machine 14s, Base After Base 59s
+	//   drop wholly-outside Time Machine 8s, Clutterfunk STALLS
+	//
+	// Clutterfunk names the mechanism, and it is not the cropping. Narrowing the
+	// crop from 15113 intervals to 319 left it stalling at the identical 55.65%,
+	// while turning the band off entirely solves it in 38s - exactly its
+	// historical time. The difference in the reports is the TOGGLE BUDGET: with
+	// the band off it deepens to 2 and solves; with it on it never leaves 1, so
+	// only single-toggle paths are ever allowed and a zigzag ship corridor needs
+	// several. 322k steps for less progress than 158k.
+	//
+	// So the band changes the search's ordering enough that the budget-1 tree
+	// stops exhausting. That is a real interaction and it is not understood, which
+	// is exactly why this should not ship on.
+	//
+	// The ceiling VALUE stays - it is read from the game at 0x764, validated over
+	// 608811 steps with zero violations, and it is correct. What is unresolved is
+	// how to apply it to the map without disturbing the search. E turns it on.
+	// Lower the MAP's roof at build time to the highest ceiling any mode portal
+	// in the level can produce. K toggles it.
+	//
+	// Every previous attempt applied the ceiling at QUERY time, cropping intervals
+	// per decision, and each traded one level for another because it perturbed
+	// steering. Build time is the right place: liveness simply never routes
+	// through phantom space, and nothing is clipped while the search runs.
+	//
+	// The map's roof today is `highest solid in the level + 120` - 630 on Base
+	// After Base, against a real ship ceiling of 390. That 240 units of phantom
+	// sky is what the ship rides into the wall chasing.
+	//
+	// Why using portals here is safe when using them elsewhere was not: this takes
+	// the MAXIMUM over every mode portal, which is an upper BOUND. A fake portal
+	// that is never entered only makes the bound looser, never tighter. The
+	// earlier objection was against using one portal to define an exact band, and
+	// it does not apply to a maximum.
+	//
+	// Conservative by construction: if no mode portal is recognised, the roof is
+	// left alone. Lowering it wrongly would delete real space, so the failure mode
+	// is "no change" rather than "lost route".
+	// 0 off, 1 prefix maximum, 2 most-recent portal. Z cycles.
+	//
+	// MEASURED: a prefix maximum cannot come back down. Clutterfunk's ship portal
+	// at x 8652 caps at 390, its ball portal at x 10796 caps at 330, and
+	// max(390,330) is 390 - so the ball section keeps the ship section's roof and
+	// 330..390 stays phantom and live for 5000 units.
+	//
+	// That phantom is upstream of the 55.65% stall, not at it. The commit floor
+	// freezes the prefix, so a route flown through space that is not really there
+	// gets committed, and the ship section downstream can be unsolvable from the
+	// state it arrives in. The old broken flat roof of 344 cut almost exactly that
+	// band, which is why a roof that was wrong everywhere else solved this level.
+	//
+	// Mode 2 tracks the most recent portal instead, which is the only form that
+	// can express a section being LOWER than the one before it. Its risk is the
+	// one that ruled portals out earlier: a fake portal flown past would set the
+	// roof from a band never entered, and if that band is lower, real space gets
+	// deleted. The difference now is that MAP ROOF TOO LOW detects exactly that,
+	// live, against the ceiling read at 0x764.
+	int geomPortalRoof = 0;
+
+	// Kept for the query-time clamp, now default off - see the measurements above
+	// it. The ceiling READ at 0x764 stays valid and is what this roof is
+	// calibrated against.
+	bool ceilingClamp = false;
+
+	// Read the ceiling straight out of the game instead of deriving it.
+	//
+	// MEASURED: a float at GJBaseGameLayer + 0x764 holds the ship ceiling exactly,
+	// on 8 of 8 contacts across 6 portal heights (480, 540, 630, 540, 450, 390),
+	// including the ground-clamped case the arithmetic needed a third constant
+	// for. Critically it is CONTINUOUS, not reactive: it reads 480 for the whole
+	// of one ship section and flips to 540 the instant the next portal is
+	// entered, so it is available at every step before any contact. That is what
+	// separates it from m_collidedTopMinY, which also equals the ceiling but only
+	// after the player has already hit it.
+	//
+	// Addressed by offset because it has no name. Every named GJGameState field
+	// was printed with its runtime offset and none landed on 0x764; several that
+	// should carry real values (m_portalY, m_cameraEdgeValue0..3) read 0, which
+	// suggests Geode's layout for the by-value m_gameState is partly wrong rather
+	// than that these fields are unused. A raw offset is the honest way to use it
+	// until the layout is corrected upstream.
+	//
+	// Guarded two ways, because an unnamed offset is exactly the thing that rots
+	// silently on a game update: the layout check below, and a live cross-check
+	// against the arithmetic rule that disagrees loudly rather than quietly.
+	bool ceilingFromField = true;
+
+	// Byte offset of that float within GJBaseGameLayer.
+	int geomCeilingFieldOffset = 0x764;
+
+	// Layout guard. These two were measured on 2.2081 and are checked once per
+	// level; if either moves, the struct has changed and the offset above cannot
+	// be trusted, so the arithmetic takes over.
+	int geomGuardGameStateOff  = 0x1A8;
+	int geomGuardCameraHeightOff = 0x3260;
+
+	// The playable band, in world units. 10 blocks, and the floor is derived from
+	// the ceiling rather than measured separately - one constant, not two.
+	double geomBandHeight = 300.0;
+
+	// The level's ground surface. The band never sinks below it - a portal low
+	// enough that its nominal band would clip through the floor gets the band
+	// pushed UP to rest on it instead.
+	//
+	// MEASURED. A portal at y 225, placed exactly three blocks above the floor,
+	// has a nominal band of [60, 360] but a measured ceiling of 390 - which is
+	// [90, 390], the same band resting on 90. It also retro-explains Base After
+	// Base, where the ceiling measured 390 with no object behind it.
+	//
+	// 90 is a game constant rather than a level one: the player is 30 tall and
+	// sits at y 105 at rest, so its underside is at 90.
+	double geomGroundY = 90.0;
+
+	// The CEILING is snapped to this grid - one whole block.
+	//
+	// MEASURED over a custom level built with portals at deliberately chosen
+	// heights, two of them nudged off the grid in the editor (one step = 2 units):
+	//
+	//   portal 345           -> 480 predicted 480   exact
+	//   portal 315           -> 450 predicted 450   exact
+	//   portal 311  (-2 st)  -> 450 predicted 446   rounded UP
+	//   portal 293  (+4 st)  -> 420 predicted 428   rounded DOWN
+	//   portal 225           -> 390 predicted 360   the ground clamp, see geomGroundY
+	//
+	// Confirmed again on a second custom level, 8 portals, ceiling AND floor
+	// touched in each: 345, 405, 495, 405, 315 exact; 263 (nudged +4 steps) gave
+	// raw 398 rounding DOWN to 390; 251 (nudged -2 steps) gave raw 386 rounding
+	// UP to 390. Two nudges bracketing the same block from either side is what
+	// makes this the ceiling being snapped rather than the portal - a single
+	// nudge could not have separated the two.
+	//
+	// One editor step is 2 world units.
+	//
+	// Eliminated by the same runs, all reading 0.00 at every contact:
+	// m_cameraHeightOffset, m_targetCameraHeightOffset,
+	// m_cameraUnzoomedHeightOffset. getTargetFlyCameraY returns the portal's own
+	// y unchanged on every entry, so it is a position echo and not a target.
+	double geomCeilingGrid = 30.0;
+
+	// Ceiling height above the entered portal's centre.
+	//
+	// CONFIRMED by a custom level built for the purpose: entering a ship portal,
+	// from anywhere and at any speed, snaps the camera to 3 blocks above the
+	// portal and 4 blocks below it. The portal is 3 blocks tall, so from its
+	// snapped centre:
+	//
+	//   ceiling = snap(portalY) + 45 + 90  = snap(portalY) + 135
+	//   floor   = ceiling - 300
+	//   band    = 300 = 10 blocks, which matches the public figure
+	//
+	// The arithmetic was never the hard part - getting the portal's y was.
+	// GJGameState::m_portalY reads 0 and never populates, so the anchor now comes
+	// from the entry event itself: GJBaseGameLayer::playerWillSwitchMode hands
+	// over the portal GameObject the player actually touched.
+	//
+	// That is what makes it assumption-free. A portal flown past never fires the
+	// hook, so fake portals, stacked portals and out-of-order portals are not
+	// special cases - they simply never set anything.
+	double geomCeilingOffset = 135.0;
+
+	// x band for the measured ceiling, in world units. Two blocks: fine enough
+	// to follow a section, coarse enough to collect several samples per band.
+	double ceilingBandX = 60.0;
+
+	// Speak only where the map actually knows something. D cycles it.
+	//
+	//   0  always      - steer at every air decision (the behaviour until now)
+	//   1  discriminating - only where liveness separates something
+	//   2  + narrowing   - also where the corridor ahead is much tighter
+	//
+	// MEASURED, and this is a confirmed causal regression rather than a theory.
+	// Base After Base solved in 13s and VERIFIED when the map held 2034
+	// intervals. With the current 4199-interval map it stalls at 69.09% for
+	// minutes; with geometry ordering off (X) it solves in 15s.
+	//
+	//   level                  map ON            map OFF
+	//   Theory of Everything   19s               stalls 32.49%
+	//   Clutterfunk            38s               34s
+	//   Base After Base        stalls 69.09%     15s
+	//
+	// So the map helps on one level and hurts on two, and the one it helps is the
+	// one built out of DECEPTIVE geometry - fake corridors, which is exactly what
+	// liveness exists to route around.
+	//
+	// The tell on Base After Base is `dead 0`: its ship section has no dead space
+	// anywhere in the map, so liveness has nothing to discriminate there - and
+	// steering still fired on 38% of air decisions, choosing directions from a
+	// map with no routing information in it and overriding the search's own
+	// ordering on every third decision for 7000 deaths.
+	//
+	// Clearance steering does two jobs and only one of them generalises. Routing
+	// between corridors needs the map. Aiming at the middle of a corridor does
+	// not, and in an open ship corridor it is positively wrong - the correct ship
+	// line very often hugs a wall.
+	//
+	// Mode 2 exists for where this has to go rather than where it is: a genuinely
+	// tight gap in a harder level is a place the map SHOULD speak, and it may not
+	// contain any dead space to announce itself with. Narrowing is the other
+	// signal that a real choice is coming.
+	// REVERTED TO 0. This was built to fix Base After Base by silencing the steer
+	// where the map has nothing to discriminate. It did not fix it - both modes
+	// stalled at the same 69.09% - and the real cause turned out to be the map's
+	// global roof offering phantom sky above the ship ceiling. It was then left
+	// on by default for several builds without ever being re-validated, and
+	// neither Theory of Everything nor Clutterfunk was run against it. An
+	// unmeasured default that changes steering on every level is exactly the kind
+	// of thing that quietly corrupts a baseline.
+	//
+	// Kept as a flag on D, to be tested deliberately against a clean baseline once
+	// the ceiling work lands.
+	int geomSteerGate = 0;
+
+	// Mode 2: "much tighter" as a fraction of the corridor the player is in now.
+	double geomNarrowFrac = 0.5;
+
 	// How far ahead to look for live space, in units. 300 is ten slices, about
 	// 230 physics steps - close to the 240-step mutable window, and far enough
 	// to see past a fork before reaching it: ToE's corridors split at x 20130
@@ -988,7 +1311,10 @@ struct Config {
 	// is a separate later change that this measurement exists to justify or kill.
 	//
 	// W dumps it; shift is not needed, it also stays collecting.
-	bool motionModelEnabled = true;
+	// OFF by default. This is a MEASUREMENT, not a feature: it does a hash lookup
+	// and insert on every physics step of every level, and it was left switched on
+	// after the velocity investigation was parked. W turns it on when wanted.
+	bool motionModelEnabled = false;
 
 	// Quantisation of vy for the model key, in GD velocity units. Fine, because
 	// this is the input to an affine fit and the clamp point has to be locatable;
@@ -1081,6 +1407,29 @@ struct Config {
 	// At 1 the ladder escalated four times in eleven seconds, 240 -> 3840, blew
 	// past the commit floor and re-explored settled ground. A real optimum, not
 	// "smaller is better".
+	// On a stall, raise the toggle budget instead of widening the window. Q.
+	//
+	// The two mechanisms currently fight, and not symmetrically:
+	//
+	//   a stall WIDENS the window, making more decisions mutable
+	//   only EXHAUSTION deepens the budget, and widening makes the tree bigger,
+	//   so widening makes exhaustion - and therefore deepening - less likely
+	//
+	// A stall can only ever widen, and widening starves deepening. MEASURED on
+	// Clutterfunk: the run that solved reached budget 2 in 158k steps, while the
+	// run that stalled took 322k steps through 14 escapes and never left budget 1
+	// - so only single-toggle paths were ever allowed, in a zigzag ship corridor
+	// that needs several.
+	//
+	// The two buy different things. Deepening allows a more intricate input
+	// pattern in the SAME region; widening allows the same complexity FURTHER
+	// BACK. Deepening is the right answer when the obstacle is at the frontier,
+	// which is what a stall usually is.
+	//
+	// With this on, a stall deepens first and only widens once the budget is
+	// maxed, so neither can starve the other.
+	bool deepenOnStall = false;
+
 	int escapesBeforeWidening  = 3;
 	int wideningFactor         = 2;
 	int maxCommitLookbackSteps = 7680; // 32 s
@@ -2485,6 +2834,31 @@ ModeClass classifyMode(PlayerObject* p) {
 	return ModeClass::Ground;                                 // cube, ball, spider, robot
 }
 
+// The camera band height for the mode a portal switches INTO, keyed by the
+// portal's object ID.
+//
+// MEASURED in a custom level: ship 300 (10 blocks), UFO 300 (10 blocks), ball
+// 240 (8 blocks). Wave, swing, robot and spider are still ASSUMED and
+// deliberately loose - a band that is too high only fails to remove phantom
+// space, while one that is too low DELETES reachable space, so the unknown case
+// errs on 300.
+//
+// This is the single source for the band, and it has to be, because it existed
+// twice and the two copies drifted the moment ball was measured at 240. The map
+// roof took the measured value; ceilingForPortal hardcoded g_config's ship band
+// in its ground clamp and had no way to know the mode at all. The result was a
+// derived ceiling of 390 for every ground-clamped ball section when the truth is
+// 330 - exactly 60 units too high, on 7 portals across 4 levels, and it is the
+// sole content of all 18 ceiling cross-check warnings ever logged.
+double bandHeightForPortal(int objID) {
+	switch (objID) {
+		case 47:  return 240.0;                    // ball, measured
+		case 13:  return 300.0;                    // ship, measured
+		case 111: return 300.0;                    // UFO, measured
+		default:  return g_config.geomBandHeight;  // assumed, and loose
+	}
+}
+
 // The coarse bucket a state falls into: "somewhere like here", not "exactly
 // here". Lifted out of goCellKey so the archive and the census that measures
 // whether the archive is worth building cannot drift apart - the same reason
@@ -2781,6 +3155,112 @@ struct Solver {
 	uint64_t              geoSteers    = 0;   // air decisions the map reordered
 	uint64_t              geoSteerDead = 0;   // ...because the player was in dead space
 	uint64_t              geoSteerWin  = 0;   // ...because it was outside a live window
+	uint64_t              geoSteerMute = 0;   // air decisions the gate silenced
+
+	// The ceiling for a portal at this y: offset, then snap the RESULT to the
+	// block grid. See geomCeilingGrid for why that order.
+	//
+	// objID is required, not optional, because the ground clamp below is the
+	// whole band: a ball section clamps at 330 and a ship section at 390, and
+	// with no objID this silently answered 390 for both.
+	static double ceilingForPortal(double portalY, int objID) {
+		const double g = std::max(1.0, g_config.geomCeilingGrid);
+		const double c = std::round((portalY + g_config.geomCeilingOffset) / g) * g;
+		// Rest the band on the ground rather than letting it clip through.
+		const double lowest = g_config.geomGroundY + bandHeightForPortal(objID);
+		return std::max(c, lowest);
+	}
+
+	// The portal the player last actually entered, from playerWillSwitchMode.
+	double                entryPortalY    = 0.0;
+	bool                  haveEntryPortal = false;
+	int                   entryPortalMode = -1;   // ModeClass at entry
+	int                   entryPortalID   = 0;    // objID, for the band height
+	uint64_t              portalEntries   = 0;
+
+	// The band of the section the player is currently in. The floor of a band is
+	// its ceiling less this, never a second constant - see bandHeightForPortal.
+	double entryBand() const { return bandHeightForPortal(entryPortalID); }
+
+	// Probe: does the read field agree with the derived rule? Any disagreement
+	// beyond a block means one of them is wrong and we want to hear about it.
+	bool                  ceilFieldOk     = false;   // layout guard passed
+	uint64_t              ceilDisagreed   = 0;
+	double                ceilWorstDelta  = 0.0;
+
+	// The validity test the clamp never had. The player can never be outside its
+	// own band; if the computed band excludes the position the player is actually
+	// occupying, the band is WRONG, and a wrong band crops real space out of the
+	// map - indistinguishable from the level simply being harder.
+	//
+	// MEASURED: Time Machine solves in 12s with the clamp off and 21s with it on,
+	// so something it removes is load-bearing.
+	//
+	// Suspected flaw: the ceiling describes where the player IS, but it is applied
+	// to a slice 300 units AHEAD. Where that lookahead crosses into a section with
+	// a different ceiling, the next section is cropped with this section's band.
+	// The widest band observed in this level, which is what the map may be
+	// cropped against.
+	//
+	// MEASURED: Clutterfunk is the only level of the three with TWO ship sections
+	// at different heights - ceilings 330 and 390 - and it is the only one the
+	// crop breaks. With the crop off it solves in 38s, exactly its historical
+	// time. The steer consults a slice 300 units ahead, which in a two-section
+	// level can belong to the OTHER section, so cropping it with the current
+	// band deletes real geometry.
+	//
+	// Testing against the widest band seen instead is conservative and needs no
+	// portal data: space above every ceiling this level has is phantom under all
+	// of them, while a lower section's real space stays untouched.
+	double                ceilMaxSeen     = -1e30;
+	double                floorMinSeen    =  1e30;
+
+	double                lastCeilingSeen = -1e30;
+	bool                  roofWarned      = false;
+	uint64_t              ceilOutside     = 0;
+	uint64_t              ceilInside      = 0;
+	double                ceilWorstOut    = 0.0;
+
+	// The reachable roof, derived from the game's own portal anchor each step.
+	// 1e30 reads as no clamp (ground mode, or free fly).
+	double                learnedCeiling  = 1e30;
+	uint64_t              ceilingCrops    = 0;
+
+	// Probe 10: the observed ceiling measured against BOTH candidate sources, so
+	// one run picks the winner instead of us arguing about it.
+	//
+	//   portal  = contactY - m_gameState.m_portalY   (needs a derived offset)
+	//   camera  = contactY - cameraObb2 rect top     (needs none if it is ~0)
+	//
+	// The right source is the one whose spread is ~0. If the camera rect wins,
+	// geomCeilingOffset stops existing.
+	double                ceilOffMin =  1e30, ceilOffMax = -1e30;   // portal
+	double                camOffMin  =  1e30, camOffMax  = -1e30;   // camera rect
+	uint64_t              ceilOffN   = 0, camOffN = 0;
+	double                camTopSeen = 0.0;
+
+	// Probe 11: the field hunt.
+	//
+	// Three candidates have been eliminated by measurement - m_objectLayer's y
+	// (constant 80), m_cameraObb2's rect top (0.5, not world space) and
+	// m_gameState.m_portalY (0, never populated). The real ceilings in Base
+	// After Base are 255 and 375, so the field we want takes two values 120
+	// apart in step with them.
+	//
+	// Rather than one candidate per run, record contactY MINUS every remaining
+	// candidate and report which difference is constant. Constant means that
+	// field tracks the ceiling; the constant is then the offset, and zero
+	// spread with a near-zero offset means the field IS the ceiling.
+	static constexpr int kCeilCand = 14;
+	double   candMin[kCeilCand];
+	double   candMax[kCeilCand];
+	double   candLast[kCeilCand];
+	uint64_t candN = 0;
+
+	// Where the clean contacts actually sit. Min and max is what let three
+	// distinct values read as two, and a conclusion was drawn from it before
+	// the spread was ever looked at.
+	std::map<int, uint32_t> ceilHist;
 	uint64_t              geoLooks     = 0;   // air decisions the map was consulted on
 
 	// The player's horizontal speed, measured. Held across restores rather than
@@ -3018,7 +3498,27 @@ struct Solver {
 		deaths = restores = steps = escapes = 0;
 		geoDeaths = 0;
 		geoSteers = geoLooks = 0;
-		geoSteerDead = geoSteerWin = 0;
+		geoSteerDead = geoSteerWin = geoSteerMute = 0;
+		learnedCeiling  = 1e30;
+		ceilingCrops    = 0;
+		entryPortalY    = 0.0;
+		haveEntryPortal = false;
+		entryPortalMode = -1;
+		entryPortalID   = 0;
+		portalEntries   = 0;
+		ceilOffMin =  1e30;
+		ceilOffMax = -1e30;
+		camOffMin  =  1e30;
+		camOffMax  = -1e30;
+		ceilOffN = camOffN = 0;
+		camTopSeen = 0.0;
+		for (int i = 0; i < kCeilCand; i++) {
+			candMin[i]  =  1e30;
+			candMax[i]  = -1e30;
+			candLast[i] = 0.0;
+		}
+		candN = 0;
+		ceilHist.clear();
 		prevX = 0.0;
 		dxPerStep = 1.31;
 		prevY = 0.0;
@@ -3207,6 +3707,42 @@ struct GoEntry {
 // each other's memory, but deliberately the SAME cell function and the same
 // entry shape - if the cell abstraction is right for one it is right for both,
 // and having two would mean two things to get wrong.
+// Probe 10: the ceiling the player actually has, per x band. See ceilingProbe.
+struct CeilingProbe {
+	struct Band {
+		double maxY    = -1e30;  // highest the player ever got here, any mode
+		double contactY = 1e30;  // lowest y at which it was STOPPED while rising
+		uint32_t reached = 0, contacts = 0;
+	};
+	std::map<int32_t, Band> bands;
+	uint64_t samples = 0;
+
+	// The rule we are actually trying to find.
+	//
+	// Public sources say the playable band is a fixed 10 blocks - 300 units -
+	// and that a ship's roof cannot be raised. That matches the observed
+	// behaviour: the same height, anchored wherever the section puts it, which
+	// is why it moves with the portal rather than with the objects.
+	//
+	// If that is right then `contactY - cameraY` is CONSTANT across every
+	// contact in every section, and one number turns the map's global roof into
+	// a correct per-section one. If it is not constant, the anchoring is
+	// something else and the spread here says how much else.
+	double offMin =  1e30, offMax = -1e30;   // contactY - cameraY
+	double camHMin =  1e30, camHMax = -1e30; // m_cameraHeight
+	double ceilMin =  1e30, ceilMax = -1e30; // absolute contact y
+	uint64_t contacts = 0;
+
+	void clear() {
+		bands.clear();
+		samples = 0;
+		offMin = camHMin = ceilMin =  1e30;
+		offMax = camHMax = ceilMax = -1e30;
+		contacts = 0;
+	}
+	static CeilingProbe& get() { static CeilingProbe c; return c; }
+};
+
 // Probe 9: the measured one-step vertical transition. See motionModelEnabled.
 struct MotionModel {
 	struct Row {
@@ -3930,6 +4466,10 @@ bool geometryBuildMap() {
 	struct Obj { double x0, x1; float lo, hi; uint8_t type; };
 	std::vector<Obj> objs;
 	std::vector<double> edges;
+	// (x, y) of every portal that re-snaps the camera band, for the per-x roof.
+	std::vector<std::pair<double, double>> bandPortals;
+	std::vector<int> bandPortalID;
+	double modePortalMaxY = -1e18;
 	double ylo = 1e18, yhi = -1e18;
 
 	// (x, units per step) for every speed portal, collected in the same pass.
@@ -3940,6 +4480,32 @@ bool geometryBuildMap() {
 		auto* o = static_cast<GameObject*>(arr->objectAtIndex(i));
 		if (!o) continue;
 		const int t = static_cast<int>(o->getType());
+
+		// Mode portals, for the roof bound. IDs are the ones already established
+		// in this file's portal handling; an unrecognised one simply does not
+		// contribute, which loosens the bound rather than tightening it.
+		switch (o->m_objectID) {
+			// Gravity portals are NOT here, and were briefly added on a bad
+			// inference that cost Base After Base its fix.
+			//
+			// MEASURED by logging every change of the live ceiling with its
+			// position: Clutterfunk's ceiling changes at x 8672, 10853 and 15914,
+			// which are its ship, ball and ship portals - and it passes straight
+			// through the gravity portal at x 19576 with no change at all.
+			//
+			// What actually explained Clutterfunk's 390 was the GROUND CLAMP, not a
+			// gravity portal: its ship portal sits at y 152, so the nominal band is
+			// [-3, 297], below the ground, and gets pushed up to [90, 390].
+			case 13: case 47: case 111: case 660:
+			case 745: case 1331: case 1933:
+				modePortalMaxY = std::max(modePortalMaxY,
+				                          static_cast<double>(o->getPositionY()));
+				bandPortals.emplace_back(static_cast<double>(o->getPositionX()),
+				                         static_cast<double>(o->getPositionY()));
+				bandPortalID.push_back(o->m_objectID);
+				break;
+			default: break;
+		}
 
 		// Before the solid/hazard filter: portals are neither.
 		if (g_config.geomSpeedScan) {
@@ -3984,6 +4550,72 @@ bool geometryBuildMap() {
 	m.yLo = ylo - 120.0;
 	m.yHi = yhi + 120.0;
 
+	// Per-x roof: the highest ceiling any band-setting portal AT OR BEFORE this x
+	// can produce.
+	//
+	// A single global maximum was the first version and it only removes phantom
+	// space above the TALLEST band in the level. Any section lower than that keeps
+	// its own phantom space live - which is the original Base After Base bug,
+	// surviving anywhere the problem section is not the highest one. It worked
+	// there only because that section happened to be the tallest.
+	//
+	// A prefix maximum is still a safe upper bound: at any x the player's band was
+	// set by some portal at or before x, so it cannot exceed the largest cap among
+	// them. And an unentered fake portal only ever loosens the bound, never
+	// tightens it - the same property that made the global version safe.
+	// Band height per mode. The 300 everywhere else in this file was measured on
+	// SHIP and does not hold for every mode.
+	//
+	// MEASURED: Clutterfunk's ball section reads a ceiling of 330, which is
+	// 90 + 240 - an 8-block band, confirmed independently in a custom level. With
+	// a ship-sized 300 the cap there computes to 390 and leaves 330..390 phantom
+	// and live.
+	//
+	// That also explains an accident. The old broken roof was 344, which is within
+	// half a block of the correct ball roof of 330 - so it was approximating this
+	// by luck, which is why Clutterfunk solved under a roof that was wrong
+	// everywhere else.
+	//
+	// The band itself now lives in bandHeightForPortal, so the map roof and the
+	// query-time rule cannot disagree about it again.
+
+	std::vector<double> roofAt(static_cast<size_t>(n), m.yHi);
+	if (g_config.geomPortalRoof > 0 && !bandPortals.empty()) {
+		std::vector<std::tuple<double, double, int>> bp;
+		bp.reserve(bandPortals.size());
+		for (size_t i = 0; i < bandPortals.size(); i++)
+			bp.emplace_back(bandPortals[i].first, bandPortals[i].second,
+			                i < bandPortalID.size() ? bandPortalID[i] : 0);
+		std::sort(bp.begin(), bp.end());
+		const double g = std::max(1.0, g_config.geomCeilingGrid);
+		size_t pi = 0;
+		double run = -1e18;
+		double lowest = m.yHi, highest = -1e18;
+		for (int si = 0; si < n; si++) {
+			while (pi < bp.size() && std::get<0>(bp[pi]) <= m.xs[si]) {
+				// The running maximum is over CAPS, not raw portal y, so a mode
+				// with a shorter band cannot be dragged up by a taller one's
+				// position alone.
+				const double py = std::get<1>(bp[pi]);
+				const double bh = bandHeightForPortal(std::get<2>(bp[pi]));
+				double c = std::round((py + g_config.geomCeilingOffset) / g) * g;
+				c = std::max(c, g_config.geomGroundY + bh);   // rest on the ground
+				// Mode 1 keeps the running maximum; mode 2 takes the most
+				// recent portal's cap, so a lower section can lower the roof.
+				run = (g_config.geomPortalRoof >= 2) ? c : std::max(run, c);
+				pi++;
+			}
+			if (run > -1e17)
+				roofAt[static_cast<size_t>(si)] = std::min(m.yHi, run);
+			lowest  = std::min(lowest,  roofAt[static_cast<size_t>(si)]);
+			highest = std::max(highest, roofAt[static_cast<size_t>(si)]);
+		}
+		log::info("Solver: map roof {:.0f} -> per-x {:.0f}..{:.0f} over {} "
+		          "band-setting portals. Space above the roof at each x is "
+		          "unreachable there.",
+		          m.yHi, lowest, highest, bandPortals.size());
+	}
+
 	// Each object contributes its y span to every segment it covers.
 	for (auto const& ob : objs) {
 		// Direct lookup, NOT segIndex: that early-returns -1 while m.valid is
@@ -4014,16 +4646,18 @@ bool geometryBuildMap() {
 
 		// Complement, keeping only gaps the player actually fits through.
 		std::vector<GeoMap::Free> fr;
+		const double roofSi = roofAt[static_cast<size_t>(si)];
 		double cur = m.yLo;
 		for (auto const& sp : merged) {
-			if (sp.lo - cur >= m.playerH)
-				fr.push_back({static_cast<float>(cur), sp.lo,
-				              static_cast<float>(cur), sp.lo, false});
+			const double top = std::min(static_cast<double>(sp.lo), roofSi);
+			if (top - cur >= m.playerH)
+				fr.push_back({static_cast<float>(cur), static_cast<float>(top),
+				              static_cast<float>(cur), static_cast<float>(top), false});
 			cur = std::max(cur, static_cast<double>(sp.hi));
 		}
-		if (m.yHi - cur >= m.playerH)
-			fr.push_back({static_cast<float>(cur), static_cast<float>(m.yHi),
-			              static_cast<float>(cur), static_cast<float>(m.yHi), false});
+		if (roofSi - cur >= m.playerH)
+			fr.push_back({static_cast<float>(cur), static_cast<float>(roofSi),
+			              static_cast<float>(cur), static_cast<float>(roofSi), false});
 		m.freeSpans[si] = fr;
 	}
 
@@ -4121,6 +4755,154 @@ bool geometryBuildMap() {
 
 	m.valid = true;
 	return true;
+}
+
+// Probe 10: what ceiling did the player actually have, and how far below the
+// map's roof is it? A large gap is the claim in ceilingProbe, measured.
+void ceilingProbeDump(const char* why) {
+	auto& cp = CeilingProbe::get();
+	if (!g_config.ceilingProbe || cp.bands.empty()) return;
+
+	const std::string path =
+		probe::outputPath(ProbeState::get().levelKey + "_ceiling.csv");
+	std::FILE* f = std::fopen(path.c_str(), "w");
+	if (!f) { log::error("Probe 10: cannot write {}", path); return; }
+
+	auto const& m = GeoMap::get();
+	const double roof = m.valid ? m.yHi : 0.0;
+	std::fprintf(f, "# measured ceiling (%s). map roof (yHi) = %.1f, one global "
+	                "value for every x\n", why, roof);
+	std::fprintf(f, "xband,x,maxYReached,contactY,reached,contacts,mapRoof,gap\n");
+
+	double worstGap = 0.0;
+	int    worstX   = 0;
+	uint64_t contactBands = 0;
+	for (auto const& kv : cp.bands) {
+		auto const& e = kv.second;
+		const double x = kv.first * g_config.ceilingBandX;
+		const double ceil = e.contacts ? e.contactY : e.maxY;
+		const double gap  = roof - ceil;
+		if (e.contacts) {
+			contactBands++;
+			if (gap > worstGap) { worstGap = gap; worstX = static_cast<int>(x); }
+		}
+		std::fprintf(f, "%d,%.0f,%.1f,%.1f,%u,%u,%.1f,%.1f\n",
+		             kv.first, x, e.maxY,
+		             e.contacts ? e.contactY : 0.0,
+		             e.reached, e.contacts, roof, gap);
+	}
+	std::fclose(f);
+
+	{
+		auto& sv = Solver::get();
+		if (sv.ceilOffN) {
+			log::info("Probe 10: ceiling MINUS m_portalY over {} contacts: "
+			          "{:.2f} .. {:.2f}  (spread {:.2f}); geomCeilingOffset is {:.2f}",
+			          sv.ceilOffN, sv.ceilOffMin, sv.ceilOffMax,
+			          sv.ceilOffMax - sv.ceilOffMin, g_config.geomCeilingOffset);
+			if (sv.ceilOffMax - sv.ceilOffMin < 1.0)
+				log::info("  portal anchor CONSTANT - set geomCeilingOffset to {:.2f}.",
+				          0.5 * (sv.ceilOffMin + sv.ceilOffMax));
+			else
+				log::info("  portal anchor NOT constant - m_portalY is not the whole "
+				          "story; the spread is how far off one number would be.");
+
+			if (sv.camOffN) {
+				log::info("Probe 10: ceiling MINUS camera rect top over {} contacts: "
+				          "{:.2f} .. {:.2f}  (spread {:.2f}), last rect top {:.1f}",
+				          sv.camOffN, sv.camOffMin, sv.camOffMax,
+				          sv.camOffMax - sv.camOffMin, sv.camTopSeen);
+				if (sv.camOffMax - sv.camOffMin < 1.0) {
+					const double mid = 0.5 * (sv.camOffMin + sv.camOffMax);
+					if (std::abs(mid) < 2.0)
+						log::info("  CAMERA RECT IS THE CEILING - offset {:.2f}, i.e. "
+						          "nothing left to derive. Clamp straight to it.", mid);
+					else
+						log::info("  camera rect constant at offset {:.2f} - still one "
+						          "number, but a read one rather than a counted one.",
+						          mid);
+				} else {
+					log::info("  camera rect NOT constant either.");
+				}
+			} else {
+				log::info("Probe 10: m_cameraObb2 was null at every contact - the "
+				          "camera rect is not readable this way.");
+			}
+
+			if (sv.candN) {
+				static const char* kCand[Solver::kCeilCand] = {
+					"cameraEdge(0)", "cameraEdge(1)", "cameraEdge(2)",
+					"cameraEdge(3)", "cameraEdge(4)", "cameraEdge(5)",
+					"collidedTopMinY", "collidedBottomMaxY", "maxGameplayY",
+					"yStart", "fallStartY", "isOutOfBounds",
+					"groundLayer.y", "groundLayer2.y"};
+				log::info("Probe 11: contactY MINUS each candidate, over {} contacts. "
+				          "The ceiling is 255 and 375 here, so the winner is whichever "
+				          "difference is CONSTANT.", sv.candN);
+				bool anyWon = false;
+				for (int i = 0; i < Solver::kCeilCand; i++) {
+					const double spread = sv.candMax[i] - sv.candMin[i];
+					const bool   won    = spread < 1.0;
+					if (won) anyWon = true;
+					log::info("  {:<20} {:+9.2f} .. {:+9.2f}  spread {:8.2f}  last {:9.2f}{}",
+					          kCand[i], sv.candMin[i], sv.candMax[i], spread,
+					          sv.candLast[i], won ? "   <-- CONSTANT" : "");
+				}
+				if (!anyWon)
+					log::info("  None constant. Every candidate GD exposes is now "
+					          "eliminated, and the ceiling is not directly readable.");
+
+				log::info("Probe 11: where the clean contacts sit (y -> count). One "
+				          "cluster means one ceiling; a spread of block-spaced values "
+				          "means the detector is still letting collisions through.");
+				for (auto const& kv : sv.ceilHist)
+					log::info("    y {:>6}   {:>6} contacts", kv.first, kv.second);
+			}
+		} else {
+			log::info("Probe 10: no ceiling contact seen, so the offset is "
+			          "unconfirmed and the clamp is running on its default.");
+		}
+	}
+	log::info("Probe 10: measured ceiling -> {}", path);
+	log::info("  {} x bands, {} with a confirmed ceiling contact, {} samples",
+	          cp.bands.size(), contactBands, cp.samples);
+	if (contactBands) {
+		log::info("  map roof {:.0f}; the largest confirmed gap is {:.0f} units at "
+		          "x {} - that much phantom open space above the player.",
+		          roof, worstGap, worstX);
+		log::info("  A large gap is the bug: the map is offering routes through "
+		          "space the player is physically barred from.");
+		log::info("  ceiling y ranged {:.1f} .. {:.1f} over {} contacts",
+		          cp.ceilMin, cp.ceilMax, cp.contacts);
+		log::info("  ceiling MINUS camera y: {:.2f} .. {:.2f}  (spread {:.2f})",
+		          cp.offMin, cp.offMax, cp.offMax - cp.offMin);
+		log::info("  m_cameraHeight: {:.2f} .. {:.2f}", cp.camHMin, cp.camHMax);
+		if (cp.offMax - cp.offMin < 1.0)
+			log::info("  CONSTANT offset - the ceiling is camera-anchored and one "
+			          "number fixes the map: clamp each x to cameraY + {:.2f}.",
+			          0.5 * (cp.offMin + cp.offMax));
+		else
+			log::info("  NOT constant, so the ceiling is not a fixed camera offset. "
+			          "The spread above is how far off a single number would be.");
+	} else {
+		log::info("  No ceiling contact seen yet. Fly a ship section into the roof "
+		          "and dump again, or the measurement has nothing to say.");
+	}
+}
+
+// Is (x, y) inside a BLOCKED span - i.e. is there a real object here?
+//
+// The discriminator for ceiling learning: a stop against a block is ordinary
+// physics the map already models, a stop against nothing is the invisible
+// ceiling that it does not.
+bool geometryBlockedAt(double x, double y) {
+	auto const& m = GeoMap::get();
+	if (!m.valid) return false;
+	const int si = m.segIndex(x);
+	if (si < 0) return false;
+	for (auto const& sp : m.blocked[si])
+		if (y >= sp.lo && y <= sp.hi) return true;
+	return false;
 }
 
 bool geometryWindowAt(double x, double y, double* lo, double* hi);
@@ -4283,16 +5065,137 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 	// returned no-opinion every time: geoSteer 0/20194 on Clutterfunk. Urgency
 	// is now a GATE on the route target above, which is the question it should
 	// have been asking - can I still reach THE INTERVAL MY CORRIDOR LEADS TO.
+	// Crop to the band the player can actually occupy. See ceilingClamp.
+	//
+	// An interval sitting entirely above the learned roof is not a route, it is
+	// scenery. One trimmed to below player height is not one either.
+	// The clamp flag gates USING the band, not knowing it.
+	const bool haveBand = g_config.ceilingClamp &&
+	                      Solver::get().learnedCeiling < 1e29;
+	const double ceilY  = haveBand ? Solver::get().learnedCeiling : 1e30;
+	// The band is bounded below as well - the portal snaps a floor at the same
+	// moment it snaps a roof, and space below it is just as unreachable.
+	// The floor is the ceiling less the band, not a second measured constant.
+	const double floorY = haveBand
+	                    ? Solver::get().learnedCeiling - Solver::get().entryBand()
+	                    : -1e30;
+	// The band constrains the TARGET, not the map.
+	//
+	// MEASURED, Time Machine: cropping intervals out of the map cost 21s against
+	// 12s uncropped - and the mechanism was NOT a wrong band. `out 0/76889` says
+	// the player was never once outside it. Removing intervals leaves the
+	// projected altitude outside any usable interval more often, which TRIGGERS a
+	// steer: the rate went 44% -> 56%. More steering means more overriding of the
+	// search's own ordering, which has cost time every time it has happened.
+	//
+	// So the band refuses an unreachable TARGET instead. Nothing is removed from
+	// the map, so no route can be lost, and this can only ever SUPPRESS a steer,
+	// never create one - the opposite of the failure above. It still kills the
+	// phantom corridor that motivated all of this: Base After Base's target sat at
+	// ~440 with a band topping out at 390.
+	//
+	// Portal spans were the alternative and are worse. Deciding which x range a
+	// band covers means reading portals from level data and assuming which of them
+	// get taken, which is exactly what fake portals exist to break.
+	// Drop an interval only when it lies ENTIRELY outside the band. Never clip one
+	// that overlaps.
+	//
+	// Both halves of this were measured separately and each failed on its own:
+	//
+	//   CLIPPING to the band shrinks real intervals, so the projected altitude
+	//   falls outside a usable interval more often and TRIGGERS a steer - rate
+	//   44% -> 56%, Time Machine 12s -> 21s.
+	//
+	//   Not cropping at all leaves liveness believing the phantom corridor above
+	//   the ship ceiling reaches the level end, so the search keeps exploring
+	//   there - Base After Base 17s -> 59s, with the old 69.09% stall returning.
+	//
+	// Dropping only wholly-outside intervals does the useful half of each. The
+	// phantom corridor is entirely above the ceiling, so it goes; every real
+	// interval overlaps the band, so it survives at full extent and nothing about
+	// normal steering changes.
+	auto usable = [&](GeoMap::Free const& f, double* lo, double* hi) -> bool {
+		*lo = static_cast<double>(f.lo);
+		*hi = static_cast<double>(f.hi);
+		if (*hi - *lo < m.playerH) return false;
+		// Against the WIDEST band seen, not the current one - see ceilMaxSeen.
+		if (haveBand && Solver::get().ceilMaxSeen > -1e29 &&
+		    (*lo > Solver::get().ceilMaxSeen || *hi < Solver::get().floorMinSeen))
+			return false;
+		return true;
+	};
+	auto targetReachable = [&](double t) -> bool {
+		if (!haveBand) return true;
+		return t >= floorY - 1.0 && t <= ceilY + 1.0;
+	};
+
+	// Does the map actually discriminate here? See geomSteerGate.
+	if (g_config.geomSteerGate > 0) {
+		auto const& fs = m.freeSpans[si];
+		bool anyDead   = false;
+		int  liveCount = 0;
+		for (auto const& f : fs) {
+			double ulo = 0.0, uhi = 0.0;
+			if (!usable(f, &ulo, &uhi)) continue;   // out of reach: not a route
+			if (f.live) liveCount++;
+			else        anyDead = true;
+		}
+		// Something dead means liveness has a route to express. More than one
+		// live interval means there is a fork, even if both continue. One live
+		// interval and nothing dead means every altitude here leads onward, and
+		// any opinion about which one is invented.
+		bool discriminates = anyDead || liveCount > 1;
+
+		// Mode 3: speak ONLY when there is exactly one live interval.
+		//
+		// The inverse of mode 1, and the one that matches what the failures
+		// actually look like. Watched at normal speed, both Base After Base and
+		// Clutterfunk fail the same way: the ship rides high, the corridor
+		// staircases down, and it flies into the wall at the top. With a high
+		// interval and a low one both live, the steer locks onto whichever the
+		// player is in and re-centres it there on every decision - it is actively
+		// holding the ship up.
+		//
+		// One live interval means there is no choice and the map genuinely knows
+		// the answer. Two or more means it has no basis for preferring either, so
+		// silence lets release-first ordering try descending on its own.
+		if (g_config.geomSteerGate == 3)
+			discriminates = liveCount == 1;
+
+		if (!discriminates && g_config.geomSteerGate >= 2) {
+			const int s0 = m.segIndex(x);
+			if (s0 >= 0) {
+				double wNow = 0.0, wAhead = 0.0;
+				for (auto const& f : m.freeSpans[s0])
+					if (yNow >= f.lo && yNow <= f.hi) { wNow = f.hi - f.lo; break; }
+				for (auto const& f : fs)
+					if (y >= f.lo && y <= f.hi) { wAhead = f.hi - f.lo; break; }
+				// A corridor closing down is a choice arriving, whether or not
+				// anything beside it is dead yet.
+				if (wNow > 0.0 && wAhead > 0.0
+				    && wAhead < g_config.geomNarrowFrac * wNow)
+					discriminates = true;
+			}
+		}
+
+		if (!discriminates) {
+			Solver::get().geoSteerMute++;
+			return 0;
+		}
+	}
+
 	auto const& fr = m.freeSpans[si];
 	bool inDead = false;
 	for (auto const& f : fr) {
-		if (y < f.lo || y > f.hi) continue;
+		double ulo = 0.0, uhi = 0.0;
+		if (!usable(f, &ulo, &uhi)) { Solver::get().ceilingCrops++; continue; }
+		if (y < ulo || y > uhi) continue;
 		if (f.live) {
 			// Aim for the middle of the window rather than merely being inside
 			// it. Being outside is subsumed: outside means further than half the
 			// height from centre, which any band below 0.5 already catches.
-			const double lo = static_cast<double>(f.wlo);
-			const double hi = static_cast<double>(f.whi);
+			const double lo = std::max(static_cast<double>(f.wlo), ulo);
+			const double hi = std::min(static_cast<double>(f.whi), uhi);
 			const double centre = 0.5 * (lo + hi);
 			// Fraction of the window HEIGHT. Slack-relative was tried and is
 			// worse overall: it made narrow windows demand near-perfect centring
@@ -4304,6 +5207,9 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 			// that solved all of them.
 			const double band = std::max(0.0, g_config.geomClearanceBand) * (hi - lo);
 			if (std::abs(y - centre) <= band) return 0;
+			// Unreachable target: the player cannot occupy that altitude from
+			// here, so steering at it is worse than saying nothing.
+			if (!targetReachable(centre)) { Solver::get().ceilingCrops++; return 0; }
 			Solver::get().geoSteerWin++;
 			return y < centre ? 1 : -1;
 		}
@@ -5114,6 +6020,38 @@ void pollHotkeys() {
 		          g_config.geomClearanceBand < 0.01 ? " (trail drives every decision)" : "");
 	}
 
+	// I = live ceiling readout while you fly (Probe 12).
+	if (keyPressedEdge('I')) {
+		g_config.liveCeilingReadout = !g_config.liveCeilingReadout;
+		log::info("Live ceiling readout: {}{}",
+		          g_config.liveCeilingReadout ? "ON" : "off",
+		          g_config.liveCeilingReadout
+		              ? " - play by hand and fly into the ceiling in each section. "
+		                "Every CONTACT line is the roof announcing itself."
+		              : "");
+	}
+
+	// E = crop the map to the reachable band.
+	if (keyPressedEdge('E')) {
+		g_config.ceilingClamp = !g_config.ceilingClamp;
+		log::info("Reachable-band crop: {}. F2 to solve with this.",
+		          g_config.ceilingClamp
+		              ? "ON - intervals above the learned ceiling are not routes"
+		              : "off - the map's global roof is taken at face value");
+	}
+
+	// D = how selective the geometry steer is about speaking.
+	if (keyPressedEdge('D')) {
+		g_config.geomSteerGate = (g_config.geomSteerGate + 1) % 4;
+		static const char* kGate[4] = {
+			"ALWAYS - steer at every air decision (the old behaviour)",
+			"DISCRIMINATING - only where liveness separates something",
+			"DISCRIMINATING + NARROWING - also where the corridor ahead tightens",
+			"ONE LIVE ONLY - speak only when there is no choice to make"};
+		log::info("Geometry steer gate: {}. F2 to solve with this.",
+		          kGate[g_config.geomSteerGate]);
+	}
+
 	// X = geometry ordering on/off.
 	//
 	// Exists to bisect a regression rather than to tune anything: Base After Base
@@ -5132,6 +6070,13 @@ void pollHotkeys() {
 
 	// W = dump the measured motion model (Probe 9).
 	if (keyPressedEdge('W')) {
+		if (!g_config.motionModelEnabled && !g_config.ceilingProbe) {
+			g_config.motionModelEnabled = true;
+			g_config.ceilingProbe       = true;
+			log::info("Probes 9 and 10: collection ON (they cost a map operation per "
+			          "step, so they are off by default). W again to dump.");
+			return;
+		}
 		auto& mm = MotionModel::get();
 		if (mm.rows.empty()) {
 			log::warn("Probe 9: nothing recorded yet - run a solve first (F2), then W. "
@@ -5139,6 +6084,7 @@ void pollHotkeys() {
 		} else {
 			motionModelDump("on demand");
 		}
+		ceilingProbeDump("on demand");
 	}
 
 	// T = restore tap state on a reposition instead of letting it go stale.
@@ -5167,6 +6113,27 @@ void pollHotkeys() {
 		              ? "ARCHIVE RESTART - on a stall, return to a promising archived "
 		                "cell and resume from there"
 		              : "rewind - pop escapeJump decisions and widen the window");
+	}
+
+	// Q = deepen the toggle budget on a stall instead of widening the window.
+	if (keyPressedEdge('Q')) {
+		g_config.deepenOnStall = !g_config.deepenOnStall;
+		log::info("On a stall: {}. F2 to solve with this.",
+		          g_config.deepenOnStall
+		              ? "DEEPEN the toggle budget first, widen only when it is maxed"
+		              : "widen the mutable window (deepening waits for exhaustion)");
+	}
+
+	// Z = cap the map roof at the highest portal-derived ceiling.
+	if (keyPressedEdge('Z')) {
+		g_config.geomPortalRoof = (g_config.geomPortalRoof + 1) % 3;
+		static const char* kRoof[3] = {
+			"highest solid object + 120, as before",
+			"PREFIX MAX - highest cap of any portal at or before each x",
+			"MOST RECENT - the cap of the last portal before each x, so a lower "
+			"section lowers the roof"};
+		log::info("Map roof: {}. F2 to solve with this (the map rebuilds on F2).",
+		          kRoof[g_config.geomPortalRoof]);
 	}
 
 	// J = cycle escapesBeforeWidening. Read at stall time, so it takes effect on
@@ -7967,6 +8934,243 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		return true;
 	}
 
+	// The reachable roof for right now, from the game's own portal anchor.
+	// Recomputed every step: m_portalY changes the instant a portal is entered,
+	// so nothing has to be remembered or forgotten.
+	void ceilingUpdate(double vyBefore) {
+		auto* p = m_player1;
+		auto& sv = Solver::get();
+		sv.learnedCeiling = 1e30;
+		// The MEASUREMENT must not depend on the clamp. Gating both on one flag
+		// meant turning the clamp off silently turned the probe off too, and a
+		// whole run came back with "no ceiling contact seen".
+		if (!p || p->m_isDead) return;
+
+		// GD says directly whether this mode is bounded, so ask it instead of
+		// inferring from the mode class. MEASURED: usingWallLimitedMode() read 1
+		// on every ship ceiling contact across two custom levels.
+		if (!p->usingWallLimitedMode()) return;
+		if (m_gameState.m_isFreeMode) return;
+
+		// Only while the mode still matches the one entered - a restore can land
+		// the search before the portal with the entry still recorded.
+		// NOT gated on ceilingClamp. The read is one memcpy, and the roof safety
+		// net below depends on it - gating both on one flag meant the check could
+		// only ever fire when the crop was also on, so a Z-only run reported
+		// "0 roof warnings" when it had simply never looked.
+		//
+		// Preferred: read it. Fallback: derive it.
+		const bool canRead = g_config.ceilingFromField && sv.ceilFieldOk;
+		double fromField = 0.0;
+		if (canRead) {
+			float f = 0.f;
+			std::memcpy(&f, reinterpret_cast<const uint8_t*>(this)
+			                + g_config.geomCeilingFieldOffset, sizeof f);
+			fromField = static_cast<double>(f);
+		}
+		const bool haveDerived = sv.haveEntryPortal &&
+		                         static_cast<int>(classifyMode(p)) == sv.entryPortalMode;
+		const double derived = haveDerived
+		                     ? Solver::ceilingForPortal(sv.entryPortalY,
+		                                                sv.entryPortalID) : 0.0;
+
+		if (canRead && std::isfinite(fromField) && fromField > 0.0) {
+			sv.learnedCeiling = fromField;
+			// Cross-check. The two were built from the same eight contacts, so a
+			// disagreement means the field moved or the rule does not generalise -
+			// either way it must be loud, not silent.
+			if (haveDerived) {
+				const double d = std::abs(fromField - derived);
+				if (d > 30.0) {
+					sv.ceilDisagreed++;
+					if (d > sv.ceilWorstDelta) {
+						sv.ceilWorstDelta = d;
+						log::warn("Ceiling: field says {:.1f}, rule says {:.1f} "
+						          "(delta {:.1f}) at x {:.0f}. One of them is wrong.",
+						          fromField, derived, d, p->getPositionX());
+					}
+				}
+			}
+		} else if (haveDerived) {
+			sv.learnedCeiling = derived;
+		}
+
+		if (sv.learnedCeiling < 1e29) {
+			sv.ceilMaxSeen  = std::max(sv.ceilMaxSeen, sv.learnedCeiling);
+			sv.floorMinSeen = std::min(sv.floorMinSeen,
+			                           sv.learnedCeiling - sv.entryBand());
+		}
+
+		// Probe 15: WHICH objects actually re-snap the band.
+		//
+		// Every portal ID in the roof scan is currently there by inference, and one
+		// of those inferences has already cost a level: gravity portals were added
+		// because Clutterfunk had a 390 ceiling near a gravity portal at 247.5
+		// (247.5 + 135 snaps to 390), and that raised Base After Base's roof from
+		// 386 to 630 and undid its fix.
+		//
+		// 0x764 is ground truth, so log every CHANGE of it with the position. The
+		// objects at that x then say which type did it - measured, not guessed.
+		if (sv.learnedCeiling < 1e29 &&
+		    std::abs(sv.learnedCeiling - sv.lastCeilingSeen) > 0.5) {
+			log::info("CEILING CHANGED {:.0f} -> {:.0f} at x {:.0f} y {:.0f} "
+			          "(implied band-setter y {:.1f})",
+			          sv.lastCeilingSeen > -1e29 ? sv.lastCeilingSeen : 0.0,
+			          sv.learnedCeiling, p->getPositionX(), p->getPositionY(),
+			          sv.learnedCeiling - g_config.geomCeilingOffset);
+			sv.lastCeilingSeen = sv.learnedCeiling;
+		}
+
+		// SAFETY NET for the map roof.
+		//
+		// The roof is derived from portal positions and is only as good as the
+		// list of portal IDs that re-snap the band. A missing ID makes the roof
+		// too LOW, which silently deletes reachable space - Clutterfunk lost ~46
+		// units that way, and the only symptom was a stall. The ceiling read at
+		// 0x764 is ground truth, so compare them and say so loudly.
+		if (sv.learnedCeiling < 1e29) {
+			auto const& gm = GeoMap::get();
+			if (gm.valid && sv.learnedCeiling > gm.yHi + 1.0 && !sv.roofWarned) {
+				sv.roofWarned = true;
+				log::error("MAP ROOF TOO LOW: the real ceiling here is {:.0f} but the "
+				           "map roof is {:.0f}, so {:.0f} units of reachable space have "
+				           "been deleted. A portal that re-snaps the band is missing "
+				           "from the roof scan. Turn the roof off (Z) for this level.",
+				           sv.learnedCeiling, gm.yHi, sv.learnedCeiling - gm.yHi);
+			}
+		}
+
+		// Is the player inside the band we just computed? It always must be.
+		if (sv.learnedCeiling < 1e29) {
+			const cocos2d::CCRect r = p->getObjectRect();
+			const double lo = sv.learnedCeiling - sv.entryBand();
+			const double out = std::max(lo - r.origin.y,
+			                            (r.origin.y + r.size.height) - sv.learnedCeiling);
+			if (out > 1.0) {
+				sv.ceilOutside++;
+				if (out > sv.ceilWorstOut) {
+					sv.ceilWorstOut = out;
+					log::warn("Ceiling band WRONG: player y {:.1f}..{:.1f} is {:.1f} "
+					          "outside band [{:.1f}, {:.1f}] at x {:.0f} - the clamp is "
+					          "cropping space the player is standing in.",
+					          r.origin.y, r.origin.y + r.size.height, out,
+					          lo, sv.learnedCeiling, p->getPositionX());
+				}
+			} else {
+				sv.ceilInside++;
+			}
+		}
+
+		// Probe 10: is that offset right? A contact is the roof announcing
+		// itself - rising, velocity forced to zero, and no object there to have
+		// done it. Recording contactY - m_portalY says whether one constant
+		// covers every section.
+		const double worldUp = p->m_isUpsideDown ? -vyBefore : vyBefore;
+		if (worldUp <= 0.5 || std::abs(p->m_yVelocity) > 1e-6) return;
+		const double y = p->getPositionY();
+
+		// Test the player's TOP EDGE, not its centre.
+		//
+		// This is what contaminated the first measurement. The player collides
+		// with its roof, about 15 units above its centre, so a stop against a
+		// block at 360 leaves the centre at ~345 - inside no blocked span - and
+		// a centre test wrongly calls it an invisible ceiling. MEASURED: the
+		// "ceilings" came back as 345 at x 17940 and 375 at x 17880, adjacent
+		// bands one block apart, which no camera ceiling does. They were the
+		// blocks at y 330 and 360 that the object dump shows there.
+		const cocos2d::CCRect pr = p->getObjectRect();
+		const double top = pr.origin.y + pr.size.height;
+		const double px  = p->getPositionX();
+		for (double probe = 0.0; probe <= 8.0; probe += 4.0)
+			if (geometryBlockedAt(px, top + probe)) return;
+
+		const double off = y - static_cast<double>(m_gameState.m_portalY);
+		sv.ceilOffMin = std::min(sv.ceilOffMin, off);
+		sv.ceilOffMax = std::max(sv.ceilOffMax, off);
+		sv.ceilOffN++;
+
+		// Probe 11. Everything still unexcluded, measured against the same
+		// contact so one run settles it.
+		{
+			double c[Solver::kCeilCand];
+			// getCameraEdgeValue's type selector is undocumented, so sweep it.
+			for (int t = 0; t < 6; t++) c[t] = getCameraEdgeValue(t);
+			c[6]  = p->m_collidedTopMinY;
+			c[7]  = p->m_collidedBottomMaxY;
+			c[8]  = m_maxGameplayY;
+			c[9]  = p->m_yStart;
+			c[10] = p->m_fallStartY;
+			c[11] = p->m_isOutOfBounds ? 1.0 : 0.0;
+			// GD draws the ship ceiling as a SECOND ground layer - it is the
+			// thing you can actually see closing the section in. If its y is the
+			// bound then there is nothing left to derive at all.
+			c[12] = m_groundLayer  ? m_groundLayer->getPositionY()  : 0.0;
+			c[13] = m_groundLayer2 ? m_groundLayer2->getPositionY() : 0.0;
+			for (int i = 0; i < Solver::kCeilCand; i++) {
+				const double d = y - c[i];
+				sv.candMin[i]  = std::min(sv.candMin[i], d);
+				sv.candMax[i]  = std::max(sv.candMax[i], d);
+				sv.candLast[i] = c[i];
+			}
+			sv.candN++;
+			sv.ceilHist[static_cast<int>(std::lround(y))]++;
+		}
+
+		// The camera's own rectangle. If its top edge IS the ceiling then there
+		// is nothing left to derive - read it and clamp to it.
+		if (m_cameraObb2) {
+			const cocos2d::CCRect r = m_cameraObb2->getBoundingRect();
+			const double top = r.origin.y + r.size.height;
+			sv.camTopSeen = top;
+			const double coff = y - top;
+			sv.camOffMin = std::min(sv.camOffMin, coff);
+			sv.camOffMax = std::max(sv.camOffMax, coff);
+			sv.camOffN++;
+		}
+	}
+
+	// Probe 10: one step of the ceiling measurement.
+	//
+	// Called from the same one-real-step gate as the motion model, so `vyBefore`
+	// really is the velocity entering this step.
+	void ceilingProbeRecord(double vyBefore) {
+		auto* p = m_player1;
+		if (!g_config.ceilingProbe || !p || p->m_isDead) return;
+		if (classifyMode(p) == ModeClass::Ground) return;   // air modes only
+
+		auto& cp = CeilingProbe::get();
+		const double bx = std::max(1.0, g_config.ceilingBandX);
+		const int32_t b = static_cast<int32_t>(std::floor(p->getPositionX() / bx));
+		const double y = p->getPositionY();
+
+		auto& e = cp.bands[b];
+		cp.samples++;
+		if (y > e.maxY) { e.maxY = y; }
+		e.reached++;
+
+		// Stopped while rising, in world-up terms so inverted gravity is not
+		// counted as a ceiling hit at the floor.
+		const double worldUp = p->m_isUpsideDown ? -vyBefore : vyBefore;
+		if (worldUp > 0.5 && std::abs(p->m_yVelocity) < 1e-6) {
+			if (y < e.contactY) e.contactY = y;
+			e.contacts++;
+
+			// The camera, so the anchoring rule can be read off rather than
+			// assumed. m_objectLayer scrolls opposite to the camera, so the
+			// camera's world y is the negation of its position.
+			double camY = 0.0;
+			if (m_objectLayer) camY = -m_objectLayer->getPositionY();
+			const double off = y - camY;
+			cp.offMin  = std::min(cp.offMin,  off);
+			cp.offMax  = std::max(cp.offMax,  off);
+			cp.camHMin = std::min(cp.camHMin, static_cast<double>(m_cameraHeight));
+			cp.camHMax = std::max(cp.camHMax, static_cast<double>(m_cameraHeight));
+			cp.ceilMin = std::min(cp.ceilMin, y);
+			cp.ceilMax = std::max(cp.ceilMax, y);
+			cp.contacts++;
+		}
+	}
+
 	// Probe 9: one step of the vertical motion model.
 	//
 	// Keyed on everything that can change the answer. If the spread column in the
@@ -8707,8 +9911,31 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// untried branches, so this genuinely enlarges the search space -
 			// deterministic DFS then explores paths it could not reach before,
 			// rather than re-deriving the same ones.
-			if (sv.escapes - sv.escapesAtWiden >= static_cast<uint64_t>(g_config.escapesBeforeWidening)
-			    && sv.lookbackSteps < g_config.maxCommitLookbackSteps) {
+			// Deepen in the GAPS between widenings - never instead of them.
+			//
+			// The first version deepened first and skipped the widening whenever it
+			// did, so widening could not happen until the budget maxed at 24, i.e.
+			// after ~24 escapes and 9600 deaths. MEASURED: Theory of Everything,
+			// Time Machine and xStep all stalled with the window pinned at w240
+			// while the budget climbed to 16, 23 and 14 - which is the original
+			// starvation exactly inverted.
+			//
+			// Widening keeps its own cadence untouched; deepening only fills the
+			// escapes in between. Strictly additive, so neither can starve.
+			const bool widenDue =
+				sv.escapes - sv.escapesAtWiden >= static_cast<uint64_t>(g_config.escapesBeforeWidening)
+				&& sv.lookbackSteps < g_config.maxCommitLookbackSteps;
+
+			if (g_config.deepenOnStall && !widenDue &&
+			    g_config.toggleBudget < g_config.maxToggleBudget) {
+				g_config.toggleBudget++;
+				log::info("Solver: stalled at {:.2f}% - deepening the toggle budget "
+				          "{} -> {} (escape #{}, widening not due yet)",
+				          sv.bestPct, g_config.toggleBudget - 1, g_config.toggleBudget,
+				          sv.escapes);
+			}
+
+			if (widenDue) {
 				const int before = sv.lookbackSteps;
 				sv.lookbackSteps = std::min(sv.lookbackSteps * g_config.wideningFactor,
 				                            g_config.maxCommitLookbackSteps);
@@ -8907,7 +10134,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		log::info("Solver: best {:.2f}%  depth {}  deaths {}  restores {}  escapes {}  "
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
 		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
-		          "archive {}c/{}r/{}f  gate {} free {}T/{}H  "
+		          "archive {}c/{}r/{}f  gate {} free {}T/{}H  mute {}  "
+		          "ceil {}/{}c/{}p out {}/{}  "
 		          "dx {:.2f}/{:.2f}  vs map {:.2f}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
@@ -8918,6 +10146,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          SolverArchive::get().cells.size(), SolverArchive::get().restarts,
 		          SolverArchive::get().restartFail,
 		          sv.budgetGateEvals, sv.gateFreeTap, sv.gateFreeHold,
+		          sv.geoSteerMute,
+		          sv.learnedCeiling > 1e29
+		              ? std::string("--")
+		              : fmt::format("{:.0f}", sv.learnedCeiling),
+		          sv.ceilingCrops,
+		          sv.portalEntries, sv.ceilOutside, sv.ceilInside,
 		          sv.dxPerStep,
 		          GeoMap::get().valid && m_player1
 		              ? GeoMap::get().speedAt(m_player1->getPositionX()) : 0.0,
@@ -9229,6 +10463,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			solverWriteMacro("solution.txt");
 			cellProbeDump("solved");
 			motionModelDump("solved");
+			ceilingProbeDump("solved");
 
 			// Hand the winning trajectory to the verifier. Done here, outside the
 			// stepping path, so the copy costs nothing that matters.
@@ -9373,8 +10608,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				// across a reposition would be pure noise. sv.hold here is still
 				// the input that was applied during this step - the tap countdown
 				// that can change it runs further down.
-				if (s.motionHavePrev)
+				if (s.motionHavePrev) {
 					motionModelRecord(s.motionPrevVy, s.motionPrevHold, sv.hold, rawDy);
+					ceilingProbeRecord(s.motionPrevVy);
+					ceilingUpdate(s.motionPrevVy);
+				}
 			}
 			s.prevX = nx;
 			s.prevY = ny;
@@ -9494,8 +10732,317 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		return true;
 	}
 
+	// Probe 12: print every ceiling candidate, live, while the level is played by
+	// hand. See liveCeilingReadout. Called from update(), so it runs in normal
+	// play rather than only inside the solver's step.
+	void liveCeilingStep() {
+		if (!g_config.liveCeilingReadout) return;
+		auto* p  = m_player1;
+		auto* pl = PlayLayer::get();
+		if (!p || !pl || p->m_isDead) return;
+		if (Solver::get().running || ProbeState::get().mode != Mode::Idle) return;
+
+		static const char* kMode[8] = {"cube", "ship", "wave", "ufo",
+		                               "ball", "robot", "spider", "swing"};
+		const int mi = p->m_isShip ? 1 : p->m_isDart ? 2 : p->m_isBird ? 3
+		             : p->m_isBall ? 4 : p->m_isRobot ? 5 : p->m_isSpider ? 6
+		             : p->m_isSwing ? 7 : 0;
+
+		static double prevVy = 0.0;
+		const double vyBefore = prevVy;
+		prevVy = p->m_yVelocity;
+
+		const double y = p->getPositionY();
+		const cocos2d::CCRect pr = p->getObjectRect();
+		const double top = pr.origin.y + pr.size.height;
+
+		// Stopped while moving up in world terms: the roof announcing itself.
+		const double worldUp = p->m_isUpsideDown ? -vyBefore : vyBefore;
+		const bool contact = worldUp > 0.5 && std::abs(p->m_yVelocity) < 1e-6;
+
+		// The FLOOR side, which has only ever been derived and never measured:
+		// stopped while moving down, with nothing under the player's feet.
+		const bool floorHit = worldUp < -0.5 && std::abs(p->m_yVelocity) < 1e-6
+		                   && !geometryBlockedAt(p->getPositionX(),
+		                                         pr.origin.y - 4.0);
+		if (floorHit) {
+			auto& sv2 = Solver::get();
+			const double bottom = pr.origin.y;
+			if (sv2.haveEntryPortal) {
+				const double predF = Solver::ceilingForPortal(sv2.entryPortalY,
+				                                              sv2.entryPortalID)
+				                   - sv2.entryBand();
+				log::info("FLOOR   x{:7.0f} bottom {:7.1f}  predicted {:7.1f}  err {:+.1f}"
+				          "  [{}{}]  {}",
+				          p->getPositionX(), bottom, predF, bottom - predF,
+				          kMode[mi], p->m_vehicleSize < 0.9f ? "-mini" : "",
+				          std::abs(bottom - predF) < 0.5 ? "PASS" : "MISMATCH");
+			} else {
+				log::info("FLOOR   x{:7.0f} bottom {:7.1f}  (no portal entry recorded)",
+				          p->getPositionX(), bottom);
+			}
+		}
+
+		static int tick = 0;
+		if (!contact && (++tick % std::max(1, g_config.liveCeilingEvery)) != 0) return;
+
+		const double gl1 = m_groundLayer  ? m_groundLayer->getPositionY()  : 0.0;
+		const double gl2 = m_groundLayer2 ? m_groundLayer2->getPositionY() : 0.0;
+
+		// The 0x764 candidate on EVERY line, not just contacts. If it only holds
+		// the ceiling at the moment of impact it is as reactive as
+		// m_collidedTopMinY and no use for prediction; if it holds it continuously
+		// through the section, it is the field we want.
+		float v764 = 0.f;
+		std::memcpy(&v764, reinterpret_cast<const uint8_t*>(this) + 0x764, sizeof v764);
+
+		log::info("{} x{:7.0f} y{:7.1f} top{:7.1f} vy{:+6.2f} {}{}  |  x764 {:8.2f}  collTop {:7.1f} "
+		          "collBot {:7.1f}  gl1 {:7.1f} gl2 {:7.1f}  portalY {:7.1f} "
+		          "camH {:6.1f} free {} oob {}",
+		          contact ? "CONTACT" : "       ",
+		          p->getPositionX(), y, top, p->m_yVelocity,
+		          kMode[mi], p->m_vehicleSize < 0.9f ? "-mini" : "", v764,
+		          p->m_collidedTopMinY, p->m_collidedBottomMaxY, gl1, gl2,
+		          m_gameState.m_portalY, m_cameraHeight,
+		          m_gameState.m_isFreeMode ? 1 : 0, p->m_isOutOfBounds ? 1 : 0);
+
+		if (contact) {
+			// The rule, checked against this contact, in this mode.
+			//
+			// Every measurement so far has been SHIP. usingWallLimitedMode()
+			// returning 1 for a ship says nothing about UFO, wave, ball, spider,
+			// swing or any mini variant, and if the offset differs per mode the
+			// clamp is wrong everywhere except the one mode it was fitted on.
+			// This turns flying the level into the test.
+			auto& sv = Solver::get();
+			if (sv.haveEntryPortal) {
+				const double pred = Solver::ceilingForPortal(sv.entryPortalY,
+				                                             sv.entryPortalID);
+				const double err  = top - pred;
+				log::info("        RULE portal {:.1f} -> predicted {:.1f}, actual {:.1f}"
+				          "  err {:+.1f}  [{}{}]  {}",
+				          sv.entryPortalY, pred, top, err,
+				          kMode[mi], p->m_vehicleSize < 0.9f ? "-mini" : "",
+				          std::abs(err) < 0.5 ? "PASS" : "MISMATCH <-- the rule does "
+				                                         "not hold for this mode");
+			} else {
+				log::info("        RULE no portal entry recorded, so nothing to "
+				          "predict from - this contact cannot check the rule.");
+			}
+
+			// Probe 13: the exhaustive test.
+			//
+			// Every named candidate has been eliminated, but that only ever tested
+			// fields someone thought to enumerate. At a contact the ceiling is
+			// KNOWN, so scan the raw bytes of both objects for anything holding it
+			// and print the offsets. If a field stores the ceiling this finds it;
+			// if nothing does, it is conclusively not stored in either object and
+			// the arithmetic is the only way to get it.
+			//
+			// Read-only, and only at a contact, so it costs nothing in normal play.
+			{
+				const double want[2] = { top, top - Solver::get().entryBand() };
+				static const char* kWhat[2] = { "CEILING", "floor" };
+				for (int w = 0; w < 2; w++) {
+					int hits = 0;
+					auto scan = [&](const char* name, const void* base, size_t bytes) {
+						const auto* b = reinterpret_cast<const uint8_t*>(base);
+						if (!b) return;
+						for (size_t off = 0; off + 4 <= bytes; off += 4) {
+							float f;
+							std::memcpy(&f, b + off, sizeof f);
+							if (std::isfinite(f) && std::abs(f - want[w]) < 0.01) {
+								log::info("        SCAN {} float {} +0x{:X} = {:.2f}",
+								          kWhat[w], name, off, f);
+								hits++;
+							}
+							if (off + 8 <= bytes && (off % 8) == 0) {
+								double d;
+								std::memcpy(&d, b + off, sizeof d);
+								if (std::isfinite(d) && std::abs(d - want[w]) < 0.01) {
+									log::info("        SCAN {} double {} +0x{:X} = {:.2f}",
+									          kWhat[w], name, off, d);
+									hits++;
+								}
+							}
+						}
+					};
+					scan("gameLayer", this, 0x5000);
+					scan("player",    p,    0x900);
+					if (!hits)
+						log::info("        SCAN {} {:.1f}: no field in either object "
+						          "holds this value.", kWhat[w], want[w]);
+				}
+			}
+
+			// Everything else named anywhere in this investigation, so one flight
+			// tests the lot instead of a build per candidate.
+			{
+				double obbY = 0.0, obbH = 0.0, obbCY = 0.0;
+				if (m_cameraObb2) {
+					const cocos2d::CCRect r = m_cameraObb2->getBoundingRect();
+					obbY = r.origin.y; obbH = r.size.height;
+					obbCY = m_cameraObb2->m_center.y;
+				}
+				const double objLayerY = m_objectLayer ? m_objectLayer->getPositionY() : 0.0;
+				log::info("        obb.y {:8.2f} (top-{:8.2f})  obb.h {:8.2f}  obb.cy "
+				          "{:8.2f}   objectLayer.y {:8.2f} (top-{:8.2f})",
+				          obbY, top - obbY, obbH, obbCY, objLayerY, top - objLayerY);
+				log::info("        maxGameplayY {:8.2f}  sectionYFactor {:8.2f}  "
+				          "camUnzoomedX {:8.2f}  halfCamW {:8.2f}",
+				          m_maxGameplayY, m_sectionYFactor,
+				          m_cameraUnzoomedX, m_halfCameraWidth);
+				log::info("        gs.cameraZoom {:8.3f}  gs.cameraAngle {:8.3f}  "
+				          "gs.middleGroundOffsetY {:8.2f}",
+				          m_gameState.m_cameraZoom, m_gameState.m_cameraAngle,
+				          m_gameState.m_middleGroundOffsetY);
+				log::info("        player yStart {:8.2f} (top-{:8.2f})  fallStartY "
+				          "{:8.2f} (top-{:8.2f})  gravity {:6.3f}",
+				          p->m_yStart, top - p->m_yStart,
+				          p->m_fallStartY, top - p->m_fallStartY, p->m_gravity);
+			}
+
+			// Probe 14: name the field at +0x764.
+			//
+			// MEASURED: a float at gameLayer +0x764 held the ceiling EXACTLY on
+			// all 8 contacts across 6 portal heights - 480, 540, 630, 540, 450,
+			// 390, 390, 390 - including the ground-clamped case. That is the
+			// field; it just has no name yet, because it sits inside the by-value
+			// m_gameState and Geode has most of GJGameState unnamed.
+			//
+			// Printing each named neighbour's runtime offset identifies it, or
+			// proves it is one of the unnamed slots and we address it by offset
+			// with the neighbours as a version guard.
+			//
+			// Prints once, not per contact.
+			{
+				static bool once = false;
+				if (!once) {
+					once = true;
+					const auto* base = reinterpret_cast<const uint8_t*>(this);
+					auto off = [&](const void* f) {
+						return static_cast<long>(reinterpret_cast<const uint8_t*>(f) - base);
+					};
+					log::info("        --- offsets from `this` (target is 0x764) ---");
+					log::info("        m_gameState              +0x{:X}", off(&m_gameState));
+					log::info("        gs.m_cameraZoom          +0x{:X}", off(&m_gameState.m_cameraZoom));
+					log::info("        gs.m_middleGroundOffsetY +0x{:X}", off(&m_gameState.m_middleGroundOffsetY));
+					log::info("        gs.m_unkFloat2           +0x{:X}", off(&m_gameState.m_unkFloat2));
+					log::info("        gs.m_unkFloat3           +0x{:X}", off(&m_gameState.m_unkFloat3));
+					log::info("        gs.m_unkFloat4           +0x{:X}", off(&m_gameState.m_unkFloat4));
+					log::info("        gs.m_unkUint1            +0x{:X}", off(&m_gameState.m_unkUint1));
+					log::info("        gs.m_portalY             +0x{:X}", off(&m_gameState.m_portalY));
+					log::info("        gs.m_unkInt13            +0x{:X}", off(&m_gameState.m_unkInt13));
+					log::info("        gs.m_unkFloat5           +0x{:X}", off(&m_gameState.m_unkFloat5));
+					log::info("        gs.m_unkFloat6           +0x{:X}", off(&m_gameState.m_unkFloat6));
+					log::info("        gs.m_unkFloat7           +0x{:X}", off(&m_gameState.m_unkFloat7));
+					log::info("        gs.m_unkFloat8           +0x{:X}", off(&m_gameState.m_unkFloat8));
+					log::info("        gs.m_cameraAngle         +0x{:X}", off(&m_gameState.m_cameraAngle));
+					log::info("        gs.m_isFreeMode          +0x{:X}", off(&m_gameState.m_isFreeMode));
+					// The later half of GJGameState, where 0x764 must actually be:
+					// m_gameState starts at 0x1A8 and m_cameraHeight is at 0x3260,
+					// so the target is 1468 bytes into the game state.
+					auto& gs = m_gameState;
+					log::info("        gs.m_targetCameraAngle   +0x{:X}", off(&gs.m_targetCameraAngle));
+					log::info("        gs.m_timeWarp            +0x{:X}", off(&gs.m_timeWarp));
+					log::info("        gs.m_totalTime           +0x{:X}", off(&gs.m_totalTime));
+					log::info("        gs.m_levelTime           +0x{:X}", off(&gs.m_levelTime));
+					log::info("        gs.m_currentProgress     +0x{:X}", off(&gs.m_currentProgress));
+					log::info("        gs.m_lastActivatedPortal1+0x{:X}", off(&gs.m_lastActivatedPortal1));
+					log::info("        gs.m_lastActivatedPortal2+0x{:X}", off(&gs.m_lastActivatedPortal2));
+					log::info("        gs.m_cameraPosition      +0x{:X}  = ({:.1f}, {:.1f})",
+					          off(&gs.m_cameraPosition), gs.m_cameraPosition.x, gs.m_cameraPosition.y);
+					log::info("        gs.m_levelFlipping       +0x{:X}", off(&gs.m_levelFlipping));
+					log::info("        gs.m_unkFloat9           +0x{:X}", off(&gs.m_unkFloat9));
+					log::info("        gs.m_cameraEdgeValue0    +0x{:X}  = {}", off(&gs.m_cameraEdgeValue0), gs.m_cameraEdgeValue0);
+					log::info("        gs.m_cameraEdgeValue1    +0x{:X}  = {}", off(&gs.m_cameraEdgeValue1), gs.m_cameraEdgeValue1);
+					log::info("        gs.m_cameraEdgeValue2    +0x{:X}  = {}", off(&gs.m_cameraEdgeValue2), gs.m_cameraEdgeValue2);
+					log::info("        gs.m_cameraEdgeValue3    +0x{:X}  = {}", off(&gs.m_cameraEdgeValue3), gs.m_cameraEdgeValue3);
+					log::info("        gs.m_unkUint10           +0x{:X}", off(&gs.m_unkUint10));
+					log::info("        gs.m_cameraStepDiff      +0x{:X}  = ({:.1f}, {:.1f})",
+					          off(&gs.m_cameraStepDiff), gs.m_cameraStepDiff.x, gs.m_cameraStepDiff.y);
+					log::info("        gs.m_unkFloat10          +0x{:X}", off(&gs.m_unkFloat10));
+					log::info("        gs.m_timeModRelated      +0x{:X}", off(&gs.m_timeModRelated));
+					log::info("        gs.m_unkUint13           +0x{:X}", off(&gs.m_unkUint13));
+					log::info("        gs.m_unkPoint32          +0x{:X}  = ({:.1f}, {:.1f})",
+					          off(&gs.m_unkPoint32), gs.m_unkPoint32.x, gs.m_unkPoint32.y);
+					log::info("        gs.m_cameraPosition2     +0x{:X}  = ({:.1f}, {:.1f})",
+					          off(&gs.m_cameraPosition2), gs.m_cameraPosition2.x, gs.m_cameraPosition2.y);
+					log::info("        gs.m_unkUint14           +0x{:X}", off(&gs.m_unkUint14));
+					log::info("        m_cameraHeight           +0x{:X}", off(&m_cameraHeight));
+					log::info("        --- and the value at 0x764 right now ---");
+					float v764;
+					std::memcpy(&v764, base + 0x764, sizeof v764);
+					log::info("        *(float*)(this+0x764) = {:.2f}", v764);
+				}
+			}
+
+			double e[6];
+			for (int t = 0; t < 6; t++) e[t] = getCameraEdgeValue(t);
+			log::info("        cameraEdge 0..5: {:.1f} {:.1f} {:.1f} {:.1f} {:.1f} "
+			          "{:.1f}   <- the ceiling is at y {:.1f} (player top edge)",
+			          e[0], e[1], e[2], e[3], e[4], e[5], top);
+
+			// The camera-offset family, which is the last untested group. Printed
+			// as the raw value AND as `top - value`, because the question is
+			// always whether some difference is constant across sections - that
+			// is what a usable anchor looks like, and eyeballing raw numbers has
+			// twice led me to the wrong conclusion.
+			const double ho  = m_cameraHeightOffset;
+			const double tho = m_targetCameraHeightOffset;
+			const double uho = m_cameraUnzoomedHeightOffset;
+			log::info("        heightOffset {:8.2f} (top-{:8.2f})   target {:8.2f} "
+			          "(top-{:8.2f})   unzoomed {:8.2f} (top-{:8.2f})",
+			          ho, top - ho, tho, top - tho, uho, top - uho);
+			log::info("        camH {:.1f} camW {:.1f} flip {:.2f}  calcTargetHO {}  "
+			          "wallLimited {}  flying {}  freeMode {}",
+			          m_cameraHeight, m_cameraWidth, m_cameraFlip,
+			          m_calculateTargetHeightOffset ? 1 : 0,
+			          p->usingWallLimitedMode() ? 1 : 0,
+			          p->isFlying() ? 1 : 0,
+			          m_gameState.m_isFreeMode ? 1 : 0);
+		}
+	}
+
+	// The portal the player actually touched. This is the whole anchor: it fires
+	// on ENTRY, so a portal that is merely flown past never sets anything and
+	// fake or stacked portals need no special handling.
+	void playerWillSwitchMode(PlayerObject* player, GameObject* object) {
+		GJBaseGameLayer::playerWillSwitchMode(player, object);
+		if (!object || !player || player != m_player1) return;
+
+		auto& sv = Solver::get();
+		sv.entryPortalY    = object->getPositionY();
+		sv.haveEntryPortal = true;
+		sv.entryPortalMode = static_cast<int>(classifyMode(player));
+		// Recorded because the band depends on the mode entered, and ModeClass is
+		// too coarse to carry it - ball and cube are both ModeClass::Ground.
+		sv.entryPortalID   = object->m_objectID;
+		sv.portalEntries++;
+
+		if (g_config.liveCeilingReadout) {
+			// GD's own answer for the same question, for cross-checking ours.
+			const double gdTarget = getTargetFlyCameraY(object);
+			const double ceil = Solver::ceilingForPortal(sv.entryPortalY,
+			                                             sv.entryPortalID);
+			log::info("PORTAL objID {} at y {:.1f}  ->  raw {:.1f} snapped to ceiling "
+			          "{:.1f}, floor {:.1f} (band {:.0f})",
+			          object->m_objectID, sv.entryPortalY,
+			          sv.entryPortalY + g_config.geomCeilingOffset,
+			          ceil, ceil - sv.entryBand(), sv.entryBand());
+			// getTargetFlyCameraY returned exactly the portal y on every entry so
+			// far (251->251, 345->345), so it looks like a position echo rather
+			// than a camera target. Logged with the derived values beside it in
+			// case it diverges on a portal shape we have not tried.
+			log::info("        getTargetFlyCameraY {:.1f}  (portalY {:.1f}, so "
+			          "target-portalY {:.1f}; predicted ceiling {:.1f})",
+			          gdTarget, sv.entryPortalY, gdTarget - sv.entryPortalY, ceil);
+		}
+	}
+
 	void update(float dt) {
 		pollHotkeys();
+		liveCeilingStep();
 
 		auto& st = ProbeState::get();
 		auto* pl = PlayLayer::get();
@@ -9776,6 +11323,31 @@ class $modify(SolverPlayLayer, PlayLayer) {
 			if (safe.empty()) safe = "level";
 			ProbeState::get().levelKey = safe;
 		}
+		// The layout guard for the unnamed ceiling field. Once per level.
+		if (auto* gl = GJBaseGameLayer::get()) {
+			const auto* base = reinterpret_cast<const uint8_t*>(gl);
+			const long gsOff = static_cast<long>(
+				reinterpret_cast<const uint8_t*>(&gl->m_gameState) - base);
+			const long chOff = static_cast<long>(
+				reinterpret_cast<const uint8_t*>(&gl->m_cameraHeight) - base);
+			auto& sv = Solver::get();
+			sv.ceilFieldOk = gsOff == g_config.geomGuardGameStateOff &&
+			                 chOff == g_config.geomGuardCameraHeightOff;
+			if (!sv.ceilFieldOk)
+				log::warn("Ceiling field: layout guard FAILED (m_gameState +0x{:X} "
+				          "expected +0x{:X}, m_cameraHeight +0x{:X} expected +0x{:X}). "
+				          "The struct has changed, so offset 0x{:X} cannot be trusted "
+				          "- falling back to the derived rule.",
+				          gsOff, g_config.geomGuardGameStateOff,
+				          chOff, g_config.geomGuardCameraHeightOff,
+				          g_config.geomCeilingFieldOffset);
+		}
+
+		// Probe 7 on every level load. It is read-only and touches no search
+		// state, and having the map on disk for every level a stall happens on is
+		// worth more than the load-time file write costs.
+		geometryDump();
+
 		log::info("gd-solver: level '{}' loaded - output files are namespaced as {}_*",
 		          ProbeState::get().levelKey, ProbeState::get().levelKey);
 		log::info("  F2 = solve/stop, B = beam, F4 = verify, F5 = record input, F6 = load input, "
