@@ -2841,6 +2841,15 @@ static const PlayerFieldSpan kPlayerFields[] = {
 //                                    exactly where it is scarcest.
 enum class ModeClass { Ground, Hold, Tap };
 
+const char* modeClassName(int mc) {
+	switch (mc) {
+		case 0:  return "Ground";
+		case 1:  return "Hold";
+		case 2:  return "Tap";
+		default: return "none";
+	}
+}
+
 ModeClass classifyMode(PlayerObject* p) {
 	if (!p) return ModeClass::Ground;
 	if (p->m_isShip || p->m_isDart)  return ModeClass::Hold; // ship, wave
@@ -9102,9 +9111,45 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					sv.ceilDisagreed++;
 					if (d > sv.ceilWorstDelta) {
 						sv.ceilWorstDelta = d;
+						// Both disagreements ever seen at this threshold read
+						// `delta exactly 30` - ToE x 24461 and Electroman x 10481 -
+						// which is (300 - 240) / 2, the gap between the ship offset
+						// and the ball one. In both the portal Y was right and the
+						// band was wrong, so the message has to say which portal it
+						// thinks it is in. Two very different faults produce the same
+						// delta and the old message could not separate them:
+						//
+						//   a STALE entryPortalID - the search restored to before a
+						//     portal it had already entered, so the id names a section
+						//     the player is no longer in;
+						//   an UNMEASURED band - wave, swing, robot and spider are all
+						//     still assumed 300, and until this threshold dropped to 15
+						//     a wrong assumption there was completely silent.
+						//
+						// The implied numbers separate them: invert the rule against
+						// the field and the band it asks for is either one we already
+						// know (stale id) or one we have never measured.
+						const double impliedOff  = fromField - sv.entryPortalY;
+						const double impliedBand = 2.0 * (impliedOff + 15.0);
+						const bool   atClamp     =
+							std::abs(derived - (g_config.geomGroundY + sv.entryBand()))
+							< 0.5;
 						log::warn("Ceiling: field says {:.1f}, rule says {:.1f} "
-						          "(delta {:.1f}) at x {:.0f}. One of them is wrong.",
-						          fromField, derived, d, p->getPositionX());
+						          "(delta {:.1f}) at x {:.0f}. Entry portal objID {} "
+						          "y {:.1f}, band {:.0f}, offset {:.0f}; mode {} now "
+						          "vs {} at entry. The field implies offset {:.1f} "
+						          "and band {:.1f}{}.",
+						          fromField, derived, d, p->getPositionX(),
+						          sv.entryPortalID, sv.entryPortalY, sv.entryBand(),
+						          ceilingOffsetForPortal(sv.entryPortalID),
+						          modeClassName(static_cast<int>(classifyMode(p))),
+						          modeClassName(sv.entryPortalMode),
+						          impliedOff, impliedBand,
+						          atClamp
+						              ? " - but the rule is sitting on the ground clamp "
+						                "here, so the implied pair describes the clamp "
+						                "and not the portal"
+						              : "");
 					}
 				}
 			}
