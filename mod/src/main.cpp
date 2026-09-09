@@ -788,7 +788,21 @@ struct Config {
 	// That is what makes it assumption-free. A portal flown past never fires the
 	// hook, so fake portals, stacked portals and out-of-order portals are not
 	// special cases - they simply never set anything.
+// SUPERSEDED as a rule by ceilingOffsetForPortal, which reads this same 135
+	// out of a 300 band. Kept because Probe 10 still reports against it, and
+	// because bandHeightForPortal's default reproduces it exactly for any mode
+	// whose band has not been measured yet.
 	double geomCeilingOffset = 135.0;
+
+	// How far BEFORE a portal's getPositionX() its cap is allowed to apply.
+	//
+	// The game re-anchors the band when the player touches the portal, which is
+	// 15..31 units before its centre on every case measured, and the slice scan
+	// adds up to one slice more on top of that. 60 is two blocks: comfortably
+	// past both, and the relaxation takes a MAX so overshooting only leaves a
+	// strip too tall rather than deleting anything. 0 restores the old
+	// centre-triggered behaviour.
+	double geomRoofLeadX = 60.0;
 
 	// x band for the measured ceiling, in world units. Two blocks: fine enough
 	// to follow a section, coarse enough to collect several samples per band.
@@ -2859,6 +2873,39 @@ double bandHeightForPortal(int objID) {
 	}
 }
 
+// How far the ceiling sits ABOVE the entered portal's y, before the grid snap.
+//
+// NOT the constant geomCeilingOffset (135). That number is correct for a 300
+// band and wrong for every other one. MEASURED against 0x764 on three levels:
+//
+//   ToE  6928 UFO  posY  345 -> 480   offset 135
+//   ToE 13768 ship posY  285 -> 420   offset 135
+//   ToE 16648 UFO  posY 1095 -> 1230  offset 135
+//   ToE 24720 ship posY  915 -> 1050  offset 135
+//   ToE 11344 ball posY  285 -> 390   offset 105
+//   ToE 23548 ball posY  915 -> 1020  offset 105
+//
+// The clincher is xStep, which puts a ball portal (x 18388) and a ship portal
+// (x 23008) at the SAME y and reads 420 and 450 - a 30-unit split at one
+// height, which is exactly (300 - 240) / 2 and cannot be explained by anything
+// but the band height.
+//
+// So the band is not anchored by its ceiling at all. It is CENTRED on
+// posY - 15, whatever the mode, and only its height changes:
+//
+//   ceiling = posY - 15 + bandHeight/2
+//   floor   = posY - 15 - bandHeight/2
+//
+// which reproduces the original ship derivation (45 above the portal's snapped
+// centre plus 90 clear above its top = 135) as the bandHeight == 300 case,
+// rather than contradicting it.
+//
+// This error was invisible because it is EXACTLY 30 on a ball and the
+// cross-check in ceilingUpdate fired on `d > 30.0`. It missed by nothing.
+double ceilingOffsetForPortal(int objID) {
+	return bandHeightForPortal(objID) * 0.5 - 15.0;
+}
+
 // The coarse bucket a state falls into: "somewhere like here", not "exactly
 // here". Lifted out of goCellKey so the archive and the census that measures
 // whether the archive is worth building cannot drift apart - the same reason
@@ -3165,7 +3212,7 @@ struct Solver {
 	// with no objID this silently answered 390 for both.
 	static double ceilingForPortal(double portalY, int objID) {
 		const double g = std::max(1.0, g_config.geomCeilingGrid);
-		const double c = std::round((portalY + g_config.geomCeilingOffset) / g) * g;
+		const double c = std::round((portalY + ceilingOffsetForPortal(objID)) / g) * g;
 		// Rest the band on the ground rather than letting it clip through.
 		const double lowest = g_config.geomGroundY + bandHeightForPortal(objID);
 		return std::max(c, lowest);
@@ -3217,6 +3264,11 @@ struct Solver {
 
 	double                lastCeilingSeen = -1e30;
 	bool                  roofWarned      = false;
+	// Smallest (map roof at the player's x - live ceiling) seen, and where.
+	// Negative means the build cropped space the game says the player may
+	// legally occupy. Positive and large means the roof is doing nothing.
+	double                roofMarginMin   =  1e30;
+	double                roofMarginMinX  = 0.0;
 	uint64_t              ceilOutside     = 0;
 	uint64_t              ceilInside      = 0;
 	double                ceilWorstOut    = 0.0;
@@ -3500,6 +3552,16 @@ struct Solver {
 		geoSteers = geoLooks = 0;
 		geoSteerDead = geoSteerWin = geoSteerMute = 0;
 		learnedCeiling  = 1e30;
+		// Both of these are per-LEVEL and were never cleared, so a session that
+		// ran more than one level carried them across. lastCeilingSeen only made
+		// the first CEILING CHANGED line of each level report the previous
+		// level's value as its "from"; roofWarned was worse - one warning
+		// anywhere in a session permanently silenced the check for every level
+		// after it.
+		lastCeilingSeen = -1e30;
+		roofWarned      = false;
+		roofMarginMin   =  1e30;
+		roofMarginMinX  = 0.0;
 		ceilingCrops    = 0;
 		entryPortalY    = 0.0;
 		haveEntryPortal = false;
@@ -4416,6 +4478,14 @@ struct GeoMap {
 	// speed and its speed portals. The map is built before the run, so unlike
 	// the lookahead this cannot be measured off the player - it has to be read.
 	std::vector<float> segSpeed;
+
+	// The roof the build actually applied at each segment - what freeSpans was
+	// cropped against. It used to be a local in geometryBuildMap, consumed and
+	// thrown away, so at run time nothing could ask "what did the roof delete
+	// here?" and the only available check was against yHi, the top of the whole
+	// map. With a per-x roof that check can never fire: Time Machine's yHi is
+	// 810 while the roof holds the back half at 390.
+	std::vector<float> segRoof;
 	double yLo = 0.0, yHi = 0.0;
 	double playerH = 15.0;         // smallest hitbox height: permissive
 	int  freeCount = 0, deadCount = 0;
@@ -4547,6 +4617,7 @@ bool geometryBuildMap() {
 	const int n = m.segments();
 	m.blocked.assign(n, {});
 	m.freeSpans.assign(n, {});
+	m.segRoof.assign(n, 0.f);
 	m.yLo = ylo - 120.0;
 	m.yHi = yhi + 120.0;
 
@@ -4598,7 +4669,7 @@ bool geometryBuildMap() {
 				// position alone.
 				const double py = std::get<1>(bp[pi]);
 				const double bh = bandHeightForPortal(std::get<2>(bp[pi]));
-				double c = std::round((py + g_config.geomCeilingOffset) / g) * g;
+				double c = std::round((py + ceilingOffsetForPortal(std::get<2>(bp[pi]))) / g) * g;
 				c = std::max(c, g_config.geomGroundY + bh);   // rest on the ground
 				// Mode 1 keeps the running maximum; mode 2 takes the most
 				// recent portal's cap, so a lower section can lower the roof.
@@ -4607,13 +4678,54 @@ bool geometryBuildMap() {
 			}
 			if (run > -1e17)
 				roofAt[static_cast<size_t>(si)] = std::min(m.yHi, run);
+		}
+
+		// LEAD-IN. The scan above raises the roof at the portal's
+		// getPositionX(), but the game re-anchors the band EARLIER - the player
+		// touches the portal before its centre. MEASURED against 0x764:
+		//
+		//   ToE  x 16634 real 1230, roof 420  - portal centre 16665, lag 31
+		//   ToE  x  6914 real  480, roof 390  - portal centre  6945, lag 31
+		//   xStep x 4590 real  390, roof 330  - portal centre  4605, lag 15
+		//
+		// 810 units of real space deleted in the first of those, right where
+		// ToE's back half begins. Two causes stack: the portal's own half-width,
+		// and `<= m.xs[si]` testing the slice's LEFT edge, which defers a portal
+		// sitting mid-slice to the following slice.
+		//
+		// The fix is a backward relaxation, not an earlier trigger. Simply moving
+		// the trigger left is only safe when the next cap is HIGHER; where it is
+		// lower it would crop the tail of the section being left. Taking the MAX
+		// of the two over the lead-in strip is safe in both directions - it can
+		// only leave a strip slightly too tall, which fails to prune, and never
+		// deletes space the player can occupy.
+		if (g_config.geomRoofLeadX > 0.0) {
+			for (auto const& t : bp) {
+				const double px = std::get<0>(t);
+				const double py = std::get<1>(t);
+				const int    pid = std::get<2>(t);
+				const double bh = bandHeightForPortal(pid);
+				double c = std::round((py + ceilingOffsetForPortal(pid)) / g) * g;
+				c = std::min(m.yHi, std::max(c, g_config.geomGroundY + bh));
+				const double x0 = px - g_config.geomRoofLeadX;
+				for (int si = 0; si < n; si++) {
+					if (m.xs[si + 1] <= x0) continue;
+					if (m.xs[si] >= px)     break;
+					roofAt[static_cast<size_t>(si)] =
+						std::max(roofAt[static_cast<size_t>(si)], c);
+				}
+			}
+		}
+
+		for (int si = 0; si < n; si++) {
 			lowest  = std::min(lowest,  roofAt[static_cast<size_t>(si)]);
 			highest = std::max(highest, roofAt[static_cast<size_t>(si)]);
 		}
 		log::info("Solver: map roof {:.0f} -> per-x {:.0f}..{:.0f} over {} "
-		          "band-setting portals. Space above the roof at each x is "
-		          "unreachable there.",
-		          m.yHi, lowest, highest, bandPortals.size());
+		          "band-setting portals, lead-in {:.0f}. Space above the roof at "
+		          "each x is unreachable there.",
+		          m.yHi, lowest, highest, bandPortals.size(),
+		          g_config.geomRoofLeadX);
 	}
 
 	// Each object contributes its y span to every segment it covers.
@@ -4647,6 +4759,7 @@ bool geometryBuildMap() {
 		// Complement, keeping only gaps the player actually fits through.
 		std::vector<GeoMap::Free> fr;
 		const double roofSi = roofAt[static_cast<size_t>(si)];
+		m.segRoof[static_cast<size_t>(si)] = static_cast<float>(roofSi);
 		double cur = m.yLo;
 		for (auto const& sp : merged) {
 			const double top = std::min(static_cast<double>(sp.lo), roofSi);
@@ -8981,7 +9094,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// either way it must be loud, not silent.
 			if (haveDerived) {
 				const double d = std::abs(fromField - derived);
-				if (d > 30.0) {
+				// Was 30.0, and the ball offset error was EXACTLY 30.0, so the
+				// guard missed the one defect it existed to catch. Half a block
+				// now: the rule predicts every measured contact exactly, so
+				// anything approaching a block is worth hearing about.
+				if (d > 15.0) {
 					sv.ceilDisagreed++;
 					if (d > sv.ceilWorstDelta) {
 						sv.ceilWorstDelta = d;
@@ -9017,7 +9134,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			          "(implied band-setter y {:.1f})",
 			          sv.lastCeilingSeen > -1e29 ? sv.lastCeilingSeen : 0.0,
 			          sv.learnedCeiling, p->getPositionX(), p->getPositionY(),
-			          sv.learnedCeiling - g_config.geomCeilingOffset);
+			          sv.learnedCeiling - ceilingOffsetForPortal(sv.entryPortalID));
 			sv.lastCeilingSeen = sv.learnedCeiling;
 		}
 
@@ -9028,15 +9145,35 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// too LOW, which silently deletes reachable space - Clutterfunk lost ~46
 		// units that way, and the only symptom was a stall. The ceiling read at
 		// 0x764 is ground truth, so compare them and say so loudly.
+		// Compared PER X, not against yHi. yHi is the top of the whole map, and Z
+		// crops per segment, so the old global form could not see a local crop at
+		// all - on Time Machine yHi is 810 while the roof pins the back half at
+		// 390, and the check sat silent through a 96.88% stall.
+		//
+		// segRoof already equals yHi everywhere when Z is off, so this subsumes
+		// the global check rather than sitting beside it.
 		if (sv.learnedCeiling < 1e29) {
 			auto const& gm = GeoMap::get();
-			if (gm.valid && sv.learnedCeiling > gm.yHi + 1.0 && !sv.roofWarned) {
-				sv.roofWarned = true;
-				log::error("MAP ROOF TOO LOW: the real ceiling here is {:.0f} but the "
-				           "map roof is {:.0f}, so {:.0f} units of reachable space have "
-				           "been deleted. A portal that re-snaps the band is missing "
-				           "from the roof scan. Turn the roof off (Z) for this level.",
-				           sv.learnedCeiling, gm.yHi, sv.learnedCeiling - gm.yHi);
+			const int si = gm.valid ? gm.segIndex(p->getPositionX()) : -1;
+			if (si >= 0 && si < static_cast<int>(gm.segRoof.size())) {
+				const double roofHere = gm.segRoof[static_cast<size_t>(si)];
+				const double margin   = roofHere - sv.learnedCeiling;
+				if (margin < sv.roofMarginMin) {
+					sv.roofMarginMin  = margin;
+					sv.roofMarginMinX = p->getPositionX();
+					// Only a NEW WORST prints, so this is bounded and cannot flood the
+					// stepping path - the same discipline as ceilWorstDelta above.
+					if (margin < -1.0) {
+						sv.roofWarned = true;
+						log::error("MAP ROOF TOO LOW at x {:.0f}: the real ceiling here "
+						           "is {:.0f} but the map roof is {:.0f}, so {:.0f} units "
+						           "of reachable space have been deleted here. Either a "
+						           "portal that re-snaps the band is missing from the roof "
+						           "scan, or MOST RECENT (Z=2) took a lower cap than the "
+						           "section actually has.",
+						           sv.roofMarginMinX, sv.learnedCeiling, roofHere, -margin);
+					}
+				}
 			}
 		}
 
@@ -10135,7 +10272,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
 		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
 		          "archive {}c/{}r/{}f  gate {} free {}T/{}H  mute {}  "
-		          "ceil {}/{}c/{}p out {}/{}  "
+		          "ceil {}/{}c/{}p out {}/{}  roofMargin {}  "
 		          "dx {:.2f}/{:.2f}  vs map {:.2f}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
@@ -10152,6 +10289,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		              : fmt::format("{:.0f}", sv.learnedCeiling),
 		          sv.ceilingCrops,
 		          sv.portalEntries, sv.ceilOutside, sv.ceilInside,
+		          sv.roofMarginMin > 1e29
+		              ? std::string("--")
+		              : fmt::format("{:.0f}@{:.0f}", sv.roofMarginMin,
+		                            sv.roofMarginMinX),
 		          sv.dxPerStep,
 		          GeoMap::get().valid && m_player1
 		              ? GeoMap::get().speedAt(m_player1->getPositionX()) : 0.0,
@@ -11028,7 +11169,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			log::info("PORTAL objID {} at y {:.1f}  ->  raw {:.1f} snapped to ceiling "
 			          "{:.1f}, floor {:.1f} (band {:.0f})",
 			          object->m_objectID, sv.entryPortalY,
-			          sv.entryPortalY + g_config.geomCeilingOffset,
+			          sv.entryPortalY + ceilingOffsetForPortal(sv.entryPortalID),
 			          ceil, ceil - sv.entryBand(), sv.entryBand());
 			// getTargetFlyCameraY returned exactly the portal y on every entry so
 			// far (251->251, 345->345), so it looks like a position echo rather
