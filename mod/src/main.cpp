@@ -3229,10 +3229,12 @@ struct Solver {
 
 	// The portal the player last actually entered, from playerWillSwitchMode.
 	double                entryPortalY    = 0.0;
+	double                entryPortalX    = 0.0;
 	bool                  haveEntryPortal = false;
 	int                   entryPortalMode = -1;   // ModeClass at entry
 	int                   entryPortalID   = 0;    // objID, for the band height
 	uint64_t              portalEntries   = 0;
+	uint64_t              entryStaleDrops = 0;  // records dropped as rewound-past
 
 	// The band of the section the player is currently in. The floor of a band is
 	// its ceiling less this, never a second constant - see bandHeightForPortal.
@@ -3278,6 +3280,12 @@ struct Solver {
 	// legally occupy. Positive and large means the roof is doing nothing.
 	double                roofMarginMin   =  1e30;
 	double                roofMarginMinX  = 0.0;
+	// The min alone is one-sided: it proves the roof never deleted occupied
+	// space, and says nothing about a roof sitting so far above the ceiling that
+	// it removes nothing. A large mean is that failure.
+	double                roofMarginMax   = -1e30;
+	double                roofMarginSum   = 0.0;
+	uint64_t              roofMarginN     = 0;
 	uint64_t              ceilOutside     = 0;
 	uint64_t              ceilInside      = 0;
 	double                ceilWorstOut    = 0.0;
@@ -3571,12 +3579,17 @@ struct Solver {
 		roofWarned      = false;
 		roofMarginMin   =  1e30;
 		roofMarginMinX  = 0.0;
+		roofMarginMax   = -1e30;
+		roofMarginSum   = 0.0;
+		roofMarginN     = 0;
 		ceilingCrops    = 0;
 		entryPortalY    = 0.0;
+		entryPortalX    = 0.0;
 		haveEntryPortal = false;
 		entryPortalMode = -1;
 		entryPortalID   = 0;
 		portalEntries   = 0;
+		entryStaleDrops = 0;
 		ceilOffMin =  1e30;
 		ceilOffMax = -1e30;
 		camOffMin  =  1e30;
@@ -4498,6 +4511,16 @@ struct GeoMap {
 	double yLo = 0.0, yHi = 0.0;
 	double playerH = 15.0;         // smallest hitbox height: permissive
 	int  freeCount = 0, deadCount = 0;
+
+	// What the ROOF cost, measured at build time over EVERY slice - not just the
+	// ones the player reached. roofMargin can only ever check the paths actually
+	// walked, and on a stalled level the region past the stall is exactly where a
+	// bad crop would hide: a roof that deletes required space causes the stall
+	// that stops us from measuring it.
+	int    roofKilledSlices = 0;   // slices the roof emptied that were not empty
+	int    roofRemovedIvls  = 0;   // intervals the roof removed in total
+	double roofFirstKillX   = 0.0; // leftmost emptied slice, or 0
+	double roofSpaceRemoved = 0.0; // world units of free height the roof deleted
 	bool valid = false;
 
 	int segments() const { return static_cast<int>(xs.size()) - 1; }
@@ -4627,6 +4650,10 @@ bool geometryBuildMap() {
 	m.blocked.assign(n, {});
 	m.freeSpans.assign(n, {});
 	m.segRoof.assign(n, 0.f);
+	m.roofKilledSlices = 0;
+	m.roofRemovedIvls  = 0;
+	m.roofFirstKillX   = 0.0;
+	m.roofSpaceRemoved = 0.0;
 	m.yLo = ylo - 120.0;
 	m.yHi = yhi + 120.0;
 
@@ -4780,6 +4807,31 @@ bool geometryBuildMap() {
 		if (roofSi - cur >= m.playerH)
 			fr.push_back({static_cast<float>(cur), static_cast<float>(roofSi),
 			              static_cast<float>(cur), static_cast<float>(roofSi), false});
+
+		// The same complement with NO roof, purely to price the roof. Two numbers
+		// matter and they answer opposite questions: intervals removed says
+		// whether the roof is cutting out space, and a slice emptied outright says
+		// the map now claims the level is impossible there - which is never a
+		// legitimate answer, since the player has to pass through every slice.
+		if (roofSi < m.yHi - 0.5) {
+			int    ivlsNoRoof  = 0;
+			double spaceNoRoof = 0.0, spaceRoof = 0.0;
+			double c2 = m.yLo;
+			for (auto const& sp : merged) {
+				const double top = static_cast<double>(sp.lo);
+				if (top - c2 >= m.playerH) { ivlsNoRoof++; spaceNoRoof += top - c2; }
+				c2 = std::max(c2, static_cast<double>(sp.hi));
+			}
+			if (m.yHi - c2 >= m.playerH) { ivlsNoRoof++; spaceNoRoof += m.yHi - c2; }
+			for (auto const& f : fr) spaceRoof += f.hi - f.lo;
+
+			m.roofRemovedIvls += std::max(0, ivlsNoRoof - static_cast<int>(fr.size()));
+			m.roofSpaceRemoved += std::max(0.0, spaceNoRoof - spaceRoof);
+			if (fr.empty() && ivlsNoRoof > 0) {
+				if (m.roofKilledSlices == 0) m.roofFirstKillX = m.xs[si];
+				m.roofKilledSlices++;
+			}
+		}
 		m.freeSpans[si] = fr;
 	}
 
@@ -4874,6 +4926,23 @@ bool geometryBuildMap() {
 
 	for (auto const& col : m.freeSpans)
 		for (auto const& f : col) { m.freeCount++; if (!f.live) m.deadCount++; }
+
+	// What the roof cost, over every slice in the level rather than the ones the
+	// player happened to reach. A slice emptied outright is never legitimate -
+	// the player must pass through every x, so a slice with no free interval says
+	// the map has declared the level impossible there.
+	if (g_config.geomPortalRoof > 0) {
+		if (m.roofKilledSlices > 0)
+			log::error("ROOF EMPTIED {} slices, first at x {:.0f}. The map now says "
+			           "the level cannot be passed there at all, which cannot be "
+			           "right - the roof is cutting out space that is needed.",
+			           m.roofKilledSlices, m.roofFirstKillX);
+		log::info("Solver: roof audit - removed {} intervals and {:.0f} units of "
+		          "free height across {} slices, {} emptied. Removed height per "
+		          "slice averages {:.0f}.",
+		          m.roofRemovedIvls, m.roofSpaceRemoved, n, m.roofKilledSlices,
+		          n > 0 ? m.roofSpaceRemoved / n : 0.0);
+	}
 
 	m.valid = true;
 	return true;
@@ -9090,6 +9159,29 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			                + g_config.geomCeilingFieldOffset, sizeof f);
 			fromField = static_cast<double>(f);
 		}
+		// A restore can land the search BEHIND the portal whose entry is still
+		// recorded. playerWillSwitchMode only fires going forward, so nothing
+		// un-sets the record when the search rewinds through a portal, and the
+		// rule then answers for a section the player is no longer in.
+		//
+		// MEASURED on Clutterfunk: at x 15765 the record named the ship portal at
+		// x 15914 - 149 units AHEAD - while the player was back in the ball
+		// section that runs 10796..15868. The ground clamp took the ship band and
+		// answered 390 where the field read 330.
+		//
+		// Being behind your own entry portal is provable rather than guessed, so
+		// this drops the record instead of clearing on every restore - the search
+		// restores thousands of times a second, and blanket clearing would leave
+		// haveDerived false almost always and silence the cross-check entirely.
+		// Stepping forward re-enters the portal and the hook re-arms it.
+		if (sv.haveEntryPortal &&
+		    p->getPositionX() < sv.entryPortalX - g_config.geomRoofLeadX) {
+			sv.haveEntryPortal = false;
+			sv.entryPortalMode = -1;
+			sv.entryPortalID   = 0;
+			sv.entryStaleDrops++;
+		}
+
 		const bool haveDerived = sv.haveEntryPortal &&
 		                         static_cast<int>(classifyMode(p)) == sv.entryPortalMode;
 		const double derived = haveDerived
@@ -9101,7 +9193,27 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// Cross-check. The two were built from the same eight contacts, so a
 			// disagreement means the field moved or the rule does not generalise -
 			// either way it must be loud, not silent.
-			if (haveDerived) {
+			// Not across a portal transition. The two sources are sampled at
+			// different instants and genuinely disagree for a few steps either
+			// side of a portal, in BOTH directions - measured:
+			//
+			//   BAB x 17960, portal centre 17985: the record had ALREADY moved to
+			//     the cube portal (rule 420) while the field still read the ship
+			//     section it had not yet left (390). playerWillSwitchMode fires on
+			//     hitbox contact, up to ~31 units early.
+			//   Clubstep x 15746, portal centre 15741: the mirror case, the record
+			//     promoted and the field still reporting the outgoing section.
+			//
+			// Both were reported as `delta 30` and `delta 60` disagreements and
+			// neither was one - their implied bands came out 240 and 400 for the
+			// same objID, which is how you know both were artefacts. Distance
+			// rather than a step count because dx per step varies with speed, and
+			// geomRoofLeadX because it is the same lead the roof already corrects
+			// for.
+			const bool nearPortal =
+				sv.haveEntryPortal &&
+				std::abs(p->getPositionX() - sv.entryPortalX) < g_config.geomRoofLeadX;
+			if (haveDerived && !nearPortal) {
 				const double d = std::abs(fromField - derived);
 				// Was 30.0, and the ball offset error was EXACTLY 30.0, so the
 				// guard missed the one defect it existed to catch. Half a block
@@ -9203,6 +9315,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (si >= 0 && si < static_cast<int>(gm.segRoof.size())) {
 				const double roofHere = gm.segRoof[static_cast<size_t>(si)];
 				const double margin   = roofHere - sv.learnedCeiling;
+				sv.roofMarginMax = std::max(sv.roofMarginMax, margin);
+				sv.roofMarginSum += margin;
+				sv.roofMarginN++;
 				if (margin < sv.roofMarginMin) {
 					sv.roofMarginMin  = margin;
 					sv.roofMarginMinX = p->getPositionX();
@@ -10317,7 +10432,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
 		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
 		          "archive {}c/{}r/{}f  gate {} free {}T/{}H  mute {}  "
-		          "ceil {}/{}c/{}p out {}/{}  roofMargin {}  "
+		          "ceil {}/{}c/{}p/{}s out {}/{}  roofMargin {}  "
 		          "dx {:.2f}/{:.2f}  vs map {:.2f}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
 		          sv.bestPct, sv.stack.size(), sv.deaths, sv.restores, sv.escapes, sv.steps,
@@ -10333,11 +10448,15 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		              ? std::string("--")
 		              : fmt::format("{:.0f}", sv.learnedCeiling),
 		          sv.ceilingCrops,
-		          sv.portalEntries, sv.ceilOutside, sv.ceilInside,
+		          sv.portalEntries, sv.entryStaleDrops,
+		          sv.ceilOutside, sv.ceilInside,
 		          sv.roofMarginMin > 1e29
 		              ? std::string("--")
-		              : fmt::format("{:.0f}@{:.0f}", sv.roofMarginMin,
-		                            sv.roofMarginMinX),
+		              : fmt::format("{:.0f}@{:.0f}/{:.0f}/{:.0f}",
+		                            sv.roofMarginMin, sv.roofMarginMinX,
+		                            sv.roofMarginN ? sv.roofMarginSum / sv.roofMarginN
+		                                           : 0.0,
+		                            sv.roofMarginMax),
 		          sv.dxPerStep,
 		          GeoMap::get().valid && m_player1
 		              ? GeoMap::get().speedAt(m_player1->getPositionX()) : 0.0,
@@ -11199,6 +11318,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		auto& sv = Solver::get();
 		sv.entryPortalY    = object->getPositionY();
+		sv.entryPortalX    = object->getPositionX();
 		sv.haveEntryPortal = true;
 		sv.entryPortalMode = static_cast<int>(classifyMode(player));
 		// Recorded because the band depends on the mode entered, and ModeClass is
