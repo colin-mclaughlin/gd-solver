@@ -2532,11 +2532,16 @@ void reportDivergence(int endStep, bool passed) {
 	writeVerifyDiff();
 }
 
+void pathAuditReport();   // Probe 17, defined with the map probes below
+
 void finishVerify(bool completed, int atStep, float pct) {
 	auto& st = ProbeState::get();
 	auto* plv = PlayLayer::get();
 	log::info("================ VERIFICATION (practice {}) ================",
 	          plv && plv->m_isPracticeMode ? "ON" : "OFF");
+	// Whether the replay passed or died, every step of it was checked
+	// against the map, and the disagreement is the point.
+	pathAuditReport();
 	if (completed) {
 		if (st.verifyDivergeStep >= 0) {
 			// A pass is not the same as a match. The search flew one trajectory and
@@ -2911,6 +2916,18 @@ double bandHeightForPortal(int objID) {
 //
 // This error was invisible because it is EXACTLY 30 on a ball and the
 // cross-check in ceilingUpdate fired on `d > 30.0`. It missed by nothing.
+// Portals that END a wall-limited section rather than starting one. Cube is
+// the only one confirmed: it is not wall-limited, so nothing should cap the
+// roof after it until the next real mode portal.
+//
+// Deliberately NOT a guess-list. Every ID added to the roof scan by inference
+// has cost a level - gravity portals were added because a 390 ceiling happened
+// to sit near one, and that raised Base After Base's roof from 386 to 630.
+// This one is here because Probe 17 measured the deletion it causes.
+bool isRoofReleasePortal(int objID) {
+	return objID == 12;
+}
+
 double ceilingOffsetForPortal(int objID) {
 	return bandHeightForPortal(objID) * 0.5 - 15.0;
 }
@@ -3403,6 +3420,66 @@ struct Solver {
 	// is a LOWER bound on capability. It can prove 2.60 is too tight; it cannot
 	// prove 2.60 is enough.
 	double                maxClimb[4][2][5][2] = {};
+
+	// Probe 16: the vertical ENVELOPE, for the liveness reach model.
+	//
+	// Keyed on the game's OWN m_playerSpeed, not on observed dx. The first cut
+	// bucketed dx and it failed: in free flight an update() call does not
+	// reliably cover exactly one physics step, so a two-step sample at slow
+	// speed reads dx 2.09 and masquerades as 3x - which is precisely what the
+	// first run produced, and why normal-size ship never registered below 3x at
+	// all. Knowing the speed independently makes dx a CHECK rather than a key.
+	//
+	// The reported figure is slope x the canonical per-step dx. Slope is
+	// frame-rate free, so it stays correct however many steps a sample spanned,
+	// and it was the only column of the first run that survived.
+	//
+	// [mode][mini][speed][dir], dir 0 = world up. Not cleared with the solver:
+	// a measurement session spans several attempts and restarting the level
+	// must not discard it.
+	double                envMaxSlope[8][2][5][2] = {};
+	// Read rather than inferred. m_yVelocity is the game's own vertical
+	// velocity, so it sidesteps the whole question of how many physics steps an
+	// update() call covered - the slope figure stays as the independent
+	// cross-check. m_fallSpeed and m_gravity are the mode's own constants and
+	// may hand us terminal velocity directly instead of us measuring toward it.
+	double                envMaxVy[8][2][5][2]      = {};
+	double                envSumGravity[8][2][5][2] = {};
+	double                envSumFall[8][2][5][2]    = {};
+	double                envSumSpdMul[8][2][5][2]  = {};
+	double                envSumGravMod[8][2][5][2] = {};
+	uint64_t              envUpsideN[8][2][5][2]    = {};
+	double                envSumDx[8][2][5][2]    = {};
+	double                envSumRaw[8][2][5][2]   = {};  // observed m_playerSpeed
+	uint64_t              envN[8][2][5][2]        = {};
+	uint64_t              envNearN[8][2][5][2]    = {};  // within 5% of max slope
+	bool                  envLocked[8][2][5][2]   = {};
+	uint64_t              envRejected             = 0;   // repositions
+	uint64_t              envStationary           = 0;   // pinned or at rest
+
+	// Probe 17: audit a KNOWN-GOOD path against the map.
+	//
+	// Every argument about whether the liveness sweep is too strict has been
+	// made from the geometry, and the geometry is exactly what is in question.
+	// A solved macro settles it without any of that: the trajectory physically
+	// happened, so anywhere the map disagrees with it, the MAP is wrong.
+	uint64_t              pathAuditSteps   = 0;
+	uint64_t              pathOffMap       = 0;  // no interval holds the player
+	uint64_t              pathDead         = 0;  // in an interval marked dead
+	uint64_t              pathOutWindow    = 0;  // live, but outside its window
+	double                pathFirstOffX    = -1.0, pathFirstOffY  = 0.0;
+	double                pathFirstDeadX   = -1.0, pathFirstDeadY = 0.0;
+	double                pathFirstOutX    = -1.0, pathFirstOutY  = 0.0;
+	double                pathWorstOff     = 0.0,  pathWorstOffX  = 0.0;
+	// WHERE the off-map steps are, in twentieths of the mapped x range. First
+	// and worst were not enough: they said the crop's deepest point was at
+	// x 28649, and left open whether the bulk of it sat before or after the
+	// wall - which is the whole question of whether the crop causes the stall
+	// or merely coexists with it.
+	uint64_t              pathOffBin[20]   = {};
+	double                pathOffBinWorst[20] = {};
+	double                envPrevX = 0.0, envPrevY = 0.0;
+	bool                  envHavePrev = false;
 
 	// Which speed column a measured dx belongs in: nearest of the five, split
 	// at the midpoints.
@@ -4606,6 +4683,22 @@ bool geometryBuildMap() {
 				                         static_cast<double>(o->getPositionY()));
 				bandPortalID.push_back(o->m_objectID);
 				break;
+
+			// The cube portal. Collected as a RELEASE rather than ignored.
+			//
+			// Cube is not wall-limited, so no camera band applies to it - but
+			// leaving it out of the scan did not mean 'no cap there', it meant
+			// the PREVIOUS section's cap stood for the rest of the level.
+			// MEASURED on Clutterfunk: its last ship portal caps at 390 and the
+			// cube section that follows inherited it, so the winning macro spent
+			// 1004 steps outside the map, up to 213 units above the roof, all of
+			// it past x 25056. Probe 17 against the default map put the same
+			// path at 4 steps, so that is the whole of the difference.
+			case 12:
+				bandPortals.emplace_back(static_cast<double>(o->getPositionX()),
+				                         static_cast<double>(o->getPositionY()));
+				bandPortalID.push_back(o->m_objectID);
+				break;
 			default: break;
 		}
 
@@ -4703,10 +4796,18 @@ bool geometryBuildMap() {
 				// The running maximum is over CAPS, not raw portal y, so a mode
 				// with a shorter band cannot be dragged up by a taller one's
 				// position alone.
-				const double py = std::get<1>(bp[pi]);
-				const double bh = bandHeightForPortal(std::get<2>(bp[pi]));
-				double c = std::round((py + ceilingOffsetForPortal(std::get<2>(bp[pi]))) / g) * g;
-				c = std::max(c, g_config.geomGroundY + bh);   // rest on the ground
+				const double py  = std::get<1>(bp[pi]);
+				const int    pid = std::get<2>(bp[pi]);
+				const double bh  = bandHeightForPortal(pid);
+				// A release portal has no band: its cap is the whole map, which
+				// lets MOST RECENT drop the previous section's cap and makes
+				// PREFIX MAX uncapped from there on - each mode's own semantics,
+				// applied to 'this section is not wall-limited'.
+				double c = m.yHi;
+				if (!isRoofReleasePortal(pid)) {
+					c = std::round((py + ceilingOffsetForPortal(pid)) / g) * g;
+					c = std::max(c, g_config.geomGroundY + bh);  // rest on the ground
+				}
 				// Mode 1 keeps the running maximum; mode 2 takes the most
 				// recent portal's cap, so a lower section can lower the roof.
 				run = (g_config.geomPortalRoof >= 2) ? c : std::max(run, c);
@@ -4741,8 +4842,11 @@ bool geometryBuildMap() {
 				const double py = std::get<1>(t);
 				const int    pid = std::get<2>(t);
 				const double bh = bandHeightForPortal(pid);
-				double c = std::round((py + ceilingOffsetForPortal(pid)) / g) * g;
-				c = std::min(m.yHi, std::max(c, g_config.geomGroundY + bh));
+				double c = m.yHi;
+				if (!isRoofReleasePortal(pid)) {
+					c = std::round((py + ceilingOffsetForPortal(pid)) / g) * g;
+					c = std::min(m.yHi, std::max(c, g_config.geomGroundY + bh));
+				}
 				const double x0 = px - g_config.geomRoofLeadX;
 				for (int si = 0; si < n; si++) {
 					if (m.xs[si + 1] <= x0) continue;
@@ -6027,6 +6131,180 @@ bool keyPressedEdge(int vk) {
 	return edge;
 }
 
+// Probe 17. One step of a verify replay, checked against the map as built.
+//
+// Classified three ways because they mean different things. OFF-MAP is the
+// loudest: the player is somewhere the map has no interval for at all, which
+// on a cropped map means the roof deleted space the winning run occupied.
+// DEAD means the interval exists but the sweep says the end is unreachable
+// from it - a false negative, since the run reached the end from there.
+// OUT-OF-WINDOW is the mildest: the space is live but the steering would
+// never have aimed at it.
+void pathAuditStep(PlayerObject* p) {
+	auto& m  = GeoMap::get();
+	auto& sv = Solver::get();
+	if (!m.valid || !p || p->m_isDead) return;
+	const double x = p->getPositionX();
+	const int si = m.segIndex(x);
+	if (si < 0) return;
+	const cocos2d::CCRect r = p->getObjectRect();
+	const double lo = r.origin.y, hi = r.origin.y + r.size.height;
+	sv.pathAuditSteps++;
+
+	// Overlap rather than containment: the hitbox is the player, and the
+	// interval holding most of it is the one they are in.
+	const GeoMap::Free* best = nullptr;
+	double bestOv = 0.0;
+	for (auto const& f : m.freeSpans[static_cast<size_t>(si)]) {
+		const double ov = std::min(hi, static_cast<double>(f.hi)) -
+		                  std::max(lo, static_cast<double>(f.lo));
+		if (ov > bestOv) { bestOv = ov; best = &f; }
+	}
+	if (!best) {
+		sv.pathOffMap++;
+		if (sv.pathFirstOffX < 0.0) { sv.pathFirstOffX = x; sv.pathFirstOffY = lo; }
+		// How far above the roof the player actually was - the number that says
+		// what the crop cost.
+		const double roof = si < static_cast<int>(m.segRoof.size())
+		                  ? static_cast<double>(m.segRoof[static_cast<size_t>(si)])
+		                  : m.yHi;
+		const double over = lo - roof;
+		if (over > sv.pathWorstOff) { sv.pathWorstOff = over; sv.pathWorstOffX = x; }
+		if (m.xs.size() > 1) {
+			const double span = m.xs.back() - m.xs.front();
+			int b = span > 1.0
+			      ? static_cast<int>(20.0 * (x - m.xs.front()) / span) : 0;
+			b = b < 0 ? 0 : b > 19 ? 19 : b;
+			sv.pathOffBin[b]++;
+			sv.pathOffBinWorst[b] = std::max(sv.pathOffBinWorst[b], over);
+		}
+		return;
+	}
+	if (!best->live) {
+		sv.pathDead++;
+		if (sv.pathFirstDeadX < 0.0) { sv.pathFirstDeadX = x; sv.pathFirstDeadY = lo; }
+		return;
+	}
+	if (hi < best->wlo || lo > best->whi) {
+		sv.pathOutWindow++;
+		if (sv.pathFirstOutX < 0.0) { sv.pathFirstOutX = x; sv.pathFirstOutY = lo; }
+	}
+}
+
+void pathAuditReport() {
+	auto& sv = Solver::get();
+	if (!sv.pathAuditSteps) return;
+	const double n = static_cast<double>(sv.pathAuditSteps);
+	log::info("Probe 17: the winning path against this map - {} steps checked, "
+	          "roof mode {}.", sv.pathAuditSteps, g_config.geomPortalRoof);
+	log::info("  OFF-MAP {} ({:.2f}%)  DEAD {} ({:.2f}%)  OUT-OF-WINDOW {} ({:.2f}%)",
+	          sv.pathOffMap,    100.0 * sv.pathOffMap    / n,
+	          sv.pathDead,      100.0 * sv.pathDead      / n,
+	          sv.pathOutWindow, 100.0 * sv.pathOutWindow / n);
+	if (sv.pathOffMap)
+		log::error("  OFF-MAP first at x {:.0f} y {:.0f}; worst {:.0f} units above "
+		           "the roof at x {:.0f}. The run was there, so the MAP is wrong.",
+		           sv.pathFirstOffX, sv.pathFirstOffY,
+		           sv.pathWorstOff, sv.pathWorstOffX);
+	if (sv.pathDead)
+		log::error("  DEAD first at x {:.0f} y {:.0f}. The run reached the end from "
+		           "there, so the liveness sweep has a FALSE NEGATIVE.",
+		           sv.pathFirstDeadX, sv.pathFirstDeadY);
+	if (sv.pathOutWindow)
+		log::warn("  OUT-OF-WINDOW first at x {:.0f} y {:.0f} - live space the "
+		          "steering would not have aimed at.",
+		          sv.pathFirstOutX, sv.pathFirstOutY);
+	if (sv.pathOffMap) {
+		auto const& m = GeoMap::get();
+		const double x0 = m.xs.empty() ? 0.0 : m.xs.front();
+		const double sp = (m.xs.size() > 1 ? m.xs.back() : 0.0) - x0;
+		log::info("  where the off-map steps are (x range, count, deepest):");
+		for (int b = 0; b < 20; b++) {
+			if (!sv.pathOffBin[b]) continue;
+			log::info("    x {:6.0f}..{:<6.0f} ({:2.0f}-{:2.0f}%)  {:>6} steps  "
+			          "deepest {:.0f} units above the roof",
+			          x0 + sp * b / 20.0, x0 + sp * (b + 1) / 20.0,
+			          5.0 * b, 5.0 * (b + 1),
+			          sv.pathOffBin[b], sv.pathOffBinWorst[b]);
+		}
+	}
+	if (!sv.pathOffMap && !sv.pathDead)
+		log::info("  The winning path stays inside live space the whole way. This "
+		          "map is not deleting this route - the fault is downstream, in "
+		          "the steering and the window, not in liveness.");
+}
+
+// Probe 16 readout. Every flown cell is printed with the evidence beside it,
+// and the footer names what is still missing, so the table says what is left
+// to do rather than leaving it to memory.
+void climbEnvelopeDump() {
+	auto& sv = Solver::get();
+	static const char* kM[8] = {"cube","ship","wave","ufo",
+	                            "ball","robot","spider","swing"};
+	static const char* kS[5] = {"0.5x","1x","2x","3x","4x"};
+	static const double kDx[5] = {kSpeedSlow, kSpeedNormal, kSpeedFast,
+	                              kSpeedFaster, kSpeedFastest};
+	log::info("Probe 16: vertical envelope. Reported figure is slope x the "
+	          "canonical per-step dx, which is frame-rate free. The map's reach "
+	          "model assumes {:.3f} for every mode at every speed.",
+	          static_cast<double>(g_config.geomVerticalReach) /
+	              std::max(1.0, static_cast<double>(g_config.geomSliceX)) *
+	              kSpeedNormal);
+	log::info("  mode    size  speed   up/step  dn/step | vy up/dn (the game's own "
+	          "m_yVelocity) | samples | state - second line is the game's "
+	          "constants and the checks on my assumptions");
+	int flown = 0, done = 0;
+	for (int mo = 0; mo < 8; mo++)
+		for (int sz = 0; sz < 2; sz++)
+			for (int sp = 0; sp < 5; sp++) {
+				const uint64_t nU = sv.envN[mo][sz][sp][0];
+				const uint64_t nD = sv.envN[mo][sz][sp][1];
+				if (!nU && !nD) continue;
+				flown++;
+				const bool ok = sv.envLocked[mo][sz][sp][0] && sv.envLocked[mo][sz][sp][1];
+				if (ok) done++;
+				const double raw = (sv.envSumRaw[mo][sz][sp][0] + sv.envSumRaw[mo][sz][sp][1]) /
+				                   static_cast<double>(nU + nD);
+				const double mdx = (sv.envSumDx[mo][sz][sp][0] + sv.envSumDx[mo][sz][sp][1]) /
+				                   static_cast<double>(nU + nD);
+				const uint64_t nAll = nU + nD;
+				log::info("  {:<7} {:<5} {:<6}  {:7.3f}  {:7.3f} | vy {:7.3f} {:7.3f} | "
+				          "n {:>6}/{:<6} at-max {:>4}/{:<4}  {}",
+				          kM[mo], sz ? "mini" : "norm", kS[sp],
+				          sv.envMaxSlope[mo][sz][sp][0] * kDx[sp],
+				          sv.envMaxSlope[mo][sz][sp][1] * kDx[sp],
+				          sv.envMaxVy[mo][sz][sp][0], sv.envMaxVy[mo][sz][sp][1],
+				          nU, nD, sv.envNearN[mo][sz][sp][0], sv.envNearN[mo][sz][sp][1],
+				          ok ? "done"
+				             : !nU ? "NEVER FLEW UP"
+				             : !nD ? "NEVER FLEW DOWN"
+				             : "thin - hold longer");
+				// The game's own constants, and the checks on my guesses. If
+				// rawSpeed is not near one of 0.7/0.9/1.1/1.3/1.6 the speed
+				// mapping is wrong; if meanDx is not near want the step
+				// filter is; if upside is not 0 the cell mixes gravity
+				// directions and up/dn mean different things in it.
+				log::info("          raw {:.3f}  dx {:.3f}/{:.3f} (span {:.2f} steps)  "
+				          "gravity {:.4f}  "
+				          "fallSpeed {:.4f}  spdMul {:.4f}  gravMod {:.3f}  "
+				          "upside {:.0f}%",
+				          raw, mdx, kDx[sp], mdx / kDx[sp],
+				          (sv.envSumGravity[mo][sz][sp][0]+sv.envSumGravity[mo][sz][sp][1])/nAll,
+				          (sv.envSumFall[mo][sz][sp][0]+sv.envSumFall[mo][sz][sp][1])/nAll,
+				          (sv.envSumSpdMul[mo][sz][sp][0]+sv.envSumSpdMul[mo][sz][sp][1])/nAll,
+				          (sv.envSumGravMod[mo][sz][sp][0]+sv.envSumGravMod[mo][sz][sp][1])/nAll,
+				          100.0*(sv.envUpsideN[mo][sz][sp][0]+sv.envUpsideN[mo][sz][sp][1])/nAll);
+			}
+	log::info("  {} cells touched, {} complete. {} repositions and {} "
+	          "stationary frames skipped. A cell is complete at 150+ samples "
+	          "and 30+ at-max per direction - terminal velocity is sustained, "
+	          "so a low at-max means the figure is a stray frame.",
+	          flown, done, sv.envRejected, sv.envStationary);
+	if (!flown)
+		log::warn("  Nothing recorded. Probe 16 samples in FREE FLIGHT only - never "
+		          "while the solver is running.");
+}
+
 void pollHotkeys() {
 	auto& st = ProbeState::get();
 
@@ -6407,6 +6685,9 @@ void pollHotkeys() {
 	// R = reach sweep (Probe 9). Read-only; rebuilds the map several times and
 	// leaves it as it found it.
 	if (keyPressedEdge('R')) geometryReachSweep();
+
+	// S = vertical envelope (Probe 16). Read-only.
+	if (keyPressedEdge('S')) climbEnvelopeDump();
 
 	// H = dead-end map (Probe 8). Read-only, same as G.
 	if (keyPressedEdge('H')) {
@@ -11040,6 +11321,121 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	// Probe 12: print every ceiling candidate, live, while the level is played by
 	// hand. See liveCeilingReadout. Called from update(), so it runs in normal
 	// play rather than only inside the solver's step.
+	// Which of the five speeds the game says we are in, and its canonical
+	// per-step dx. m_playerSpeed's absolute values are not assumed - the index
+	// is the nearest of the five known multipliers and the RAW value is
+	// reported back, so a wrong guess is visible in the table rather than
+	// silently mis-filing every sample.
+	static int envSpeedIndex(float ps) {
+		static const float kMul[5] = {0.7f, 0.9f, 1.1f, 1.3f, 1.6f};
+		int best = 1; float bd = 1e9f;
+		for (int i = 0; i < 5; i++) {
+			const float d = std::abs(ps - kMul[i]);
+			if (d < bd) { bd = d; best = i; }
+		}
+		return best;
+	}
+	static double envSpeedDx(int i) {
+		static const double kDx[5] = {kSpeedSlow, kSpeedNormal, kSpeedFast,
+		                              kSpeedFaster, kSpeedFastest};
+		return kDx[i < 0 ? 0 : i > 4 ? 4 : i];
+	}
+
+	// Probe 16. Runs in FREE FLIGHT only - same guard as liveCeilingStep - so it
+	// never sees a savestate restore and never competes with the solver's own
+	// sampler.
+	void climbEnvelopeStep() {
+		auto* p  = m_player1;
+		auto* pl = PlayLayer::get();
+		if (!p || !pl || p->m_isDead) return;
+		if (Solver::get().running || ProbeState::get().mode != Mode::Idle) return;
+
+		auto& sv = Solver::get();
+		const double nx = p->getPositionX();
+		const double ny = p->getPositionY();
+		if (!sv.envHavePrev) {
+			sv.envPrevX = nx; sv.envPrevY = ny; sv.envHavePrev = true; return;
+		}
+		const double dx    = nx - sv.envPrevX;
+		const double rawDy = ny - sv.envPrevY;
+		sv.envPrevX = nx; sv.envPrevY = ny;
+		if (!(dx > 0.01 && dx < 20.0)) return;   // a reposition, not a step
+		const double dy = std::abs(rawDy);
+		if (dy >= 200.0) return;                 // a teleport, not motion
+
+		// NOT MOVING is not a direction. Direction comes from the sign of dy,
+		// so a ship pinned against the camera ceiling - or resting on the
+		// floor - produced dy 0 and filed as an UP sample worth 0.000. On the
+		// 3x corridor that was 329 of them, which locked the cell at zero and
+		// buried the real figure. A stationary frame says nothing about how
+		// far the player CAN move, so it is not a sample at all.
+		if (dy < 0.01 || std::abs(p->m_yVelocity) < 0.01) {
+			sv.envStationary++; return;
+		}
+
+		const int mode = p->m_isShip ? 1 : p->m_isDart ? 2 : p->m_isBird ? 3
+		               : p->m_isBall ? 4 : p->m_isRobot ? 5 : p->m_isSpider ? 6
+		               : p->m_isSwing ? 7 : 0;
+		const int size = p->m_vehicleSize < 0.9f ? 1 : 0;
+		const int dir  = rawDy >= 0.0 ? 0 : 1;   // world up, not player up
+		const int spd  = envSpeedIndex(p->m_playerSpeed);
+
+		// dx is a DIAGNOSTIC, not a filter. The previous version rejected any
+		// sample whose dx was not one step's worth and threw away every last
+		// one - 3724 of 3724 - which was the same mistake twice over: free
+		// flight runs at 1/120 with the delta hook returning 1/240, so an
+		// update() call covers TWO physics steps and no sample could ever
+		// match. It did not matter anyway. Both figures recorded here are
+		// frame-rate free: m_yVelocity is read at the instant of sampling,
+		// and slope is dy/dx with the span cancelling out of both halves.
+		// Only an outright reposition is worth discarding.
+		const double want  = envSpeedDx(spd);
+		const double spanF = dx / want;          // ~ how many steps this covered
+		if (spanF < 0.25 || spanF > 8.0) { sv.envRejected++; return; }
+
+		// States where vertical motion is not the mode's own physics. An open
+		// corridor has none of these, so rejecting them costs nothing there
+		// and stops a stray dash or slope frame from setting the envelope.
+		if (p->m_isDashing || p->m_isOnSlope || p->m_isSideways) {
+			sv.envRejected++; return;
+		}
+
+		const double slope = dy / dx;
+		double& sl = sv.envMaxSlope[mode][size][spd][dir];
+		// A max alone cannot be trusted: one bad frame sets it forever. Terminal
+		// velocity is SUSTAINED, so the count of samples sitting at the top is
+		// the evidence that a max is the envelope and not a stray.
+		if (slope > sl) { if (slope > sl * 1.05) sv.envNearN[mode][size][spd][dir] = 0; sl = slope; }
+		if (slope >= sl * 0.95) sv.envNearN[mode][size][spd][dir]++;
+		double& vy = sv.envMaxVy[mode][size][spd][dir];
+		vy = std::max(vy, std::abs(p->m_yVelocity));
+		sv.envSumDx     [mode][size][spd][dir] += dx;
+		sv.envSumRaw    [mode][size][spd][dir] += p->m_playerSpeed;
+		sv.envSumGravity[mode][size][spd][dir] += p->m_gravity;
+		sv.envSumFall   [mode][size][spd][dir] += p->m_fallSpeed;
+		sv.envSumSpdMul [mode][size][spd][dir] += p->m_speedMultiplier;
+		sv.envSumGravMod[mode][size][spd][dir] += p->m_gravityMod;
+		if (p->m_isUpsideDown) sv.envUpsideN[mode][size][spd][dir]++;
+		sv.envN         [mode][size][spd][dir]++;
+
+		// Say so the moment a direction is nailed down, so a corridor can be
+		// left as soon as it is done instead of being flown on guesswork and
+		// checked afterwards.
+		if (!sv.envLocked[mode][size][spd][dir] &&
+		    sv.envN[mode][size][spd][dir] >= 150 &&
+		    sv.envNearN[mode][size][spd][dir] >= 30) {
+			sv.envLocked[mode][size][spd][dir] = true;
+			static const char* kM[8] = {"cube","ship","wave","ufo",
+			                            "ball","robot","spider","swing"};
+			static const char* kS[5] = {"0.5x","1x","2x","3x","4x"};
+			const bool both = sv.envLocked[mode][size][spd][0] &&
+			                  sv.envLocked[mode][size][spd][1];
+			log::info("Probe 16: {} {} {} {} LOCKED at {:.3f} units/step{}",
+			          kM[mode], size ? "mini" : "norm", kS[spd],
+			          dir ? "DOWN" : "UP", sl * want,
+			          both ? " - corridor complete, move on." : "");
+		}
+	}
 	void liveCeilingStep() {
 		if (!g_config.liveCeilingReadout) return;
 		auto* p  = m_player1;
@@ -11349,6 +11745,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	void update(float dt) {
 		pollHotkeys();
 		liveCeilingStep();
+		climbEnvelopeStep();
 
 		auto& st = ProbeState::get();
 		auto* pl = PlayLayer::get();
@@ -11418,6 +11815,17 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			log::debug("attempt start: m_currentStep = {}", m_currentStep);
 		}
 		if (st.mode == Mode::Verify) {
+			// Fresh per replay, so the same macro run against two different maps
+			// can be compared directly. Here rather than in startVerify, which is
+			// declared above Solver and cannot see it.
+			if (st.stepCounter == 0) {
+				auto& sv = Solver::get();
+				sv.pathAuditSteps = sv.pathOffMap = sv.pathDead = sv.pathOutWindow = 0;
+				sv.pathFirstOffX = sv.pathFirstDeadX = sv.pathFirstOutX = -1.0;
+				sv.pathWorstOff  = sv.pathWorstOffX  = 0.0;
+				std::memset(sv.pathOffBin, 0, sizeof(sv.pathOffBin));
+				std::memset(sv.pathOffBinWorst, 0, sizeof(sv.pathOffBinWorst));
+			}
 			const size_t idx = static_cast<size_t>(st.stepCounter);
 
 			// Past the end of the macro: keep stepping with no input for a short
@@ -11454,6 +11862,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				GJBaseGameLayer::update(g_config.physicsFix
 				                        ? static_cast<float>(kPhysicsDt) : dt);
 				st.stepCounter++;
+				pathAuditStep(m_player1);
 				compareAgainstSolvePath(pressed, k);
 				if (st.finished) {
 					finishVerify(true, static_cast<int>(st.stepCounter),
