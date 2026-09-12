@@ -145,7 +145,6 @@ struct Config {
 	// This TRADES AWAY strict completeness, which was the main argument for DFS
 	// over beam. Set stallLimit to 0 to disable and get pure DFS back.
 	int stallLimit  = 400;
-	int escapeJump  = 200;
 
 	// Replace the escape heuristic's blind rewind with a return to an archived
 	// cell. A toggles it; default off so the 14-level baseline is untouched.
@@ -171,6 +170,78 @@ struct Config {
 	// shows a search that repeats and wanders. The table stays on the shelf and
 	// composes on top of this later.
 	bool escapeArchiveRestart = false;
+
+	// Let tap state go STALE across a reposition instead of restoring it.
+	//
+	// RESTORED AS A BISECT, not as a recommendation. Default false, which is
+	// bit-for-bit the current baseline.
+	//
+	// The history, which is the whole reason this is back:
+	//
+	//   5555e42   introduced at true.  Theory of Everything 78.90%.
+	//   9803757   CLUBSTEP CLEARS - first demon.  Still true.
+	//   6f7562d   flipped to false.
+	//   c57f14d   deleted.
+	//
+	// 6f7562d justified the flip on two levels. Theory of Everything came out
+	// equal. Clutterfunk was a NULL TEST and that commit says so in those words -
+	// it reports `free 0T`, generating no Tap gate evaluations at all, so it
+	// cannot exercise this flag in either position. CLUBSTEP WAS NEVER RE-RUN,
+	// and Clubstep is the level in the suite with the heavy UFO section and the
+	// level now stalling in one.
+	//
+	// The mechanism, from 6f7562d's own comment. decisionCost charges Tap as
+	// `choice ? 1 : 0`, and the gate asks what the ALTERNATIVE costs, so which
+	// branch is free depends on which way the decision was pushed:
+	//
+	//   pushed choice=false (no tap)  ->  alternative is tap,    costs 1, GATED
+	//   pushed choice=true  (tap)     ->  alternative is no-tap, costs 0, FREE
+	//
+	// Stale tapRemaining means the countdown never fires, sv.hold outlives the
+	// tap, and the next Tap decision is pushed HELD - so its alternative is free.
+	// Measured at ~8% of UFO branches escaping the toggle budget.
+	//
+	// Read it as a release valve on a budget that charges every flap 1 while
+	// charging a ship climb of any length 1, not as a clever trick. Exempting Tap
+	// outright was tried and REFUTED (tapBudgetExempt: Theory of Everything
+	// stalled at 33.24% against a 19s clear), so the valve being partial matters.
+	//
+	// 6f7562d ended "Kept as a flag rather than deleted so a regression on a level
+	// with heavy UFO or swing can be bisected against it. Delete once the 14-level
+	// suite is green." The suite has never been green - Base After Base has failed
+	// throughout - and c57f14d deleted it anyway, removing the bisect that note
+	// existed to preserve, for exactly the case that then occurred.
+	//
+	// MEASURED AND CONTROLLED, 2026-09-12, same build, same session:
+	//
+	//   Y on    Clubstep SOLVED at 20,274 deaths - and F4-verified from frame 0,
+	//           zero diverging steps, the first verified demon on this lineage.
+	//   Y off   Clubstep stuck at 71.75% after 27,430 deaths, 35% longer than the
+	//           solve took. Not stopped early: run to exhaustion of patience.
+	//
+	// So the default is now true, and 6f7562d's flip is reverted with the control
+	// run it never had.
+	//
+	// THE MECHANISM ABOVE IS WRONG, and the control is what proves it. If stale
+	// tap state worked by making Tap alternatives free, `free ...T` would rise
+	// with the flag on. It falls:
+	//
+	//   Y on     865 free taps of 54,083 gate evaluations   1.6%
+	//   Y off   5979 free taps of 96,814 gate evaluations   6.2%
+	//
+	// What the logs do show: the control spent 31 of its 57 escapes in the ladder's
+	// runaway state - window 7680, anchor released, dropping 671 decisions and
+	// ~7450 steps on every escape with the floor creeping by exactly 1 each time -
+	// while the solving run never left window 240. The flag is not buying budget.
+	// It changes move ordering enough to keep the frontier moving, which keeps the
+	// escape ladder out of its fixed point.
+	//
+	// Read that as: this flag is masking an escape-ladder defect, not fixing one.
+	// It earns its default by the controlled run above and by nothing else, and it
+	// should be revisited once the steer target is fixed - see docs/STEER_TARGET.md.
+	//
+	// Y toggles it.
+	bool tapStateSurvivesRestore = true;
 
 	// Cells held by the solver's archive.
 	//
@@ -915,6 +986,13 @@ struct Config {
 	// which is what makes the cap necessary at all.
 	int geomVerticalReach = 60;
 
+	// Vertical units per physics step for the window's reach model. 0 falls back
+	// to the geomVerticalReach derivation above. 2.118 is the measured mini-ship
+	// figure, the largest of the four ship values, so it is the least likely of
+	// them to narrow the window past what a ship can actually fly. See the
+	// comment at climbPerStep.
+	double geomClimbPerStep = 2.118;
+
 
 	// How far off-centre the player may drift inside the live window before
 	// steering fires, as a FRACTION of the window's height.
@@ -952,6 +1030,10 @@ struct Config {
 	// the band is the only thing that matters there. Sweep across levels of
 	// different character, not against the one that motivated the feature.
 	double geomClearanceBand = 0.25;
+
+	// 0 = the fraction above. 1 = the measured per-decision distance. See
+	// steerDeadband. Default 0 so this is inert until it is tested.
+	int geomBandMode = 0;
 
 	// 0/0 means the WHOLE level. The dead-end map has always covered everything
 	// (slices -1..848 on ToE, x -30..25440 against a 25855-unit level); it was
@@ -1107,78 +1189,10 @@ struct Config {
 	// default should stay tight.
 	int commitLookbackSteps = 240;
 
-	// Adaptive widening. 240 steps is one second of gameplay, chosen because
-	// Stereo Madness's ship is only ~330 steps. On a longer section that window
-	// is proportionally far too tight: Time Machine stalled at 93.77% with
-	// commit pinned and only ~60 decisions mutable, so any correction that had
-	// to begin more than a second before the death was physically unreachable.
-	//
-	// Commitment must therefore be REVOCABLE (plan section 2.6 option 3): after
-	// this many escapes with no improvement, double the window and let the
-	// search reach further back, up to the cap.
-	// Escalation ladder for a stalled search, in increasing cost and reach:
-	//   stage 1  widen the window within the current section
-	//   stage 2  release the mode-transition anchor, reaching into the previous
-	//            section - the only way to reconsider HOW a portal was entered,
-	//            or whether to take it at all
-	//   stage 3  the existing frame-0 replay fallback
-	//
-	// Aggressive on purpose. Each escape needs 400 deaths (~57 s at observed
-	// rates), so at the old 6-escapes-per-doubling it took ~28 minutes to reach
-	// full reach - useless as an escape hatch. 2 escapes and x4 gets there in ~3.
-	// Back to the values that reached 78.90%. Faster escalation (2 escapes, x4)
-	// ran the whole ladder in ~2 minutes, before the search had meaningfully
-	// explored any single window. Escapes come cheaply early in a level, so the
-	// trigger must be slow enough that widening means "genuinely exhausted".
-	// Escapes with no progress before the mutable window is widened. With
-	// stallLimit at 400 deaths per escape, 6 means 2400 deaths of thrashing
-	// before the ladder moves at all.
-	//
-	// MEASURED as the single largest block of wasted time left. Clutterfunk,
-	// 48 seconds total: 4s of fast progress to 35.53%, then 21 SECONDS stuck
-	// waiting out this counter, then the widen at 240 -> 480, then 23s to solve.
-	// Nothing in that 21s moved best% by a hundredth.
-	//
-	// J cycles 6 / 3 / 1 so the direction can be measured rather than guessed.
-	// Widening early is not free - it lowers the commit floor, so more of the
-	// prefix becomes mutable and the search re-explores ground it had settled.
-	//
-	// MEASURED on Clutterfunk, three runs back to back in one session:
-	//   6  49s, 189644 steps
-	//   3  38s, 154152 steps   <- optimum, both neighbours worse
-	//   1  66s, 255074 steps
-	// At 1 the ladder escalated four times in eleven seconds, 240 -> 3840, blew
-	// past the commit floor and re-explored settled ground. A real optimum, not
-	// "smaller is better".
-	// On a stall, raise the toggle budget instead of widening the window. Q.
-	//
-	// The two mechanisms currently fight, and not symmetrically:
-	//
-	//   a stall WIDENS the window, making more decisions mutable
-	//   only EXHAUSTION deepens the budget, and widening makes the tree bigger,
-	//   so widening makes exhaustion - and therefore deepening - less likely
-	//
-	// A stall can only ever widen, and widening starves deepening. MEASURED on
-	// Clutterfunk: the run that solved reached budget 2 in 158k steps, while the
-	// run that stalled took 322k steps through 14 escapes and never left budget 1
-	// - so only single-toggle paths were ever allowed, in a zigzag ship corridor
-	// that needs several.
-	//
-	// The two buy different things. Deepening allows a more intricate input
-	// pattern in the SAME region; widening allows the same complexity FURTHER
-	// BACK. Deepening is the right answer when the obstacle is at the frontier,
-	// which is what a stall usually is.
-	//
-	// With this on, a stall deepens first and only widens once the budget is
-	// maxed, so neither can starve the other.
-	bool deepenOnStall = false;
 
-	int escapesBeforeWidening  = 3;
 	int wideningFactor         = 2;
 	int maxCommitLookbackSteps = 7680; // 32 s
 
-	// Escapes at max window before the transition anchor is released.
-	int escapesBeforeAnchorRelease = 10;
 
 	// The floor must never collapse to zero. The window is an ABSOLUTE step count
 	// behind the frontier, so early in a level a wide window reaches past the
@@ -2609,7 +2623,6 @@ struct RestoreState {
 struct Decision;
 int decisionCost(Decision const& d, bool choice);
 int tapCost(Decision const& d, bool choice);
-int tapAllowance(int window);
 
 // Release a checkpoint, first detaching it from anything GD still points at.
 //
@@ -2662,17 +2675,15 @@ int tapCost(Decision const& d, bool choice) {
 	return (d.modeClass == ModeClass::Tap && choice) ? 1 : 0;
 }
 
-// Taps permitted above the commit floor for a given mutable window. Scales with
-// the window so the allowance means the same thing at any width; at the default
-// window it is exactly toggleBudget, which is what makes this inert until
-// widening starts.
-int tapAllowance(int window) {
-	const int base = g_config.commitLookbackSteps;
-	if (window <= base) return g_config.toggleBudget;
-	const double scale = static_cast<double>(window) / static_cast<double>(base);
-	const double n = static_cast<double>(g_config.toggleBudget) * scale;
-	return static_cast<int>(n < 1.0 ? 1.0 : n);
-}
+// Taps permitted above the commit floor. The same number as holds get.
+//
+// It used to scale with the mutable window - "so the allowance means the same
+// thing at any width" - which quietly made widening change what a decision
+// COSTS as well as how far back the search may go. Two concepts on one lever,
+// and it stayed hidden while widening was slow, because the scaling is inert
+// at the default window.
+//
+
 
 int decisionCost(Decision const& d, bool choice) {
 	// Free if it is what the map asked for.
@@ -2725,9 +2736,21 @@ struct Solver {
 	int                   tapsUsed     = 0;
 	size_t                commitDepth  = 0; // cached for logging; see solverCommitFloor()
 	int                   lookbackSteps = 0;   // current (possibly widened) window
-	int                   escapesAtWiden = 0;  // escape count when it last widened
+	// How far back the LAST escape actually reached. The ladder escalates when an
+	// escape fails to beat it, so the trigger is the effect rather than a count of
+	// escapes - see the stage block in solverStep.
+	int                   lastUndone = 0;
+
+	// Probe 19: WHERE the search dies, and what the map was saying there.
+	//
+	// Every diagnosis so far has come from aggregate counters, which say a level
+	// stalled but never where or why. A death histogram localises it: if most
+	// deaths land in one cell, the problem is one obstacle, and the map's opinion
+	// at that cell is then readable directly rather than inferred.
+	std::unordered_map<uint64_t, uint32_t> deathCells;
+	std::unordered_map<uint64_t, double>   deathVySum;
+	uint64_t              deathsRecorded = 0;
 	bool                  anchorReleased = false; // stage 2: transition anchor dropped
-	uint64_t              escapesAtMaxWindow = 0;
 	int                   bestStep     = 0; // solver step at which bestPct was reached
 	uint64_t              deathsAtBest = 0;
 	uint64_t              escapes      = 0;
@@ -2797,7 +2820,6 @@ struct Solver {
 	double                ceilMaxSeen     = -1e30;
 	double                floorMinSeen    =  1e30;
 
-	double                lastCeilingSeen = -1e30;
 	bool                  roofWarned      = false;
 	// Smallest (map roof at the player's x - live ceiling) seen, and where.
 	// Negative means the build cropped space the game says the player may
@@ -3155,9 +3177,11 @@ struct Solver {
 		commitDepth = 0;
 		bestStep = 0;
 		lookbackSteps = 0;
-		escapesAtWiden = 0;
+		lastUndone = 0;
+		deathCells.clear();
+		deathVySum.clear();
+		deathsRecorded = 0;
 		anchorReleased = false;
-		escapesAtMaxWindow = 0;
 		bestPct = 0.f;
 		// escapes MUST reset with the rest. It is not just a counter: the
 		// widening gate reads `escapes - escapesAtWiden >= escapesBeforeWidening`,
@@ -3176,13 +3200,8 @@ struct Solver {
 		geoSteers = geoLooks = 0;
 		geoSteerDead = geoSteerWin = geoSteerMute = 0;
 		learnedCeiling  = 1e30;
-		// Both of these are per-LEVEL and were never cleared, so a session that
-		// ran more than one level carried them across. lastCeilingSeen only made
-		// the first CEILING CHANGED line of each level report the previous
-		// level's value as its "from"; roofWarned was worse - one warning
-		// anywhere in a session permanently silenced the check for every level
-		// after it.
-		lastCeilingSeen = -1e30;
+		// roofWarned is per-LEVEL and was never cleared, so one warning anywhere in
+		// a session permanently silenced the check for every level after it.
 		roofWarned      = false;
 		roofMarginMin   =  1e30;
 		roofMarginMinX  = 0.0;
@@ -4277,7 +4296,25 @@ bool geometryBuildMap() {
 	// Calibrate the per-step rate off the 1x meaning of the existing constant,
 	// so this is arithmetically inert on every level that runs at one speed and
 	// changes behaviour only where the speed does.
-	const double climbPerStep = static_cast<double>(g_config.geomVerticalReach) /
+	// MEASURED, not fitted. This is the one number the window depends on, and
+	// getting it from geomVerticalReach = 60 (which works out at 2.596) is what
+	// retired WINDOWED in 9803757 - the mechanism was sound, its input was a
+	// guess. Probe 16 measured ship in a purpose-built level: 1.800 up / 1.440
+	// down normal, 2.118 / 1.694 mini, identical at 0.5x, 1x, 2x, 3x and 4x, and
+	// cross-checked to 0.1% by the game's own m_yVelocity.
+	//
+	// One value for the whole map is the FIRST CUT, not the end state. The map
+	// knows where the portals are, so each section could use its own mode's rate;
+	// a cube climbs far faster than a ship and is over-constrained by this. The
+	// point of a single value is to find out whether a real corridor helps at all
+	// before building the per-section version.
+	//
+	// Too SMALL narrows the window past the flyable set and deletes routes; too
+	// large just fails to narrow. Probe 17 measures which, by replaying a known-
+	// good macro and counting how much of it falls outside the window.
+	const double climbPerStep = g_config.geomClimbPerStep > 0.0
+	                          ? g_config.geomClimbPerStep
+	                          : static_cast<double>(g_config.geomVerticalReach) /
 	                            std::max(1.0, static_cast<double>(g_config.geomSliceX)) *
 	                            kSpeedNormal;
 
@@ -4508,6 +4545,37 @@ bool geometryWindowAt(double x, double y, double* lo, double* hi);
 //
 // 0 is the common answer: if the player is already inside a live interval at the
 // lookahead, nothing needs steering.
+// How close to the target counts as 'close enough to say nothing'.
+//
+// Mode 0 (geomClearanceBand): a fraction of the corridor. The code's own
+// comments condemn it twice - "A narrower target getting LESS tolerance is
+// backwards" and "Three levels wanted three different values, which is
+// overfitting rather than tuning". It gives the most slack where precision
+// matters least, and its value was chosen because it happened to solve three
+// levels on a build where the map roof and the ceiling rule were both wrong.
+//
+// Mode 1 (MEASURED): the distance the player can actually move in one decision
+// interval, from the measured climb rate. Below that the controller cannot
+// resolve anything - the player will move that far before the next decision
+// regardless - so it is the honest floor for 'close enough', and it does not
+// care how wide the corridor happens to be.
+//
+// For a normal ship that is 1.800 x 4 = 7.2 units against 30 in a 120-unit
+// corridor and 71 in a 285-unit one, so the map should speak far more often.
+// That is the point: it currently has an opinion on 11% of air decisions and
+// every steer ever recorded was a drift correction rather than a warning.
+double steerDeadband(double intervalHeight) {
+	if (g_config.geomBandMode == 0)
+		return std::max(0.0, g_config.geomClearanceBand) * intervalHeight;
+	auto* p = Solver::get().steerPlayer;
+	const double up = Solver::get().observedClimb(p, true);
+	const double dn = Solver::get().observedClimb(p, false);
+	const double rate = std::max(up, dn);
+	// No measurement for this mode yet: fall back rather than inventing a band.
+	if (rate <= 0.0)
+		return std::max(0.0, g_config.geomClearanceBand) * intervalHeight;
+	return rate * std::max(1, g_config.airBranchInterval);
+}
 int geometrySteer(double x, double y, double vy, double lead, double lookaheadUnits) {
 	auto const& m = GeoMap::get();
 	if (!m.valid) return 0;
@@ -4574,8 +4642,7 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 			// the same slack-relative failure recorded below - a 285-unit
 			// corridor gives 71 units of deadband, a 90-unit threaded gap gives
 			// 22. The target should tighten; the tolerance should not.
-			const double band = std::max(0.0, g_config.geomClearanceBand) *
-			                    (rawHi - rawLo);
+			const double band = steerDeadband(rawHi - rawLo);
 			if (std::abs(y - centre) <= band) return 0;
 			Solver::get().geoSteerWin++;
 			return y < centre ? 1 : -1;
@@ -4615,7 +4682,7 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 				}
 
 				const double centre = 0.5 * (clo + chi);
-				const double band = std::max(0.0, g_config.geomClearanceBand) * (chi - clo);
+				const double band = steerDeadband(chi - clo);
 				if (std::abs(y - centre) <= band) return 0;
 
 				// Urgency gate. Route alone fired on 78.7%% of decisions and
@@ -4801,7 +4868,7 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 			// decisions. Three levels wanted three different values, which is
 			// overfitting rather than tuning, so this is back to the only setting
 			// that solved all of them.
-			const double band = std::max(0.0, g_config.geomClearanceBand) * (hi - lo);
+			const double band = steerDeadband(hi - lo);
 			if (std::abs(y - centre) <= band) return 0;
 			// Unreachable target: the player cannot occupy that altitude from
 			// here, so steering at it is worse than saying nothing.
@@ -5492,6 +5559,51 @@ void pathAuditStep(PlayerObject* p) {
 	}
 }
 
+// Probe 19. Where the search actually dies, and what the map said there.
+//
+// Read it as: if one cell holds a large share of deaths, the stall is one
+// obstacle and the map's opinion at that cell is the diagnosis. If deaths are
+// spread thin, the search is lost rather than blocked, which is a different
+// problem with a different fix.
+void deathMapReport(int topN) {
+	auto& sv = Solver::get();
+	if (sv.deathCells.empty()) { log::info("Probe 19: no deaths recorded."); return; }
+	std::vector<std::pair<uint64_t,uint32_t>> v(sv.deathCells.begin(), sv.deathCells.end());
+	std::sort(v.begin(), v.end(),
+	          [](auto const& a, auto const& b){ return a.second > b.second; });
+	auto& m = GeoMap::get();
+	log::info("Probe 19: {} deaths across {} cells (one block each). Top {}:",
+	          sv.deathsRecorded, sv.deathCells.size(),
+	          std::min<size_t>(v.size(), static_cast<size_t>(topN)));
+	for (size_t i = 0; i < v.size() && i < static_cast<size_t>(topN); i++) {
+		const int xb = static_cast<int>(static_cast<int32_t>(v[i].first >> 32));
+		const int yb = static_cast<int>(static_cast<int32_t>(v[i].first & 0xFFFFFFFFu));
+		const double x = xb * 30.0, y = yb * 30.0;
+		const double share = 100.0 * v[i].second / static_cast<double>(sv.deathsRecorded);
+		const double vy = sv.deathVySum[v[i].first] / std::max(1u, v[i].second);
+		// What the map believed at that x: the interval holding that y, its live
+		// window, and where the steer would have been aiming.
+		std::string say = "map: -";
+		if (m.valid) {
+			const int si = m.segIndex(x + 15.0);
+			if (si >= 0) {
+				for (auto const& f : m.freeSpans[static_cast<size_t>(si)]) {
+					if (y + 30.0 < f.lo || y > f.hi) continue;
+					say = fmt::format("gap {:.0f}..{:.0f} window {:.0f}..{:.0f} {} "
+					                  "centre {:.0f}",
+					                  f.lo, f.hi, f.wlo, f.whi,
+					                  f.live ? "live" : "DEAD",
+					                  0.5 * (f.wlo + f.whi));
+					break;
+				}
+				if (say == "map: -") say = "NO INTERVAL HOLDS THIS Y";
+			}
+		}
+		log::info("  x {:6.0f}  y {:5.0f}  {:5} deaths ({:4.1f}%)  mean vy {:+6.2f}  {}",
+		          x, y, v[i].second, share, vy, say);
+	}
+}
+
 void pathAuditReport() {
 	auto& sv = Solver::get();
 	if (!sv.pathAuditSteps) return;
@@ -5758,6 +5870,20 @@ void pollHotkeys() {
 
 
 
+	// Y = let tap state go stale across a reposition (the UFO bisect).
+	if (keyPressedEdge('Y')) {
+		g_config.tapStateSurvivesRestore = !g_config.tapStateSurvivesRestore;
+		log::info("Tap state on a reposition: {}. F2 to solve with this.",
+		          g_config.tapStateSurvivesRestore
+		              ? "SURVIVES (stale - sv.hold outlives the tap, so the next Tap "
+		                "decision is pushed held and its alternative is FREE. This is "
+		                "how it was when Clubstep cleared in 9803757)"
+		              : "RESTORED (clean, the default - the tap self-releases, so the "
+		                "next Tap decision is pushed released and its alternative is "
+		                "charged against the toggle budget)");
+	}
+
+
 	// A = archive restart instead of the blind escape rewind.
 	if (keyPressedEdge('A')) {
 		g_config.escapeArchiveRestart = !g_config.escapeArchiveRestart;
@@ -5765,17 +5891,9 @@ void pollHotkeys() {
 		          g_config.escapeArchiveRestart
 		              ? "ARCHIVE RESTART - on a stall, return to a promising archived "
 		                "cell and resume from there"
-		              : "rewind - pop escapeJump decisions and widen the window");
+		              : "rewind - drop to the commit floor and escalate the ladder");
 	}
 
-	// Q = deepen the toggle budget on a stall instead of widening the window.
-	if (keyPressedEdge('Q')) {
-		g_config.deepenOnStall = !g_config.deepenOnStall;
-		log::info("On a stall: {}. F2 to solve with this.",
-		          g_config.deepenOnStall
-		              ? "DEEPEN the toggle budget first, widen only when it is maxed"
-		              : "widen the mutable window (deepening waits for exhaustion)");
-	}
 
 	// Z = cap the map roof at the highest portal-derived ceiling.
 	if (keyPressedEdge('Z')) {
@@ -5790,35 +5908,20 @@ void pollHotkeys() {
 	}
 
 
-	// F = cycle escapesBeforeAnchorRelease. Stage 2 of the ladder frees the
-	// mode-transition anchor, and MEASURED it is the only stage that can move
-	// the floor at all once the window has passed the anchor: Clutterfunk under
-	// Z widened 240 -> 7680, a 32x increase, while the rewind went 243 -> 633
-	// steps and then back down to 618, with `anchor held` on all 23 escapes.
-	// At the default 10 the release arrives ~10400 deaths into a stall, which is
-	// later than the search survives. 1 fires it the moment the window maxes.
-	if (keyPressedEdge('F')) {
-		g_config.escapesBeforeAnchorRelease =
-			g_config.escapesBeforeAnchorRelease == 10 ? 3 :
-			g_config.escapesBeforeAnchorRelease == 3  ? 1 : 10;
-		log::info("Anchor release: after {} escapes at the max window ({} deaths of "
-		          "thrashing past it). F2 to solve with this.",
-		          g_config.escapesBeforeAnchorRelease,
-		          g_config.escapesBeforeAnchorRelease * g_config.stallLimit);
+	// 2 = where the search is dying (Probe 19). Read-only.
+	if (keyPressedEdge('2')) deathMapReport(12);
+
+	// T = how the steer decides it is close enough to say nothing.
+	if (keyPressedEdge('T')) {
+		g_config.geomBandMode = (g_config.geomBandMode + 1) % 2;
+		log::info("Steer deadband: {}. F2 to solve with this.",
+		          g_config.geomBandMode
+		              ? "MEASURED - the distance the player moves in one decision "
+		                "interval, so it does not depend on how wide the corridor is"
+		              : "fraction of the corridor (geomClearanceBand), as before");
 	}
 
-	// J = cycle escapesBeforeWidening. Read at stall time, so it takes effect on
-	// the next F2 with no rebuild.
-	if (keyPressedEdge('J')) {
-		g_config.escapesBeforeWidening =
-			g_config.escapesBeforeWidening == 6 ? 3 :
-			g_config.escapesBeforeWidening == 3 ? 1 : 6;
-		log::info("Escalation ladder: widen after {} escapes with no progress "
-		          "({} deaths of thrashing at stallLimit {}). F2 to solve with this.",
-		          g_config.escapesBeforeWidening,
-		          g_config.escapesBeforeWidening * g_config.stallLimit,
-		          g_config.stallLimit);
-	}
+
 
 	// N = toggle the forward scan. Read at steer time, so no rebuild.
 	if (keyPressedEdge('N')) {
@@ -6010,6 +6113,12 @@ void pollHotkeys() {
 			          "checkpoint. Plan 13.13.",
 			          g_config.hybridRestore ? "ON" : "OFF",
 			          g_config.hybridRestore ? "do NOT carry" : "carry");
+			log::info("Solver: tap state {} (Y toggles).",
+			          g_config.tapStateSurvivesRestore
+			              ? "SURVIVES a reposition - stale, as when Clubstep "
+			                "cleared in 9803757"
+			              : "is RESTORED on a reposition - clean, the current "
+			                "default");
 			log::info("Solver: starting DFS. air branch interval {} steps, "
 			          "release-before-hold ordering. F2 again to stop.",
 			          g_config.airBranchInterval);
@@ -8130,25 +8239,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			                           sv.learnedCeiling - sv.entryBand());
 		}
 
-		// Probe 15: WHICH objects actually re-snap the band.
+		// Probe 15 lived here: a log::info on every CHANGE of the ground-truth
+		// ceiling, to find out which object types re-snap the band. It answered
+		// that - gravity portals were added on that evidence and then removed
+		// again when they cost Base After Base its roof - and is now deleted.
 		//
-		// Every portal ID in the roof scan is currently there by inference, and one
-		// of those inferences has already cost a level: gravity portals were added
-		// because Clutterfunk had a 390 ceiling near a gravity portal at 247.5
-		// (247.5 + 135 snaps to 390), and that raised Base After Base's roof from
-		// 386 to 630 and undid its fix.
-		//
-		// 0x764 is ground truth, so log every CHANGE of it with the position. The
-		// objects at that x then say which type did it - measured, not guessed.
-		if (sv.learnedCeiling < 1e29 &&
-		    std::abs(sv.learnedCeiling - sv.lastCeilingSeen) > 0.5) {
-			log::info("CEILING CHANGED {:.0f} -> {:.0f} at x {:.0f} y {:.0f} "
-			          "(implied band-setter y {:.1f})",
-			          sv.lastCeilingSeen > -1e29 ? sv.lastCeilingSeen : 0.0,
-			          sv.learnedCeiling, p->getPositionX(), p->getPositionY(),
-			          sv.learnedCeiling - ceilingOffsetForPortal(sv.entryPortalID));
-			sv.lastCeilingSeen = sv.learnedCeiling;
-		}
+		// It also had to go. It was a log call in the physics stepping path, which
+		// this project forbids, and the reason showed up the moment the search
+		// started re-crossing one spot: Clutterfunk logged 1152 CEILING CHANGED
+		// lines in a single run, all at x 10784..10796, flapping 390 <-> 330. That
+		// is not a fault - two sections meet there and every restore across the
+		// boundary re-reads the other one's band. The measurement was right and the
+		// logging was wrong.
 
 		// SAFETY NET for the map roof.
 		//
@@ -8584,7 +8686,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			solverRestoreState(d);
 			sv.step        = d.step;
 			sv.hold         = sv.resumeHold;
-			{
+			if (!g_config.tapStateSurvivesRestore) {
 				sv.tapping      = sv.resumeTapping;
 				sv.tapRemaining = sv.resumeTap;
 			}
@@ -8620,7 +8722,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					return true;
 				}
 				sv.hold         = sv.resumeHold;
-				{
+				if (!g_config.tapStateSurvivesRestore) {
 					sv.tapping      = sv.resumeTapping;
 					sv.tapRemaining = sv.resumeTap;
 				}
@@ -8683,18 +8785,17 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			size_t maxDrop = sv.stack.size() > escFloor
 			               ? sv.stack.size() - escFloor : 0;
 
-			// Also prefer not to rewind out of an air section we are working on.
-			if (!sv.stack.empty() && sv.stack.back().airPolicy) {
-				size_t firstAir = 0;
-				while (firstAir < sv.stack.size() && !sv.stack[firstAir].airPolicy) firstAir++;
-				if (firstAir < sv.stack.size()) {
-					const size_t keep = firstAir + 1; // keep the entry decision itself
-					const size_t airDrop = sv.stack.size() > keep ? sv.stack.size() - keep : 0;
-					maxDrop = std::min(maxDrop, airDrop);
-				}
-			}
-
-			const size_t drop = std::min(static_cast<size_t>(g_config.escapeJump), maxDrop);
+			// Rewind to the floor, and nothing else caps it.
+			//
+			// escapeJump asked for 200 decisions and the air-section guard asked to
+			// stay inside the current air section. Probe 18 logged all 28 escapes on
+			// Clutterfunk: the air guard bound ZERO of them, and escapeJump bound
+			// none of the first sixteen - the floor was always the smaller number.
+			// Once the anchor released it became the cap at exactly 200 and stayed
+			// there for twelve escapes. So it was either ignored or it was the thing
+			// preventing progress, and never once the right number. The floor is the
+			// one quantity that means anything here, so it is now the only one.
+			const size_t drop = maxDrop;
 
 			// Probe 18: what the rewind ACTUALLY did, against what it was asked
 			// to do. Three quantities claim to control how far back the search
@@ -8706,7 +8807,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// do with where progress stopped. This line settles whether
 			// escapeJump is doing any work at all.
 			const size_t depthBefore = sv.stack.size();
-			const size_t floorCap    = depthBefore > escFloor ? depthBefore - escFloor : 0;
 			const int    stepAtFloor = escFloor < depthBefore
 			                         ? sv.stack[escFloor].step : 0;
 
@@ -8717,23 +8817,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			sv.escapes++;
 			sv.deathsAtBest = sv.deaths;
 
+			int undone = 0;
 			{
 				const int newStep = sv.stack.empty() ? 0 : sv.stack.back().step;
 				// The number that matters: how much ALREADY-SOLVED level this
 				// threw away. An escape that lands a few steps behind the best
 				// is retrying the hard part; one that lands thousands of steps
 				// behind is re-deriving a section it had already cleared.
-				const int undone = sv.bestStep - newStep;
-				const char* bound = drop == static_cast<size_t>(g_config.escapeJump)
-				                  ? "escapeJump"
-				                  : (maxDrop == floorCap ? "COMMIT FLOOR"
-				                                        : "air-section guard");
-				log::info("Escape #{} at {:.2f}%: dropped {} of {} decisions "
-				          "(bound by {}; escapeJump {}, floor allows {}) - "
-				          "depth {}->{}, step {}->{}, undoing {} steps behind best. "
-				          "floor idx {} at step {}, window {}, budget {}, anchor {}",
-				          sv.escapes, sv.bestPct, drop, depthBefore, bound,
-				          g_config.escapeJump, floorCap,
+				undone = sv.bestStep - newStep;
+				log::info("Escape #{} at {:.2f}%: dropped {} of {} decisions to the "
+				          "floor - depth {}->{}, step {}->{}, undoing {} steps behind "
+				          "best. floor idx {} at step {}, window {}, budget {}, anchor {}",
+				          sv.escapes, sv.bestPct, drop, depthBefore,
 				          depthBefore, sv.stack.size(), sv.bestStep, newStep, undone,
 				          escFloor, stepAtFloor, sv.lookbackSteps,
 				          g_config.toggleBudget,
@@ -8757,48 +8852,67 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			//
 			// Widening keeps its own cadence untouched; deepening only fills the
 			// escapes in between. Strictly additive, so neither can starve.
-			const bool widenDue =
-				sv.escapes - sv.escapesAtWiden >= static_cast<uint64_t>(g_config.escapesBeforeWidening)
-				&& sv.lookbackSteps < g_config.maxCommitLookbackSteps;
-
-			if (g_config.deepenOnStall && !widenDue &&
-			    g_config.toggleBudget < g_config.maxToggleBudget) {
-				g_config.toggleBudget++;
-				log::info("Solver: stalled at {:.2f}% - deepening the toggle budget "
-				          "{} -> {} (escape #{}, widening not due yet)",
-				          sv.bestPct, g_config.toggleBudget - 1, g_config.toggleBudget,
-				          sv.escapes);
+			// ESCALATE ON EFFECT, NOT ON SCHEDULE.
+			//
+			// One quantity decides everything here: how far back the rewind actually
+			// reached, which Probe 18 already reports as `undone`. If an escape did
+			// not reach further than the last one, whatever stage we are in is inert
+			// and we move to the next immediately.
+			//
+			// MEASURED, and this is why: on Clutterfunk the old schedule widened the
+			// window 240 -> 7680, a 32x increase over five doublings costing three
+			// escapes each, while the rewind went 243 -> 483 -> 633 and then FELL to
+			// 618. Every escape logged `anchor held`: the transition anchor was
+			// binding the whole time, so widening past it could not move the floor by
+			// a single step. A schedule cannot see that. `undone` can.
+			//
+			// The stages in order - widen, release the anchor, raise the budget -
+			// replace escapesBeforeWidening, escapesBeforeAnchorRelease and
+			// deepenOnStall. The last of those deepened on EVERY stall, which cost
+			// Electroman Adventures and Clubstep their solves outright; here the
+			// budget rises only once the rewind is genuinely exhausted, which is the
+			// deadlock it was reaching for: deepening waits on exhausting the budget-N
+			// space, exhausting it needs a rewind that can reach the whole space, and
+			// a pinned rewind means the budget can never rise. Clutterfunk sat on
+			// budget 1 for 28 escapes and 11,200 deaths.
+			if (undone <= sv.lastUndone) {
+				if (sv.lookbackSteps < g_config.maxCommitLookbackSteps) {
+					const int before = sv.lookbackSteps;
+					sv.lookbackSteps = std::min(sv.lookbackSteps * g_config.wideningFactor,
+					                            g_config.maxCommitLookbackSteps);
+					log::info("Escape reached no further ({} steps) - widening the window "
+					          "{} -> {} ({:.1f}s -> {:.1f}s of reach)",
+					          undone, before, sv.lookbackSteps,
+					          before / 240.0, sv.lookbackSteps / 240.0);
+				} else if (!sv.anchorReleased) {
+					// The obstacle is not inside this section - it is how we ENTERED
+					// it. Releasing the anchor lets the floor move back past the
+					// portal, which is the only way to reconsider the approach, or
+					// whether to take it at all. A fake portal in a dead-end corridor
+					// is otherwise permanently unescapable: taking it scores progress,
+					// the anchor freezes behind it, and "do not go here" is
+					// unreachable.
+					sv.anchorReleased = true;
+					log::info("Escape reached no further ({} steps) with the window maxed "
+					          "- releasing the mode-transition anchor.", undone);
+				}
+				// No budget stage here. One was tried and ran away: with the window
+				// maxed and the anchor released the floor is already as far back as it
+				// goes, so `undone` can only decay by 1 per escape - the search adding
+				// one decision - and the trigger is then permanently true. MEASURED:
+				// Clubstep took eight consecutive bumps to budget 11, and a budget of
+				// 11 over a 7,400-step window is a hopeless subtree that guarantees the
+				// next escape fails too. Gating it on budgetMaxSpent did not help
+				// either: that is a running maximum over the whole run, so it is
+				// trivially satisfied once any branch has ever spent the budget.
+				//
+				// The budget already deepens on EXHAUSTION, which is the principled
+				// trigger. What blocked it was a rewind that could not reach the space
+				// it had to enumerate - and the collapse above fixes exactly that, so
+				// exhaustion is reachable again. It fired six times in the run that
+				// found this.
 			}
-
-			if (widenDue) {
-				const int before = sv.lookbackSteps;
-				sv.lookbackSteps = std::min(sv.lookbackSteps * g_config.wideningFactor,
-				                            g_config.maxCommitLookbackSteps);
-				sv.escapesAtWiden = sv.escapes;
-				if (sv.lookbackSteps >= g_config.maxCommitLookbackSteps)
-					sv.escapesAtMaxWindow = sv.escapes;
-				log::info("Solver: {} escapes with no progress at {:.2f}% - widening the "
-				          "mutable window {} -> {} steps ({:.1f}s -> {:.1f}s of reach)",
-				          g_config.escapesBeforeWidening, sv.bestPct, before,
-				          sv.lookbackSteps, before / 240.0, sv.lookbackSteps / 240.0);
-			}
-
-			// Stage 2. The window is maxed and the search is still boxed in, so
-			// the obstacle is not inside this section - it is how we ENTERED it.
-			// Releasing the transition anchor lets the floor move back past the
-			// portal, which is the only way to reconsider the approach to it, or
-			// whether to take it at all. Fake portals inside dead-end corridors
-			// are otherwise permanently unescapable: taking one scores progress,
-			// the anchor freezes behind it, and "do not go here" is unreachable.
-			if (!sv.anchorReleased &&
-			    sv.lookbackSteps >= g_config.maxCommitLookbackSteps &&
-			    sv.escapesAtMaxWindow > 0 &&
-			    sv.escapes - sv.escapesAtMaxWindow >= static_cast<uint64_t>(g_config.escapesBeforeAnchorRelease)) {
-				sv.anchorReleased = true;
-				log::info("Solver: still stuck at {:.2f}% with the window maxed - releasing "
-				          "the mode-transition anchor. The search can now reconsider how it "
-				          "entered this section, or whether to enter it at all.", sv.bestPct);
-			}
+			sv.lastUndone = undone;
 
 			// Phase A2: the rewind distance in steps AND seconds. Arithmetic says
 			// 200 air decisions should be ~800 steps (3.3 s); observation said
@@ -8846,10 +8960,13 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (d.tried != 0b11 && d.airPolicy) {
 				sv.budgetGateEvals++;
 
-				const bool isTapBudget = false;
-				const bool wouldToggle = isTapBudget
-				                       ? tapCost(d, !d.choice) > 0
-				                       : decisionCost(d, !d.choice) > 0;
+				// There is no separate tap budget. There never was: the branch that
+				// would have used one was gated on tapRateBudget, which has been
+				// false for the whole life of the file, so tapAllowance was never
+				// once called from the search. Taps are charged against the same
+				// toggle budget as holds, and steer-matching taps are free under
+				// geomFreeFollowing exactly as steer-matching holds are.
+				const bool wouldToggle = decisionCost(d, !d.choice) > 0;
 				if (wouldToggle) sv.budgetGateWouldToggle++;
 				else if (d.modeClass == ModeClass::Tap) sv.gateFreeTap++;
 				else                                    sv.gateFreeHold++;
@@ -8857,13 +8974,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				// frozen, already-working prefix must not count against the
 				// budget for the part still being solved.
 				const int floorToggles = floor < sv.stack.size()
-				                       ? (isTapBudget ? sv.stack[floor].tapsBefore
-				                                      : sv.stack[floor].togglesBefore)
+				                       ? sv.stack[floor].togglesBefore
 				                       : 0;
-				const int spent = (isTapBudget ? d.tapsBefore : d.togglesBefore)
-				                - floorToggles;
-				const int budget = isTapBudget ? tapAllowance(sv.lookbackSteps)
-				                              : g_config.toggleBudget;
+				const int spent = d.togglesBefore - floorToggles;
+				const int budget = g_config.toggleBudget;
 				if (spent > sv.budgetMaxSpent) sv.budgetMaxSpent = spent;
 				if (wouldToggle && spent >= budget) {
 					// Record BEFORE the pop: d is about to be destroyed.
@@ -8871,7 +8985,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					if (sv.budgetPops.size() < sv.budgetPops.capacity()) {
 						BudgetPop bp;
 						bp.step          = d.step;
-						bp.togglesBefore = isTapBudget ? d.tapsBefore : d.togglesBefore;
+						bp.togglesBefore = d.togglesBefore;
 						bp.floorToggles  = floorToggles;
 						bp.spent         = spent;
 						bp.budget        = budget;
@@ -9041,7 +9155,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			sv.resyncForBacktrack = false;
 			sv.resyncing   = false;
 			sv.hold         = sv.resumeHold;
-			{
+			if (!g_config.tapStateSurvivesRestore) {
 				sv.tapping      = sv.resumeTapping;
 				sv.tapRemaining = sv.resumeTap;
 			}
@@ -9277,10 +9391,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				log::info("Solver: progress at {:.2f}% - resetting escalation (window {} -> {}"
 				          "{})", sv.bestPct, sv.lookbackSteps, g_config.commitLookbackSteps,
 				          sv.anchorReleased ? ", transition anchor restored" : "");
-				sv.lookbackSteps      = g_config.commitLookbackSteps;
-				sv.escapesAtWiden     = sv.escapes;
-				sv.anchorReleased     = false;
-				sv.escapesAtMaxWindow = 0;
+				sv.lookbackSteps  = g_config.commitLookbackSteps;
+				sv.anchorReleased = false;
+				sv.lastUndone     = 0;
 			}
 
 			// Far enough past the last validation: re-derive the prefix cleanly.
@@ -10315,6 +10428,18 @@ class $modify(SolverPlayLayer, PlayLayer) {
 	// the icon" - is never involved.
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
 		if (ProbeState::get().suppressDeath) return;
+		// Probe 19. One hash and two map bumps, only while solving. Bucketed at
+		// one block so a cell is a place on screen rather than a coordinate.
+		if (Solver::get().running && player == m_player1 && !player->m_isDead) {
+			auto& sv = Solver::get();
+			const int xb = static_cast<int>(std::floor(player->getPositionX() / 30.0));
+			const int yb = static_cast<int>(std::floor(player->getPositionY() / 30.0));
+			const uint64_t k = (static_cast<uint64_t>(static_cast<uint32_t>(xb)) << 32)
+			                 |  static_cast<uint64_t>(static_cast<uint32_t>(yb));
+			sv.deathCells[k]++;
+			sv.deathVySum[k] += player->m_yVelocity;
+			sv.deathsRecorded++;
+		}
 		PlayLayer::destroyPlayer(player, object);
 	}
 

@@ -192,22 +192,45 @@ Scaling to the corridor gives the most slack where precision matters least. The
 value was chosen because it happened to solve three levels, on a build where both
 the map roof and the ceiling rule were wrong.
 
-*What it should be:* the distance the player moves in one decision interval.
-A ship climbing at 1.800 units/step with decisions every 4 steps covers ~7 units.
-Below that, chatter; far above, late reaction. **This is a velocity-derived
-quantity, not a tuned fraction.**
+*What it should be:* the distance the player moves in one decision interval —
+**tested 2026-09-11, and it fails.** See below.
 
-*Consequence today:* the map has an opinion on **11% of air decisions**
-(`geoSteer 14204/125687`), and the counters show `dead 0, win 14204` — **every
-steer in every run was a drift correction.** The map is purely reactive. It
-reports that you have already left the window; it never warns that you are about
-to.
-
-This is exactly Clutterfunk's wall. At x 16,560 a mini ship rides the ceiling at
-y 270–300 having cleared a saw; at x 16,590 the ceiling drops to y 270. A steer
-does fire — about 23 steps before the block — far too late to reverse a climb.
-The right moment to descend was earlier, while still inside the window, where the
-map is silent by construction.
+> ### RESULT — the deadband is a governor, not a fitted accident
+>
+> Implemented as `steerDeadband` mode 1: measured climb rate × `airBranchInterval`
+> = 7.2 units for a normal ship, against 30 in a 120-unit corridor.
+>
+> Mechanically it did exactly what it was supposed to. The map went from having
+> an opinion on **37%** of air decisions to **94%** (`geoSteer 32997/35037`).
+>
+> And Clutterfunk went from solving at 99.00% to **stalling at 33.72%**.
+>
+> That number is already in the source. A comment on the forward-scan band
+> records: *"scaling it to the intersection fired the steer on 92.6% of decisions
+> against 36.7% without the scan, and Clutterfunk stalled at 33.72% instead of
+> solving in 38s."*
+>
+> **Two unrelated mechanisms, both driving the steer rate past ~92%, produce the
+> identical stall at the identical percentage.** That is a reproducible,
+> mechanism-independent property: it is not about *how* the map gains authority,
+> only *how much* it has.
+>
+> **Conclusion: the map's steering TARGET is wrong, and the deadband is what
+> limits the damage.** The target is the centre of the live window — a position,
+> with no notion of trajectory. Aiming at the centre of a corridor is not how a
+> ship is flown through saws. Because steer-following is free, raising the map's
+> authority hands the flying to a controller that does not know how to fly.
+>
+> This reframes much of §3 and §5. The pile of heuristics is not redundancy —
+> several of them are **governors on a controller that aims at the wrong thing.**
+> Grounding any of them in physics without first fixing the target will make
+> things worse, predictably, and 0.25 is not a number to be replaced but a
+> symptom to be explained.
+>
+> **The real steering item is what the map aims at, not when it speaks.** That is
+> what `geomRouteSteer` and `geomUrgencySteer` were reaching for — a target
+> derived from the upcoming constriction and a feasible trajectory to it, rather
+> than the midpoint of wherever the player currently is.
 
 ### 3.3 Free following — `geomFreeFollowing = true` — **KEEP**
 
