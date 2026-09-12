@@ -225,6 +225,39 @@ struct Config {
 	// F toggles it.
 	bool geoStateRestore = true;
 
+	// Restore prevAirMode / prevOnGround on a reposition.
+	//
+	// THE DEFECT: those two remember what mode the player was in, and whether it
+	// was on the ground, at the previous step. The solver forces a decision
+	// whenever either CHANGES - a mode transition is the most timing-critical
+	// frame in a section, and a landing is where jump timing matters. Neither is
+	// put back when the search rewinds, so the first step after a rewind compares
+	// against whatever the ABANDONED path left behind. That can invent a forced
+	// decision that does not belong to the node, or miss one that does.
+	//
+	// Same class as lastGeoLo/Hi: the children of a node depend on where the
+	// search came from rather than on the node. Milder - it can only fire on the
+	// first step after a reposition, and corrects itself on the next.
+	//
+	// DEFAULT ON as of this commit. MEASURED, full suite, one keypress apart:
+	//
+	//   15/15 either way. Clubstep 5,930 -> 5,558 (-6%). The other fourteen levels
+	//   BIT-IDENTICAL. Nothing regressed, so the fix is free.
+	//
+	// modeStaleDiverged in the report line measures EXPOSURE, not residual: it
+	// compares the stale value against the decision's recorded one at reposition
+	// time, and restoring fixes the consequence without changing that comparison -
+	// the next exploration still ends somewhere with a different context. So it does
+	// NOT drop to zero with this on, and it was wrong to expect that. Measured
+	// exposure is 63-212 repositions per level, 2.8%-54%.
+	//
+	// Why so little behavioural change for so much exposure is NOT understood. The
+	// plausible account - untested - is that a spurious forced decision costs
+	// nothing under continue-first ordering and its first branch reproduces the same
+	// trajectory, so it only bites where the search is deep enough to backtrack into
+	// it. Clubstep, the deepest, is the only level that moved. 4 toggles it.
+	bool modeStateRestore = true;
+
 	// 4b: kill a branch whose reachable band, propagated from the player's ACTUAL
 	// vertical velocity, intersects no live space at the horizon.
 	//
@@ -2916,6 +2949,12 @@ struct Decision {
 	// exhaustion searches simple paths before complicated ones, and stays
 	// complete as the bound grows.
 	bool enteringHold  = false; // hold state on arrival, so a toggle is well-defined
+	// sv.prevAirMode / sv.prevOnGround on arrival here. Those two gate the FORCED
+	// decisions at a mode transition and at a landing, and neither was put back on
+	// a reposition - so after a rewind they held whatever the abandoned path left,
+	// exactly the defect lastGeoLo/Hi had. See modeStateRestore.
+	bool enteringAirMode  = false;
+	bool enteringOnGround = false;
 	SteerInfo si;            // the steer internals at the moment this was pushed
 	double    vyAt = 0.0;    // player vy at the same moment
 	// Corridor at the previous decision, on arrival here. Carried state for the
@@ -3374,6 +3413,9 @@ struct Solver {
 	bool                  resyncing      = false;
 	bool                  resyncForBacktrack = false;
 	bool                  resumeHold     = false;
+	bool                  resumeAirMode  = false;
+	bool                  resumeOnGround = false;
+	uint64_t              modeStaleEvals = 0, modeStaleDiverged = 0;
 	// Shadow of lastGeoLo/Hi that IS restored on reposition, so the branch rule can
 	// be evaluated both ways and the difference counted. Measurement only.
 	double                shadowGeoLo  = 0.0;
@@ -3537,6 +3579,8 @@ struct Solver {
 		prevY = 0.0;
 		lastGeoLo = lastGeoHi = 0.0;
 		resumeGeoLo = resumeGeoHi = 0.0;
+		resumeAirMode = resumeOnGround = false;
+		modeStaleEvals = modeStaleDiverged = 0;
 		shadowGeoLo = shadowGeoHi = 0.0;
 		brIvSum = brIvN = 0; brIvMin = 1 << 30; brIvMax = 0;
 		velPrunes = 0;
@@ -6612,6 +6656,16 @@ void pollHotkeys() {
 	}
 
 
+	// 4 = restore prevAirMode/prevOnGround on a reposition.
+	if (keyPressedEdge('4')) {
+		g_config.modeStateRestore = !g_config.modeStateRestore;
+		log::info("Mode/ground state on a reposition: {}. F2 to solve with this.",
+		          g_config.modeStateRestore
+		              ? "RESTORED - behaviour CHANGE from cfa8462"
+		              : "carries across (stale), exactly as cfa8462 - the default");
+	}
+
+
 	// 3 = the decisions behind the best path (Probe 21). Read-only.
 	if (keyPressedEdge('3')) bestDecisionDump();
 
@@ -6837,6 +6891,10 @@ log::info("Solver: velocity prune {} (V toggles).",
 			                            g_config.velocityPruneSteps,
 			                            g_config.velocityPruneMargin)
 			              : std::string("OFF"));
+log::info("Solver: mode/ground state {} (4 toggles).",
+			          g_config.modeStateRestore
+			              ? "is RESTORED on reposition - BEHAVIOUR CHANGE from cfa8462"
+			              : "carries across (stale), exactly as cfa8462");
 			log::info("Solver: branch-rule carried state {} (F toggles).",
 			          g_config.geoStateRestore
 			              ? "is RESTORED on reposition - BEHAVIOUR CHANGE from a02573c"
@@ -8336,6 +8394,14 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		                             !(g_config.hybridRestore && d.airPolicy);
 		if (needsCheckpoint) captureRestoreState(d.rs);
 		d.enteringHold  = sv.hold;
+		d.enteringAirMode  = sv.prevAirMode;
+		// NOT sv.prevOnGround. That is assigned AFTER this push, so reading it here
+		// gives the previous ground-policy step, while a step resuming from this
+		// decision must compare against the CURRENT one. prevAirMode does not have
+		// this problem: it is only written inside the transition branch, which fires
+		// whenever it disagrees with the mode, so it always equals the mode at this
+		// step by the time a decision is pushed.
+		d.enteringOnGround = m_player1 ? m_player1->m_isOnGround : false;
 		d.enteringGeoLo = sv.lastGeoLo;
 		d.enteringGeoHi = sv.lastGeoHi;
 		d.togglesBefore = d.airPolicy ? sv.togglesUsed : 0;
@@ -9460,6 +9526,15 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// MEASURED, Clutterfunk: mode 0 exhausts budget 1 at 455 deaths, deepens to
 		// 2 and solves. Mode 1 sat on budget 1 for 5,943 deaths and 13 escapes and
 		// stalled at 55.65%, and Clutterfunk has needed budget 2 since 9803757.
+		// MEASUREMENT, always on and independent of the flag: how often the stale
+		// values actually differ from the correct ones. The geoStateRestore decision
+		// was defensible because the rate was measured (0.47%-4.75%) rather than
+		// assumed from the bug's shape; this is the same check for the same reason.
+		sv.modeStaleEvals++;
+		if (sv.prevAirMode != d.enteringAirMode ||
+		    sv.prevOnGround != d.enteringOnGround) sv.modeStaleDiverged++;
+		sv.resumeAirMode = d.enteringAirMode;
+		sv.resumeOnGround = d.enteringOnGround;
 		sv.resumeGeoLo   = d.enteringGeoLo;
 		sv.resumeGeoHi   = d.enteringGeoHi;
 		sv.macro.resize(static_cast<size_t>(d.step), 0);
@@ -9472,6 +9547,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			solverRestoreState(d);
 			sv.step        = d.step;
 			sv.hold         = sv.resumeHold;
+			if (g_config.modeStateRestore) {
+				sv.prevAirMode  = sv.resumeAirMode;
+				sv.prevOnGround = sv.resumeOnGround;
+			}
 			sv.shadowGeoLo  = sv.resumeGeoLo;
 			sv.shadowGeoHi  = sv.resumeGeoHi;
 			if (g_config.geoStateRestore) {
@@ -9514,6 +9593,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					return true;
 				}
 				sv.hold         = sv.resumeHold;
+				if (g_config.modeStateRestore) {
+					sv.prevAirMode  = sv.resumeAirMode;
+					sv.prevOnGround = sv.resumeOnGround;
+				}
 				sv.shadowGeoLo  = sv.resumeGeoLo;
 				sv.shadowGeoHi  = sv.resumeGeoHi;
 				if (g_config.geoStateRestore) {
@@ -9878,7 +9961,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
 		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
 		          "archive {}c/{}r/{}f  gate {} free {}T/{}H  mute {}  "
-		          "geoStale {}/{}  velPrune {}  brIv {}/{:.1f}/{}  "
+		          "geoStale {}/{}  velPrune {}  brIv {}/{:.1f}/{}  modeStale {}/{}  "
 		          "ceil {}/{}c/{}p/{}s out {}/{}  roofMargin {}  "
 		          "dx {:.2f}/{:.2f}  vs map {:.2f}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
@@ -9895,6 +9978,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          sv.brIvN ? sv.brIvMin : 0,
 		          sv.brIvN ? static_cast<double>(sv.brIvSum) / sv.brIvN : 0.0,
 		          sv.brIvMax,
+		          sv.modeStaleDiverged, sv.modeStaleEvals,
 		          sv.learnedCeiling > 1e29
 		              ? std::string("--")
 		              : fmt::format("{:.0f}", sv.learnedCeiling),
@@ -9958,6 +10042,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			sv.resyncForBacktrack = false;
 			sv.resyncing   = false;
 			sv.hold         = sv.resumeHold;
+			if (g_config.modeStateRestore) {
+				sv.prevAirMode  = sv.resumeAirMode;
+				sv.prevOnGround = sv.resumeOnGround;
+			}
 			sv.shadowGeoLo  = sv.resumeGeoLo;
 			sv.shadowGeoHi  = sv.resumeGeoHi;
 			if (g_config.geoStateRestore) {
@@ -10115,6 +10203,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (sv.step >= sv.anchorReplayTarget) {
 				sv.anchorReplaying = false;
 				sv.hold         = sv.resumeHold;
+				if (g_config.modeStateRestore) {
+					sv.prevAirMode  = sv.resumeAirMode;
+					sv.prevOnGround = sv.resumeOnGround;
+				}
 				sv.shadowGeoLo  = sv.resumeGeoLo;
 				sv.shadowGeoHi  = sv.resumeGeoHi;
 				if (g_config.geoStateRestore) {
