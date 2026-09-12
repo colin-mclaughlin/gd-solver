@@ -247,160 +247,9 @@ struct Config {
 	// replay from the nearest cube ancestor.
 	bool hybridRestore = false;
 
-	// Order Tap decisions (UFO, swing) by whether a tap is NEEDED, instead of by
-	// the carried-over hold state.
-	//
-	// decisionCost is asymmetric for Tap - `choice ? 1 : 0` - so a decision
-	// pushed with choice=true has a FREE alternative and is never gated by the
-	// toggle budget, while one pushed with choice=false has an alternative that
-	// costs 1 and is refused the instant the budget is spent. Release-first
-	// therefore makes "never tap" the cheapest path through a UFO corridor,
-	// which is exactly "fall to the bottom corridor" - the observed ToE failure.
-	//
-	// 30fe2b7 evaded this by accident: stale tap state left sv.hold true often
-	// enough that 7.7% of gate evaluations had a free alternative. This does the
-	// same thing on purpose and for a stated reason. Plan 13.15.
-	// MEASURED and LOST: 27.72% on Theory of Everything against 32.49% with it
-	// off and 78.90% for 30fe2b7's stale tap state. It is not over-tapping - the
-	// rule fired on 10373 of 26890 Tap decisions (38.6%), so it discriminates -
-	// it is simply the wrong prior for this level. Deaths in the stall sit at
-	// yVelocity +5.8 to +6.7, i.e. RISING into a ceiling: "tap when falling"
-	// lifts the UFO out of a corridor whose correct route is to stay low.
-	//
-	// Kept behind the flag because the rule is sound where altitude must be held
-	// and may still win on other levels; it is only wrong as a universal prior.
-	//
-	// It also refutes the free-alternative story I attached to 13.15: this made
-	// 38.6% of Tap decisions carry a free alternative against 30fe2b7's 7.7% of
-	// gate evaluations, and did WORSE. More reachable tree is not the mechanism.
-	bool tapOrderByNeed = false;
 
-	// Let tapping/tapRemaining survive a reposition instead of being restored -
-	// what 30fe2b7 did by omission on its anchor-replay arrival, applied to
-	// EVERY path back to a decision rather than only that one.
-	//
-	// Why this is the experiment that matters: staleness is measured causal
-	// (78.90% vs 32.49%, hybrid on, nothing else changed), but in 30fe2b7 it
-	// could only ever fire through an anchor replay, so it was welded to the
-	// hybrid. With hybrid off there are no anchor replays and the effect has no
-	// vector at all. This gives it one, which makes "stale tap state" and
-	// "cube-anchor replay" independently testable for the first time.
-	//
-	// MEASURED AND RETIRED. The 78.90% vs 32.49% result that justified keeping
-	// this defect was stale evidence: it predates geometry ordering becoming the
-	// default, and predates Theory of Everything solving at all. Re-run at
-	// current defaults, same session, nothing else changed:
-	//
-	//   Theory of Everything   stale 19s, 2065 deaths   clean 19s, 1971 deaths
-	//   Clutterfunk            38s clean - but a NULL TEST, see below
-	//
-	// Clean is equal on time and slightly better on deaths, so the defect buys
-	// nothing and the default is now clean. The leak it created is still real but
-	// far smaller than it was: 130 free Tap alternatives of 18064 gate
-	// evaluations (0.7%) against 36 (0.2%) clean, where the original measurement
-	// saw ~8%. Geometry ordering changed which branch gets pushed first, which
-	// drained most of the valve.
-	//
-	// Clutterfunk reported `free 0T` - it generates no Tap gate evaluations at
-	// all, so it cannot exercise this flag and only shows the absence of a
-	// regression. Theory of Everything is the only level here that tests it.
-	//
-	// Kept as a flag rather than deleted so a regression on a level with heavy
-	// UFO or swing can be bisected against it. Delete once the 14-level suite is
-	// green. T toggles it.
-	//
-	// Confirmation the instrumentation is honest: `free ...H` was identical (852)
-	// in both runs. Hold's cost is symmetric and cannot leak, and it did not move.
-	bool tapStateSurvivesRestore = false;
 
-	// Take Tap decisions out of the toggle budget entirely. Y toggles it.
-	//
-	// The hypothesis this tests, stated so the run can refute it: the stale tap
-	// state is not doing anything clever - it is an accidental RELEASE VALVE on
-	// a budget that is too tight for UFO, and the 78.90%% vs 32.49%% result is
-	// the valve, not the staleness.
-	//
-	// The mechanism, end to end. decisionCost charges Tap as `choice ? 1 : 0` -
-	// adding a tap costs one, removing a tap is free. The budget gate asks
-	// whether the ALTERNATIVE costs anything, so which branch is free depends
-	// entirely on which way the decision was pushed, and a decision is pushed
-	// with `d.choice = sv.hold`:
-	//
-	//   pushed choice=false (no tap)  ->  alternative is tap,    costs 1, GATED
-	//   pushed choice=true  (tap)     ->  alternative is no-tap, costs 0, FREE
-	//
-	// Stale tapRemaining (almost always 0) means the countdown in solverStep
-	// never fires, so sv.hold survives the whole 4-step branch interval instead
-	// of self-releasing after 2 - and the next Tap decision is therefore pushed
-	// with choice=true and gets a free alternative. Clean state releases the
-	// hold, the decision is pushed with choice=false, and it is gated.
-	//
-	// Measured at the time: 1756 free alternatives of 22675 gate evaluations
-	// with the defect, against 3 of 67995 without it. About 8% of Tap decisions
-	// escaping the budget is the whole difference.
-	//
-	// MEASURED AND REFUTED, which is the useful outcome. The prediction above was
-	// that exempting Tap would recover what the defect bought. It did the
-	// opposite: Theory of Everything STALLED AT 33.24% against a 19s clear, with
-	// 4302 free Tap alternatives out of 7515 gate evaluations - 60% of the gate
-	// leaking - and throughput down 5271 -> 1412 steps/s.
-	//
-	// The tell is that the toggle budget stayed pinned at 1 for the whole run and
-	// never deepened. With Tap exempt the budget-1 subtree is effectively
-	// infinite, so iterative deepening can never advance and the search drowns in
-	// tap patterns it should have reached last.
-	//
-	// So the conclusion inverts: the Tap gate is LOAD-BEARING, and it wants to be
-	// tighter rather than looser. It is what forces the UFO section to be
-	// searched simple-first. This does not contradict the tapRateBudget finding
-	// above - that loosened the ALLOWANCE, this changes which ALTERNATIVES are
-	// free, and only the second turned out to be decisive.
-	//
-	// Kept off, as the record of a measured dead end.
-	bool tapBudgetExempt = false;
 
-	// Budget taps as a RATE rather than a count.
-	//
-	// The toggle budget means two different things in the two air modes. For
-	// Hold, a toggle is a CHANGE: a sustained hold is one toggle whether it
-	// lasts ten steps or ten thousand, so the count does not depend on how much
-	// of the path is mutable. For Tap, cost is one per tap and the taps a UFO
-	// needs scale LINEARLY with the length of the section - so the same number
-	// means "path complexity" in one mode and "section length" in the other.
-	//
-	// MEASURED CONSEQUENCE: widening is self-defeating in UFO. The mutable
-	// window escalated 240 -> 7680 steps (1s -> 32s) in 90 seconds while the
-	// allowance stayed at 3 taps, so reaching further back made the gate TIGHTER
-	// exactly when the search needed it looser: more refusals -> more stalls ->
-	// more widening. Both a run with tap ordering and the current baseline show
-	// the same runaway once progress stops.
-	//
-	// With this on, taps are counted against their own allowance which scales
-	// with the window, so a 32-second window permits 32x the taps of a
-	// one-second window. At the default window the allowance is exactly
-	// toggleBudget, so nothing changes until widening begins. Hold toggles keep
-	// the flat, window-invariant budget, which is correct for them.
-	// MEASURED and LOST, worse than the thing it was meant to fix: Theory of
-	// Everything stalled at 32.49% where the shared budget reaches 78.90%, and
-	// the widening runaway it targeted was UNCHANGED - 5 widenings, 0 resets,
-	// identical to the baseline. Reverted to off.
-	//
-	// Two things it established, both worth more than the change itself:
-	//
-	// 1. The budget is NOT what gates the fake corridor. At w7680 the allowance
-	//    was 3 x 32 = 96 taps in the mutable window - a nearly free gate - and
-	//    the search still never left 32.49%. Loosening the bound does not help,
-	//    so budget tuning, rate budgets and faster deepening are all dead ends.
-	//    What stops it is DFS ORDER: release-first explores essentially every
-	//    low-altitude path before any high-altitude one, and there are
-	//    astronomically many. The fix has to change what is TRIED, not what is
-	//    allowed.
-	//
-	// 2. The 78.90% result depends on taps and hold toggles sharing ONE budget.
-	//    Giving them separate pools is strictly looser and still broke it, so
-	//    the coupling is load-bearing and not understood. Treat 78.90% as
-	//    fragile until it is.
-	bool tapRateBudget = false;
 
 	// "Falling" threshold, in units of gravity-relative fall speed (positive =
 	// moving the way gravity pulls). 0.0 means any downward motion counts.
@@ -999,24 +848,6 @@ struct Config {
 	// rim with zero margin is not arriving.
 	double geomUrgencyFrac = 0.7;
 
-	// Divide the map's vertical reach by the segment's speed. MEASURED: OFF.
-	// Electrodynamix went from a 1m51s clear to a 29.47%% stall - worse than the
-	// lookahead change alone managed - and the run says exactly why. Dead
-	// intervals went 167 -> 338 and dead-space steers went from 31 across the
-	// whole old run to 696 in half of this one, with the steer rate 35%% -> 67%%.
-	// Reachable space was marked dead and the steering then pushed the player
-	// away from the route it needed.
-	//
-	// The reasoning behind the change is sound for a PHYSICAL bound: vertical
-	// motion is per-step, so crossing the same 30 units at 2x gives 0.80 of the
-	// steps and 0.80 of the climb. The error was assuming geomVerticalReach IS
-	// that bound. It is a tightness heuristic, and being deliberately tighter
-	// than physics is what produces dead detection at all - so it was already
-	// sitting near a cliff, and 20%% more broke it.
-	//
-	// Whether this can be turned on depends on how far 60 sits from the real
-	// climb rate, which is what the climb instrumentation below measures.
-	bool geomSpeedReach = false;
 
 	// Liveness: propagate the live window backward from the end of the level so
 	// a gap that leads nowhere can be told from one that leads out. OFF means
@@ -3147,7 +2978,6 @@ struct Decision {
 // Taps spent by this choice. Always 1 for a tap, independent of the flag - the
 // flag decides which budget it is charged to, not what it costs.
 int tapCost(Decision const& d, bool choice) {
-	if (g_config.tapBudgetExempt) return 0;
 	return (d.modeClass == ModeClass::Tap && choice) ? 1 : 0;
 }
 
@@ -3172,11 +3002,7 @@ int decisionCost(Decision const& d, bool choice) {
 		// from 78.90% to 32.49% - the first UFO section needs scattered single
 		// taps, which doubled in price. Neither model dominates; per-tap is the
 		// one that demonstrably clears more.
-		// Under tapRateBudget a tap is charged to the tap allowance instead, so
-		// it must not also consume the hold-toggle budget or it is counted twice.
-		case ModeClass::Tap:
-			if (g_config.tapBudgetExempt) return 0;
-			return g_config.tapRateBudget ? 0 : (choice ? 1 : 0);
+		case ModeClass::Tap:   return choice ? 1 : 0;
 		case ModeClass::Hold:   return (choice != d.enteringHold) ? 1 : 0;
 		case ModeClass::Ground: default: return 0;
 	}
@@ -3384,11 +3210,34 @@ struct Solver {
 
 	// Fastest this mode and size has been seen to move in the given world
 	// direction, over every speed column. 0 until something has been observed.
+	// The most this mode can move vertically in one step.
+	//
+	// MEASURED for ship in a purpose-built level (Probe 16), not sampled
+	// from whatever the search happened to fly. Two independent readings -
+	// the game's own m_yVelocity and slope x the canonical per-step dx -
+	// agreed at exactly 4.4444 across ten cells, and the figures held at
+	// 0.5x, 1x, 2x, 3x and 4x, so vertical rate is speed-independent and
+	// these are physics constants rather than fitted ones.
+	//
+	// This is what geomUrgencySteer was missing. It was switched off
+	// because its only input was the fitted vertical-reach constant that
+	// 9803757 dropped as untrustworthy - the mechanism was fine, the number
+	// under it was a guess.
+	//
+	// Modes without a measured figure fall back to the sampled table. They
+	// do not appear in any level in the regression set, so there is nothing
+	// to measure them against yet.
 	double observedClimb(PlayerObject* p, bool up) const {
 		if (!p) return 0.0;
 		const int mode = p->m_isShip ? 0 : p->m_isDart ? 1 : p->m_isBird ? 2 : 3;
 		const int size = p->m_vehicleSize < 0.9f ? 1 : 0;
 		const int dir  = up ? 0 : 1;
+		if (mode == 0) {
+			//                     up      down
+			static const double kShip[2][2] = {{1.800, 1.440},   // normal
+			                                   {2.118, 1.694}};  // mini
+			return kShip[size][dir];
+		}
 		double v = 0.0;
 		for (int sp = 0; sp < 5; sp++) v = std::max(v, maxClimb[mode][size][sp][dir]);
 		return v;
@@ -4990,9 +4839,7 @@ bool geometryBuildMap() {
 	for (int si = n - 2; si >= 0; si--) {
 		// Reach scales with how many STEPS this segment takes to cross, which is
 		// its width divided by the speed in force there.
-		const double segDx = g_config.geomSpeedReach
-			? std::max(1e-6, static_cast<double>(m.segSpeed[si]))
-			: kSpeedNormal;
+		const double segDx = kSpeedNormal;
 		// Overlap mode: reach is unbounded, so a gap's window is its whole gap
 		// and the sweep reduces to pure overlap connectivity.
 		const double reach = g_config.geomReachMode == 1
@@ -6556,23 +6403,7 @@ void pollHotkeys() {
 		ceilingProbeDump("on demand");
 	}
 
-	// T = restore tap state on a reposition instead of letting it go stale.
-	if (keyPressedEdge('T')) {
-		g_config.tapStateSurvivesRestore = !g_config.tapStateSurvivesRestore;
-		log::info("Tap state on a reposition: {}. F2 to solve with this.",
-		          g_config.tapStateSurvivesRestore
-		              ? "SURVIVES (stale, the default - sv.hold outlives the tap and the "
-		                "next Tap decision is pushed held, so its alternative is free)"
-		              : "RESTORED (clean - the tap self-releases and the next Tap "
-		                "decision is pushed released, so its alternative is gated)");
-	}
 
-	// Y = take Tap decisions out of the toggle budget.
-	if (keyPressedEdge('Y')) {
-		g_config.tapBudgetExempt = !g_config.tapBudgetExempt;
-		log::info("Tap decisions are {} the toggle budget. F2 to solve with this.",
-		          g_config.tapBudgetExempt ? "EXEMPT from" : "charged against");
-	}
 
 	// A = archive restart instead of the blind escape rewind.
 	if (keyPressedEdge('A')) {
@@ -6603,6 +6434,43 @@ void pollHotkeys() {
 			"section lowers the roof"};
 		log::info("Map roof: {}. F2 to solve with this (the map rebuilds on F2).",
 		          kRoof[g_config.geomPortalRoof]);
+	}
+
+	// 1 = urgency steering. The map is otherwise purely REACTIVE: the steer
+	// returns 0 whenever the player is within geomClearanceBand of the
+	// target centre, so it only ever speaks after a drift has happened.
+	// MEASURED: every steer in every run was a drift correction (dead 0,
+	// win 14204), and Clutterfunk's wall is a mini ship that clears a saw,
+	// rides the ceiling, and meets a roof dropping 30 units 23 steps later -
+	// the steer fires far too late to reverse a climb.
+	//
+	// Urgency speaks in the band where the manoeuvre is becoming urgent but
+	// is still possible, which needs only the climb rate and no model of
+	// acceleration or turning.
+	if (keyPressedEdge('1')) {
+		g_config.geomUrgencySteer = !g_config.geomUrgencySteer;
+		log::info("Urgency steering: {}. F2 to solve with this.",
+		          g_config.geomUrgencySteer
+		              ? "ON - speak when a move is becoming urgent, not once it "
+		                "is already missed"
+		              : "off - steer only on drift, as before");
+	}
+
+	// F = cycle escapesBeforeAnchorRelease. Stage 2 of the ladder frees the
+	// mode-transition anchor, and MEASURED it is the only stage that can move
+	// the floor at all once the window has passed the anchor: Clutterfunk under
+	// Z widened 240 -> 7680, a 32x increase, while the rewind went 243 -> 633
+	// steps and then back down to 618, with `anchor held` on all 23 escapes.
+	// At the default 10 the release arrives ~10400 deaths into a stall, which is
+	// later than the search survives. 1 fires it the moment the window maxes.
+	if (keyPressedEdge('F')) {
+		g_config.escapesBeforeAnchorRelease =
+			g_config.escapesBeforeAnchorRelease == 10 ? 3 :
+			g_config.escapesBeforeAnchorRelease == 3  ? 1 : 10;
+		log::info("Anchor release: after {} escapes at the max window ({} deaths of "
+		          "thrashing past it). F2 to solve with this.",
+		          g_config.escapesBeforeAnchorRelease,
+		          g_config.escapesBeforeAnchorRelease * g_config.stallLimit);
 	}
 
 	// J = cycle escapesBeforeWidening. Read at stall time, so it takes effect on
@@ -6839,17 +6707,6 @@ void pollHotkeys() {
 			          "checkpoint. Plan 13.13.",
 			          g_config.hybridRestore ? "ON" : "OFF",
 			          g_config.hybridRestore ? "do NOT carry" : "carry");
-			log::info("Solver: tap ordering by need is {} (fall speed > {:.2f} tries the "
-			          "tap first). Plan 13.15.",
-			          g_config.tapOrderByNeed ? "ON" : "OFF", g_config.tapNeedFallSpeed);
-			log::info("Solver: tap budget is {} (allowance {} taps at the default {}-step "
-			          "window, scaling with it). Plan 13.15.",
-			          g_config.tapRateBudget ? "a RATE" : "a flat count",
-			          tapAllowance(g_config.commitLookbackSteps),
-			          g_config.commitLookbackSteps);
-			log::info("Solver: tap state {} a reposition. Plan 13.15.",
-			          g_config.tapStateSurvivesRestore ? "SURVIVES (stale, as 30fe2b7)"
-			                                           : "is restored (clean)");
 			log::info("Solver: starting DFS. air branch interval {} steps, "
 			          "release-before-hold ordering. F2 again to stop.",
 			          g_config.airBranchInterval);
@@ -8403,10 +8260,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				const bool climb = steer > 0;
 				d.choice = m_player1->m_isUpsideDown ? !climb : climb;
 				d.steerChoice = d.choice;
-			} else if (d.modeClass == ModeClass::Tap && g_config.tapOrderByNeed) {
-				d.choice = tapFirst;
-				sv.tapDecisions++;
-				if (tapFirst) sv.tapFirstChosen++;
 			} else {
 				d.choice = sv.hold;
 			}
@@ -10365,7 +10218,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			solverRestoreState(d);
 			sv.step        = d.step;
 			sv.hold         = sv.resumeHold;
-			if (!g_config.tapStateSurvivesRestore) {
+			{
 				sv.tapping      = sv.resumeTapping;
 				sv.tapRemaining = sv.resumeTap;
 			}
@@ -10401,7 +10254,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					return true;
 				}
 				sv.hold         = sv.resumeHold;
-				if (!g_config.tapStateSurvivesRestore) {
+				{
 					sv.tapping      = sv.resumeTapping;
 					sv.tapRemaining = sv.resumeTap;
 				}
@@ -10476,12 +10329,50 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			}
 
 			const size_t drop = std::min(static_cast<size_t>(g_config.escapeJump), maxDrop);
+
+			// Probe 18: what the rewind ACTUALLY did, against what it was asked
+			// to do. Three quantities claim to control how far back the search
+			// may go - escapeJump in decisions, lookbackSteps in steps, and the
+			// commit floor as a stack index - and nothing has ever reported
+			// which of them bound a given escape. xStep abandons 16, 37, 53,
+			// 54, 59, 60, 113, 119, 120, 134, 142 and then 200 decisions, a
+			// pattern that tracks depth-against-floor rather than anything to
+			// do with where progress stopped. This line settles whether
+			// escapeJump is doing any work at all.
+			const size_t depthBefore = sv.stack.size();
+			const size_t floorCap    = depthBefore > escFloor ? depthBefore - escFloor : 0;
+			const int    stepAtFloor = escFloor < depthBefore
+			                         ? sv.stack[escFloor].step : 0;
+
 			for (size_t i = 0; i < drop; i++) {
 				releaseCheckpoint(sv.stack.back().rs.cp);
 				sv.stack.pop_back();
 			}
 			sv.escapes++;
 			sv.deathsAtBest = sv.deaths;
+
+			{
+				const int newStep = sv.stack.empty() ? 0 : sv.stack.back().step;
+				// The number that matters: how much ALREADY-SOLVED level this
+				// threw away. An escape that lands a few steps behind the best
+				// is retrying the hard part; one that lands thousands of steps
+				// behind is re-deriving a section it had already cleared.
+				const int undone = sv.bestStep - newStep;
+				const char* bound = drop == static_cast<size_t>(g_config.escapeJump)
+				                  ? "escapeJump"
+				                  : (maxDrop == floorCap ? "COMMIT FLOOR"
+				                                        : "air-section guard");
+				log::info("Escape #{} at {:.2f}%: dropped {} of {} decisions "
+				          "(bound by {}; escapeJump {}, floor allows {}) - "
+				          "depth {}->{}, step {}->{}, undoing {} steps behind best. "
+				          "floor idx {} at step {}, window {}, budget {}, anchor {}",
+				          sv.escapes, sv.bestPct, drop, depthBefore, bound,
+				          g_config.escapeJump, floorCap,
+				          depthBefore, sv.stack.size(), sv.bestStep, newStep, undone,
+				          escFloor, stepAtFloor, sv.lookbackSteps,
+				          g_config.toggleBudget,
+				          sv.anchorReleased ? "released" : "held");
+			}
 
 			// Escapes that keep bouncing off the commit floor mean the search is
 			// boxed in: it has nowhere left to explore inside the window. Widen
@@ -10589,11 +10480,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (d.tried != 0b11 && d.airPolicy) {
 				sv.budgetGateEvals++;
 
-				// Tap decisions are gated on the tap allowance, Hold on the flat
-				// toggle budget. Under tapRateBudget decisionCost returns 0 for
-				// Tap, so exactly one of these is nonzero for any decision.
-				const bool isTapBudget = g_config.tapRateBudget &&
-				                         d.modeClass == ModeClass::Tap;
+				const bool isTapBudget = false;
 				const bool wouldToggle = isTapBudget
 				                       ? tapCost(d, !d.choice) > 0
 				                       : decisionCost(d, !d.choice) > 0;
@@ -10788,7 +10675,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			sv.resyncForBacktrack = false;
 			sv.resyncing   = false;
 			sv.hold         = sv.resumeHold;
-			if (!g_config.tapStateSurvivesRestore) {
+			{
 				sv.tapping      = sv.resumeTapping;
 				sv.tapRemaining = sv.resumeTap;
 			}
