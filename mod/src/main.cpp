@@ -123,6 +123,44 @@ struct Config {
 	// of slack either side.
 	double geomTightHeights = 6.0;
 
+	// 0 = branch every airBranchInterval steps. 1 = branch only where the corridor
+	// ahead CHANGES. 2 = as 1, but full cadence in tight corridors.
+	//
+	// Default 0. See the MEASURED block at geometryWantsBranch: mode 1 is what
+	// cleared Clubstep in 59 seconds on 9803757, where mode 0 stalls at 58.43%.
+	// Restored after c57f14d deleted it as unreachable - it was unreachable at the
+	// default and load-bearing on the hotkey. M cycles it.
+	//
+	// DEFAULT IS NOW 1, on a full 15-level suite (2026-09-12 12:38, M x1, nothing
+	// else pressed) against the same suite on the old default:
+	//
+	//                        mode 0          mode 1
+	//   Base After Base      STALL 69.09%    318 deaths / 3s    <- first ever solve
+	//   Clubstep             20274 / 178s    5805 / 61s
+	//   xStep                 7292 /  63s    2901 / 28s
+	//   Cant Let Go           1434 /  13s     516 /  5s
+	//   Electroman            4053 /  37s    2378 / 25s
+	//   Jumper                2216 /  20s     948 /  9s
+	//   Time Machine          1379 /  13s     770 /  8s
+	//   Electrodynamix         (1m51s)       4892 / 55s
+	//   Clutterfunk           3743 /  34s    STALL 55.65%       <- the one regression
+	//   ...every other level faster or equal, no exceptions.
+	//
+	// 14 of 15 either way, but mode 1 solves the level that had NEVER solved and is
+	// 2-3.5x faster on everything else. The trade is Base After Base for
+	// Clutterfunk, and Clutterfunk is recoverable by cycling M to 0.
+	//
+	// The default moves rather than staying at 0 with the result recorded in a
+	// commit message, because that is exactly how this mechanism was lost: 9803757
+	// reads "Clubstep clears - first demon!" describing an M-pressed run while the
+	// default stayed 0, so eleven days later c57f14d deleted it as unreachable.
+	// A tested configuration that is not the default configuration is a trap.
+	//
+	// Mode 2 is NOT the fix for Clutterfunk - measured, same 55.65% stall in the
+	// same fixed point. Nor is escapeArchiveRestart: A alone reaches 58.98% where
+	// default SOLVES, collapsing the commit floor to 0 and running the budget to 15.
+	int  geomBranchMode = 1;
+
 	// How long a discrete tap holds the button. Only needs to outlast the
 	// measured one-step injection latency so the press registers as an edge;
 	// holding longer does nothing in UFO or swing and would only crowd the next
@@ -5884,6 +5922,21 @@ void pollHotkeys() {
 	}
 
 
+	// M = branch on geometry change rather than on a fixed cadence.
+	if (keyPressedEdge('M')) {
+		g_config.geomBranchMode = (g_config.geomBranchMode + 1) % 3;
+		static const char* kName[3] = {
+			"every airBranchInterval steps, as before",
+			"where the corridor ahead CHANGES",
+			"where it CHANGES, but full cadence in tight corridors"};
+		log::info("Air branching: {} (min {} steps, max {}, tight < {:.0f} units). "
+		          "F2 to solve with this.",
+		          kName[g_config.geomBranchMode],
+		          g_config.airBranchInterval, g_config.airBranchIntervalMax,
+		          g_config.geomTightHeights * GeoMap::get().playerH);
+	}
+
+
 	// A = archive restart instead of the blind escape rewind.
 	if (keyPressedEdge('A')) {
 		g_config.escapeArchiveRestart = !g_config.escapeArchiveRestart;
@@ -9607,11 +9660,59 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// Has the corridor ahead changed since the last decision? Only consulted
 		// between airBranchInterval and airBranchIntervalMax: below the minimum
 		// nothing branches, above the maximum everything does.
-		// Was geomBranchMode: branch on a geometry CHANGE rather than a fixed
-		// cadence. Mode 0 - the default and the only mode ever shipped - returned
-		// true immediately, so the whole rule was unreachable. Removed with the
-		// mode; the fixed cadence is what has always run.
-		auto geometryWantsBranch = [&]() -> bool { return true; };
+		//
+		// RESTORED. c57f14d deleted this with the note "mode 0 - the default and the
+		// only mode ever shipped - returned true immediately, so the whole rule was
+		// unreachable". The second half was true and the first half was not: mode 1
+		// shipped on a hotkey, and it is what produced the fastest Clubstep clear
+		// this project has recorded.
+		//
+		// MEASURED, and the control arrived eleven days late. Same build - the
+		// working tree committed 25 minutes afterwards as 9803757 - same level:
+		//
+		//   M pressed (mode 1)   Clubstep SOLVED, 6,206 deaths, 59 seconds
+		//   default  (mode 0)    Clubstep STALLED at 58.43% after 9,903 deaths
+		//
+		// 9803757's message reads "Clubstep clears - first demon!" and does not
+		// mention the key, so that result has been read as a default-config clear
+		// ever since. It was not one.
+		//
+		// What it does: the fixed cadence pushes a decision every airBranchInterval
+		// steps in the air whether or not anything is happening, so a long straight
+		// corridor costs the search hundreds of decision points that all have the
+		// same answer. Mode 1 reads the free window at the lookahead point and only
+		// branches when it has CHANGED since the last decision. It cannot go blind:
+		// airBranchIntervalMax forces a decision regardless, and no map reading means
+		// no opinion, which falls through to the old cadence.
+		//
+		// Mode 2 additionally keeps every decision inside a tight corridor, where
+		// timing is what matters - suppressing them there is what cost mode 1 the
+		// mini ship section.
+		//
+		// Default 0, so this is inert until M is pressed.
+		auto geometryWantsBranch = [&]() -> bool {
+			if (g_config.geomBranchMode == 0 || !GeoMap::get().valid) return true;
+			const uint64_t elapsed = sv.step - sv.lastBranch;
+			if (elapsed >= static_cast<uint64_t>(g_config.airBranchIntervalMax)) return true;
+			const double lookX = p->getPositionX() +
+				(g_config.geomLookaheadScaleWithSpeed
+					? static_cast<double>(g_config.geomLookaheadSteps) * sv.dxPerStep
+					: static_cast<double>(g_config.geomLookaheadFixedX));
+			double glo = 0.0, ghi = 0.0;
+			// No reading means no opinion: keep the old cadence rather than
+			// suppressing a decision the map cannot vouch for.
+			if (!geometryWindowAt(lookX, p->getPositionY(), &glo, &ghi)) return true;
+			// Tight corridor: keep every decision.
+			if (g_config.geomBranchMode >= 2 &&
+			    (ghi - glo) < g_config.geomTightHeights * GeoMap::get().playerH) {
+				sv.lastGeoLo = glo; sv.lastGeoHi = ghi;
+				return true;
+			}
+			const bool changed = std::abs(glo - sv.lastGeoLo) > 0.01 ||
+			                     std::abs(ghi - sv.lastGeoHi) > 0.01;
+			if (changed) { sv.lastGeoLo = glo; sv.lastGeoHi = ghi; }
+			return changed;
+		};
 
 		if (mc == ModeClass::Tap) {
 			// Discrete events: decide whether to tap, on the same cadence. No

@@ -531,3 +531,99 @@ trio.
 
 The discipline this document is meant to enforce: **nothing ships that has not
 been isolated, and nothing stays that has been measured inert.**
+
+---
+
+## 10. Revised ordering, 2026-09-12
+
+The ordering in section 9 was written before a night of testing that inverted its
+premise. Recording the revision here so it stops living in chat history.
+
+### What happened
+
+Two things moved the board, and **neither was on the ordering**:
+
+- `tapStateSurvivesRestore` — `6f7562d` retired it on evidence from two levels,
+  one of which that commit itself calls a NULL TEST. Restored and controlled:
+  Clubstep **solves at 20,274 deaths with it on** and stalls at 71.75% after
+  27,430 with it off. First F4-verified demon on this lineage.
+- `geomBranchMode` — `c57f14d` (mine) deleted it as "unreachable", because mode 0
+  short-circuits the rule. Mode 0 is the default; mode 1 shipped on a hotkey.
+  Same build, same level: mode 0 stalls Clubstep at 58.43%, mode 1 **solves it in
+  60 seconds at 6,206 deaths**, reproduced bit-for-bit eleven days apart.
+
+Everything *built* that night was reverted: two escape-ladder triggers that failed
+in opposite directions (one demoted on any 0.01% creep and so never escalated; its
+replacement never demoted and pinned every level at maximum window, costing
+Electroman its solve).
+
+### The principle that follows
+
+**Keypress experiments before builds.** Both wins came from exercising a flag that
+already existed. Four of my judgements that night were wrong in the same way -
+`geomUrgencySteer`, the `geomLookaheadSteps` ternary, `tapAllowance` and
+`geomBranchMode` - all "this is inert" reasoned from the default without checking
+whether the hotkey had ever been pressed. The last of those deleted the best result
+in the project's history.
+
+So: **a flag is not dead because its default makes it inert. Grep the logs for the
+hotkey before deleting anything.**
+
+### Revised list
+
+**Tier 0 - keypress, zero build**
+
+1. `geomBranchMode` - `M` x1 then x2, on Clubstep, the suite, and Base After Base.
+2. `escapeArchiveRestart` - `A`. Promoted sharply. Its own build comment says the
+   rewind "re-derives the same limit cycle from a slightly different starting
+   depth every time - the detachment failure Go-Explore names", and that is
+   verbatim what Electroman now measures: twelve identical escapes dropping 596
+   decisions and 5,047 steps, and Clubstep dropping the same 671 forever. Built
+   for this pathology, never once run.
+3. Reach mode - `L`, WINDOWED. Only after item 6 gives it measured numbers; its
+   input being a fitted constant is what retired it in `9803757`.
+4. The predictive steer trio - `geomForwardScan`, `geomUrgencySteer`,
+   `geomRouteSteer`. Note urgency is nested inside route.
+
+**Tier 1 - measurement, no build**
+
+5. UFO velocity, per `docs/STEER_TARGET.md` section 4.2. One tap for the impulse,
+   no input for gravity and terminal fall, two consecutive taps to settle whether
+   the flap sets or adds. Does not need frame-perfect spamming.
+
+**Tier 2 - build**
+
+6. **The steer target** - velocity 4c plus the reach envelope. See
+   `docs/STEER_TARGET.md`. Probe 17 on the verified Clubstep macro reads
+   `OFF-MAP 0 / DEAD 0 / OUT-OF-WINDOW 0`: the map contains every step of a
+   winning route through a demon and the search could not find it. That is the
+   whole case, and that zero is also the acceptance test.
+7. Unmeasured bands - `bandHeightForPortal`. Ship/UFO 300 and ball 240 are
+   measured; the rest are guesses, and the ceiling offset is `band/2 - 15`, so a
+   wrong band gives a wrong roof. Feeds Base After Base, whose map roof measures a
+   uniform 240 units above the enforced ceiling (`roofMargin 240@13761/240/240`).
+8. Velocity 4b - `(y, vy)` pruning. The one item that genuinely needs an
+   acceleration and reversal model. Strictly an improvement on item 6's outer
+   bound, never a substitute.
+9. The left-to-right reachability pass. Liveness sweeps right-to-left and answers
+   "can I get OUT of this gap". It never asks whether the gap is reachable from
+   the start at all.
+
+**Dead or frozen**
+
+- *Bounded rewind by mode transitions* - **disproven.** Electroman reproduced its
+  frontier twelve times with 5,047 steps of rewind available. More reach does not
+  help; the search re-derives the same wrong path because the target is the same.
+- *Escape-ladder tuning* - frozen. Two attempts failed in opposite directions. It
+  is compensation for the steer target, and tuning compensation before fixing the
+  cause is how a whole session went.
+- *Restore-path variants* - no evidence they cost anything.
+
+### Debt
+
+Two mechanisms now earn their defaults empirically without a mechanism we
+understand. `tapStateSurvivesRestore`'s stated mechanism is measurably wrong - free
+taps *fall* with it on, 1.6% against 6.2% - and what it really does is keep the
+frontier moving so the escape ladder never reaches its fixed point. `geomBranchMode`
+is likely similar. Both are flagged as such in the source so they get revisited
+rather than enshrined. Fixing the steer target is what should retire them.
