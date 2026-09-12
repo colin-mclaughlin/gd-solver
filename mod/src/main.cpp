@@ -115,40 +115,6 @@ struct Config {
 	// knob to tighten if a section proves unsolvable.
 	int airBranchInterval = 4;
 
-	// Branch where the LEVEL changes, not on a metronome.
-	//
-	// Air decisions land every airBranchInterval steps whether or not anything
-	// is happening. In a long featureless corridor that is many identical
-	// decisions, each costing a ~22 KB checkpoint, none of which the level ever
-	// asked for. Branching when the live interval ahead actually changes puts
-	// decisions where the geometry demands a choice and skips the rest.
-	//
-	// Segment boundaries only exist at object edges, so "the interval ahead
-	// changed" is close to "an edge that matters was crossed" - the map's own
-	// structure supplies the cadence and no new constant does.
-	//
-	// airBranchIntervalMax bounds it: after that many steps a decision is forced
-	// regardless, so a stretch the map has no opinion about can never go
-	// unbranched. Completeness is unaffected either way - this changes WHERE
-	// decisions sit, and every input sequence remains reachable.
-	//
-	// Unlike the forward scan this does NOT raise the steer rate, which the
-	// session's evidence says is the variable that decides whether the map helps
-	// (36% solves, 69% and 93% stall). M toggles it.
-	// 0 off (flat cadence), 1 change-gated, 2 change-gated EXCEPT in tight
-	// corridors, which keep the full cadence.
-	//
-	// MEASURED, Clutterfunk: mode 1 blew past the 35.53%% wall the flat cadence
-	// had never beaten, reaching 55.65%%, with throughput more than doubled
-	// (8530 steps/s against 4000) because branches run far longer before dying.
-	// Then it stalled at the mini ship.
-	//
-	// The reason is that geometry change is not control difficulty. A long
-	// straight narrow tunnel has almost no object edges, so the corridor never
-	// "changes" and the gate suppresses decisions - in exactly the place a mini
-	// ship needs one every few steps. Mode 2 keys density on how TIGHT the
-	// corridor is instead, which is what control difficulty actually tracks.
-	int  geomBranchMode = 0;
 	int  airBranchIntervalMax = 16;
 
 	// A corridor narrower than this many player heights is "tight" and keeps the
@@ -312,45 +278,6 @@ struct Config {
 	// know which mode is active at a given x - a clean follow-up, not this pass.
 	int geomPlayerHeight = 15;
 
-	// Treat entering a dead cell as a death.
-	//
-	// This is the first time geometry touches a search decision, and it is a
-	// PRUNE, which the ordering-before-pruning rule says to avoid. It earns the
-	// exception because the map's error is one-directional: the sweep lets the
-	// player move freely inside a column, so it over-estimates reachability and
-	// under-reports dead space. A cell it marks dead has no forward route under
-	// any physics.
-	//
-	// The point is not the saved simulation. It is WHERE the search backtracks.
-	// Today the bottom corridor is entered at band 335 and kills the player at
-	// band 340, ~240 steps later; the commit floor sits 240 steps behind the
-	// frontier, so by the time the death is recorded the entry decision is
-	// frozen and cannot be retried. Detecting it at band 335 puts the death AT
-	// the entry, which is exactly the decision that needs to change.
-	//
-	// If the map is ever wrong, this deletes a viable route silently - so it is
-	// flagged, counted, and reported.
-	// MEASURED and REVERTED: Theory of Everything went 78.90%% -> 6.27%%, with
-	// 12566 of 45966 deaths called by the map at one x (1620.2, band 27) in
-	// ordinary cube gameplay the solver has crossed thousands of times.
-	//
-	// The cause is resolution, not the idea. Occupancy is per 60x30 cell and a
-	// cell is marked lethal if ANY hazard touches it - but 199 of this level'''s
-	// 257 hazards are 9x7.2 spikes, 3.6%% of a cell. Every spike blankets 28x its
-	// own area, vertical runs terminate that actually continue, and the dead
-	// region cascades left. The corridor result was right by luck of scale: the
-	// four saws there are 44x85 and genuinely fill their cells.
-	//
-	// It also broke my own rule - ordering before pruning - and the failure mode
-	// was exactly the one that rule exists to prevent: routes deleted silently,
-	// visible only as "the search got worse".
-	//
-	// The fix is not a finer grid. At 7.5 units a column is ~6 physics steps and
-	// free vertical movement inside it stops being a safe over-estimate. What
-	// this needs is per-column FREE INTERVALS computed from real object rects
-	// against the player'''s own hitbox height, propagated with physics-bounded
-	// vertical reach - the reachable-interval build, not a bucketed grid.
-	bool geometryDeadPrune = false;
 
 	// Use the map for move ORDERING: at an air decision, try first whichever
 	// branch heads toward space that still has a forward route.
@@ -988,35 +915,6 @@ struct Config {
 	// which is what makes the cap necessary at all.
 	int geomVerticalReach = 60;
 
-	// How far OUTSIDE the live window the player must be before steering fires.
-	//
-	// Probe 9 measured the mean window at 97-98% of its gap, so the great
-	// majority of narrowings are a unit or two - real, but meaningless. Steering
-	// on those overrides continue-first ordering for nothing, and that ordering
-	// is load-bearing: it is what makes a sustained hold cost one decision
-	// instead of many. MEASURED price of steering indiscriminately: Clutterfunk
-	// 34s -> 45s and Time Machine 2m00 -> 2m38 against the pre-geometry
-	// baseline, both +32%, on levels with no fake corridors.
-	//
-	// Raising reach does NOT fix this - Clutterfunk's constrained count is flat
-	// at ~350 for every reach >= 15, so the pinches are real. The fix is to
-	// ignore the ones the player is only marginally outside of.
-	//
-	// One block. Applies only to being outside a live window; DEAD space always
-	// steers, because there is nothing marginal about a corridor that ends.
-	// MEASURED and REVERTED to 0 (off). At 30 - one block - Theory of Everything
-	// stopped solving entirely (stalled 75.52%) and Clutterfunk went 45s -> 3m06s
-	// with its steer rate cut 7.4%% -> 1.0%%.
-	//
-	// Two things wrong with it. An ABSOLUTE margin cannot work when passages run
-	// from 90 units (ToE's pillar gap) to 300: 30 units is a third of the former
-	// and a tenth of the latter. And the premise was wrong - cutting Clutterfunk's
-	// steering made it FOUR TIMES slower, so the steering was helping, and the
-	// 34s -> 45s I called a tax was not caused by what I assumed.
-	//
-	// A relative margin - a fraction of the window height - might still work.
-	// This one does not.
-	int geomSteerMargin = 0;   // superseded by geomClearanceBand
 
 	// How far off-centre the player may drift inside the live window before
 	// steering fires, as a FRACTION of the window's height.
@@ -1332,118 +1230,12 @@ struct Config {
 	// replay is the only exact option.
 	bool noSavestates = false;
 
-	// --- beam search -------------------------------------------------------
-	// Frontier width.
-	//
-	// Set from TIME, not memory. Expanding a node costs two restores - after
-	// stepping the first child we are at the child's state, not the parent's -
-	// and a restore was MEASURED at 1.06 ms on Stereo Madness and 40.9 ms on an
-	// object-heavy level (Probe 5). A 20k-step level branches every 4 steps, so
-	// ~5000 beam levels:
-	//
-	//     restores = 2 * width * 5000
-	//     width 64  -> 640k  ->  11 min @1.06ms,  7.3 h @40.9ms
-	//     width 500 -> 5M    ->  88 min @1.06ms,   57 h @40.9ms
-	//
-	// For comparison the DFS clears Stereo Madness in 1473 restores. The beam
-	// buys coverage by paying restores, so width belongs in the tens until
-	// restore cost comes down. Memory is NOT the binding constraint at these
-	// widths - beamReclaim keeps live checkpoints proportional to width, not to
-	// nodes explored.
-	int  beamWidth = 64;
 
-	// Rank the frontier by the MAP rather than by progress.
-	//
-	// The beam expands in lockstep, so every candidate at a level sits at almost
-	// the same step and therefore almost the same percent - ranking by progress
-	// is ranking noise, which is the recorded reason the beam was set aside.
-	// The map supplies the discriminator progress cannot: among states that are
-	// equally far along, prefer the one better placed inside the live corridor,
-	// because that is the one more likely to still be alive in fifty steps.
-	//
-	// This is the map used as a VALUE FUNCTION over whole states, not as a
-	// per-decision override. It is the one use that cannot demand a move the
-	// physics will not make - measured this session, every attempt to steer
-	// individual decisions harder (forward scan 69%%, clearance band 97.6%%)
-	// stalled, while the map's cheap global signals cost nothing.
-	//
-	// Ground states are deliberately given a neutral score: on flat ground every
-	// state sits in the same live interval, so the map has nothing to say and
-	// pretending otherwise would rank on noise again.
-	//
-	// V cycles: 0 diversity buckets (as before), 1 progress, 2 geometry.
-	int  beamRankMode = 0;
 
-	// Best-first instead of a width-K beam. P toggles it.
-	//
-	// MEASURED, Clutterfunk, width 64: the beam reached 3.39%% in 50 seconds -
-	// depth 196, 22241 restores, 90 deaths - against the DFS's 35%% in four
-	// seconds. It projects to about 24 minutes for the level.
-	//
-	// The cap was never the problem. `dropped` stayed modest and the frontier
-	// stayed full. The problem is that a beam advances in LOCKSTEP: it expands
-	// all K nodes before moving one level forward, so it pays 2K restores for
-	// every 4 steps of progress and pays that full width in the easy opening
-	// where DFS simply commits and dives. 90 deaths in 22241 restores is a
-	// search meticulously exploring states nothing was threatening.
-	//
-	// Best-first is not lockstep. One priority queue over every generated node,
-	// pop the single most promising, expand it, push both children, discard
-	// NOTHING. While things go well the most promising node is the deepest one,
-	// so it dives exactly like DFS; when a branch dies it resumes from whatever
-	// state is genuinely best anywhere in the tree, rather than the escape
-	// ladder's blind 200-decision rewind.
-	//
-	// That is the property worth having and the reason the earlier analysis
-	// ranked best-first above beam: "build the one without the arbitrary cap
-	// first, then add the cap only if memory forces it."
-	bool beamBestFirst = false;
 
-	// How much the geometry score is worth, in percent of level progress.
-	//
-	// It was written as an exact-tie tiebreak on pct and therefore NEVER FIRED:
-	// pct is a float with about 0.005%% of granularity per step, so two nodes
-	// essentially never compare equal and the geometry branch was dead code.
-	// Ranking mode 2 was behaving identically to mode 1 in every run so far.
-	//
-	// 0.02%% is roughly one decision's worth of progress, so a well-centred
-	// state can outrank one a single decision further along, and no more.
-	double beamGeoWeight = 0.02;
 
-	// How much a cell that kills EVERYTHING entering it is worth, in percent of
-	// progress. Scaled by the cell's death rate, not its death count.
-	//
-	// This is the missing half of best-first. Ranking on progress alone means a
-	// node 500 steps back is strictly worse than a node at the wall, so the
-	// queue keeps handing back wall nodes and each death spawns fresh siblings
-	// at the same depth - the search can never run out of them and is
-	// structurally incapable of backing off. MEASURED on Clutterfunk: 31.05%% in
-	// twelve seconds, then 14299 deaths without moving off 32.50%%.
-	//
-	// Charging progress for local failure is what lets it retreat. A node born
-	// into a cell that has already killed 31 branches scores 2.5%% worse than
-	// its progress suggests, one born into a cell that has killed 1023 scores
-	// 5%% worse - so the frontier drifts back to earlier, cheaper ground on its
-	// own instead of needing an escape ladder to force it.
-	//
-	// Charged at node CREATION rather than at pop: a heap cannot have its keys
-	// mutate underneath it. Newly generated siblings in a hot cell are born
-	// worse, which is what shifts the queue.
-	double beamDeathWeight = 8.0;
 
-	// Cell size for that death count, in world units. One block.
-	int    beamDeathCellSize = 30;
 
-	// A node gets its own checkpoint once it is this far, in steps, from its
-	// nearest checkpointed ancestor.
-	//
-	// 0 = derive it at search start from the measured restore and step costs.
-	// Restoring an ancestor and replaying d steps beats a direct restore exactly
-	// when d * stepCost < restoreCost, so the break-even interval IS
-	// restoreCost/stepCost - about 5 steps on Stereo Madness and about 195 on a
-	// heavy level. A fixed constant would be wrong on one of them, so it is
-	// measured per level instead of guessed.
-	int  beamCheckpointIntervalSteps = 0;
 
 	// Selection rule. Score-ranking is the naive baseline and is EXPECTED to
 	// fail on fake-corridor levels: the decoy scores higher early, so ranking by
@@ -1452,7 +1244,6 @@ struct Config {
 	// (mode, y band) so both corridors survive. Kept switchable so the
 	// prediction can be tested rather than assumed.
 
-	int  beamYBucketSize = 30;   // world units per diversity bucket
 
 	// --- Go-Explore --------------------------------------------------------
 	// Cell size. Too fine and the archive explodes with states that are the same
@@ -1475,65 +1266,13 @@ struct Config {
 	// section. sqrt keeps resolution where control is and compresses the rest.
 	double goCellVy = 0.4;
 
-	// Steps of DFS work per episode before returning to a fresh cell.
-	//
-	// Much larger than the 120 the coin-flip explorer used, and necessarily so:
-	// that budget was 120 steps of forward travel, this is 120 steps of SEARCH,
-	// most of which is spent re-walking a subtree after a death. 120 would buy
-	// two or three deaths and no coverage at all.
-	int goEpisodeSteps = 3000;
 
-	// Cap on the local DFS stack. Each entry holds a checkpoint, and a runaway
-	// stack would both exhaust memory and defeat the point of a BOUNDED local
-	// search - the archive is supposed to decide where effort goes, not one
-	// episode that never ends.
-	int goMaxDepth = 256;
 
-	// Archive cap. Each cell holds a checkpoint (~22-34 KB measured) plus its
-	// macro, so this is the memory knob. Eviction drops the cells furthest
-	// behind that have already been explored most.
-	// Each cell holds a checkpoint (22.0 KB measured on Stereo Madness, 33.7 KB
-	// on a heavier level) plus its macro, so this is the memory knob: 8000 cells
-	// is roughly 340 MB worst case. Deliberately a guess - the first run reports
-	// live memory and eviction rate, and those numbers set this properly. The
-	// beam taught the same lesson: one run's counters beat an afternoon of my
-	// arithmetic.
-	int goArchiveCap = 8000;
 
-	// Selection bias toward progress. 0 = pure count-based novelty, which is
-	// the paper's mechanism and is self-balancing: a new frontier cell has been
-	// chosen zero times so it wins automatically. Raising this makes selection
-	// greedier, which is the fake-corridor trap - kept switchable so that can be
-	// tested rather than assumed.
-	double goProgressBias = 0.0;
 
-	// How many archive cells one selection samples.
-	//
-	// MEASURED: at 16 out of 2016 cells a tournament sees 0.8% of the archive,
-	// so a frontier cell was picked roughly 8% of the time and ~92% of episodes
-	// re-explored solved ground - 12,000 episodes and 1.2M steps bought 19 new
-	// cells. Sampling has to be wide enough to FIND the frontier before any
-	// weighting can prefer it.
-	int goTournament = 64;
 
-	// Replace a cell's stored representative only when the new route is at least
-	// this many steps shorter.
-	//
-	// Go-Explore's criterion is trajectory length, which assumes length carries
-	// information about quality. Here it does not: the player advances at a
-	// constant rate, so macro length is very nearly a restatement of x position
-	// and two routes into the same cell differ by a handful of steps. Without a
-	// threshold this fires constantly (3,567 replacements for 2,017 cells) and
-	// the state a return lands on keeps shifting underneath the search.
-	int goImproveMargin = 8;
 
-	// A cell counts as "frontier" for reporting if it is within this many
-	// percent of the best reached. Diagnostic only; it steers nothing.
-	double goFrontierPct = 2.0;
 
-	// Fixed so a run reproduces. A search that misbehaves once and never again
-	// cannot be debugged.
-	uint64_t goSeed = 0x243F6A8885A308D3ull;
 };
 
 Config g_config;
@@ -1548,8 +1287,6 @@ enum class Mode {
 	Determinism,  // Probe 1: replay fixed input N times, compare trace hashes
 	RestoreTest,  // Probe 4b: does a restore reproduce the future, bit-for-bit?
 	Solve,        // DFS search for an input sequence that clears the level
-	Beam,         // deduplicated width-K beam search over the same action space
-	GoExplore,    // archive of cells; return to one, then explore from it
 	Verify,       // replay a found macro from frame 0, no savestates, no practice
 	Sweep,        // Probe 6: replay best.txt with a forced climb injected, and
 	              // report how high it got - geometry, with no search involved
@@ -2868,62 +2605,6 @@ struct RestoreState {
 	std::vector<uint8_t> playerBytes;
 };
 
-// ---------------------------------------------------------------------------
-// Deduplicated beam search: node store and sparse checkpointing
-// ---------------------------------------------------------------------------
-//
-// WHY NOT PLAIN BFS. Branching every few steps across a ~6000-step section is
-// on the order of 1500 binary decisions, i.e. 2^1500 states. Deduplication does
-// not rescue that: it collapses cube sections well, where many input sequences
-// converge on the same grounded state, but air trajectories almost never
-// coincide bit for bit, and the sections that block us are air. A bounded
-// frontier is the only thing that fits.
-//
-// The bound costs completeness, which is acceptable here for the same reason
-// the escape heuristic was: a found macro must still replay from frame 0 to
-// count, so an incomplete search can MISS a solution but can never manufacture
-// a false one.
-//
-// TWO SEPARATE BUDGETS, easily confused:
-//   * sparse checkpointing bounds BYTES PER NODE
-//   * frontier selection bounds NUMBER OF NODES
-// Neither substitutes for the other. A cheap node still costs a slot.
-struct BeamNode {
-	int      parent   = -1;   // index into Beam::nodes, -1 at the root
-	int      step     = 0;    // solver step this node sits at
-	uint64_t key      = 0;    // solverStateKey() at this node
-	float    pct      = 0.f;  // progress, for reporting and optional ranking
-
-	// How well this state sits inside the live corridor: 1 dead centre, 0 at the
-	// edge. Computed while the player is actually in the state, like `bucket`,
-	// because it cannot be recovered from the node afterwards.
-	float    geoScore = 0.f;
-
-	// What the heap actually orders by: progress, plus geometry, minus what the
-	// neighbourhood has already cost. Fixed at creation - see beamDeathWeight.
-	float    score    = 0.f;
-	bool     hold     = false;// input applied on the edge from parent to here
-	bool     alive    = true;
-
-	// Sparse checkpointing. Most nodes carry no checkpoint and are reached by
-	// restoring the nearest ancestor that does, then replaying forward. That
-	// replay is exact in EVERY mode now, which is what makes this sound - the
-	// superficially similar hybrid deleted in 13.11 existed to dodge broken air
-	// restores, whereas this exists purely to bound memory.
-	// Captured state lives in Beam::rsPool, not here. Inlining a RestoreState
-	// would put two vector headers and ~25 scalars - about 220 bytes - on every
-	// node including the overwhelming majority that hold no checkpoint. The
-	// indirection keeps BeamNode at 40 bytes, which is the difference between a
-	// 100 MB arena and a 650 MB one, and lets a reclaimed slot be reused.
-	int      rsIndex     = -1; // index into Beam::rsPool, -1 = no checkpoint
-	int      cpAncestor  = -1; // nearest ancestor (or self) holding a checkpoint
-	int      stepsSinceCp = 0; // replay distance from that ancestor
-
-	// Diversity bucket, computed while the player is actually in this state.
-	// It cannot be recovered afterwards from the node alone, which is why it is
-	// stored rather than derived at selection time.
-	uint32_t bucket      = 0;
-};
 
 struct Decision;
 int decisionCost(Decision const& d, bool choice);
@@ -3557,119 +3238,6 @@ struct Solver {
 	static Solver& get() { static Solver s; return s; }
 };
 
-// ---------------------------------------------------------------------------
-// The beam
-// ---------------------------------------------------------------------------
-struct Beam {
-	bool running = false;
-
-	// The search alternates between expanding a frontier and choosing the next
-	// one. Expansion is resumable mid-frontier because a full frontier is far
-	// more work than one rendered frame's budget allows.
-	enum class Phase { Init, Expand };
-	Phase phase     = Phase::Init;
-	int   expandIdx = 0;   // position within `frontier` while expanding
-
-	// Arena. Nodes are never erased while the search runs - a node may be the
-	// checkpoint ancestor of a live descendant long after it leaves the frontier
-	// - so `alive` marks frontier membership and the arena is freed at the end.
-	std::vector<BeamNode> nodes;
-
-	// Current depth's frontier and the next one being built, as node indices.
-	std::vector<int> frontier;
-	std::vector<int> next;
-
-	// Every state key ever expanded. A key that reappears is a state we have
-	// already explored the future of, so the duplicate is dropped.
-	std::unordered_set<uint64_t> visited;
-
-	// Captured states, indexed by BeamNode::rsIndex. Slots freed by beamReclaim
-	// are reused, so this grows to the high-water mark of live checkpoints
-	// rather than to the number of checkpoints ever taken.
-	std::vector<RestoreState> rsPool;
-	std::vector<int>          rsFree;   // reusable slots
-	std::vector<int>          cpNodes;  // nodes currently holding a checkpoint
-
-	// Scratch, reused so expansion and selection allocate nothing per node.
-	std::vector<uint8_t>   macroScratch;
-	std::vector<int>       pathScratch;
-	std::vector<int>       keepScratch;
-	std::unordered_set<int> neededScratch;
-
-	uint64_t expansions   = 0;
-	uint64_t dedupHits    = 0;
-	uint64_t deaths       = 0;
-	uint64_t steps        = 0;
-	uint64_t replaySteps  = 0;  // steps spent replaying forward from an ancestor
-	uint64_t restoreCount = 0;
-	uint64_t restoreFails = 0;
-	uint64_t dropped      = 0;  // nodes discarded by the selection rule
-	float    bestPct      = 0.f;
-	int      bestNode     = -1;
-	int      depth        = 0;
-
-	// Calibration, measured once at search start. cpInterval is derived from
-	// them unless the config pins it.
-	double restoreUs = 0.0;
-	double stepUs    = 0.0;
-	int    cpInterval = 240;
-	size_t memAtStart = 0;
-
-	// Best-first's open list: every generated, unexpanded node, kept as a heap.
-	// Unbounded by design - see Config::beamBestFirst.
-	std::vector<int> open;
-
-	// Deaths and expansions per (x, y) cell. The score uses the RATIO.
-	//
-	// MEASURED: a raw death COUNT punishes the correct path. Deaths accumulate
-	// wherever the search actually explores, which is the route, so the route
-	// became the most penalised place on the map and the queue drifted into
-	// untouched sideways cells - in Clutterfunk's cube opening those are all
-	// duplicate grounded states, and the run wedged at 12.44%% with 12776
-	// dedups against 77 deaths. It spread out instead of diving.
-	//
-	// A rate does not have that failure. The route has many expansions and few
-	// deaths; a wall kills nearly everything that enters it.
-	std::unordered_map<uint64_t, uint32_t> cellDeaths;
-	std::unordered_map<uint64_t, uint32_t> cellTries;
-
-	uint64_t startTicks   = 0;
-	uint64_t lastReport   = 0;
-
-	void clear() {
-		if (auto* pl = PlayLayer::get()) {
-			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
-		}
-		for (auto& r : rsPool) releaseCheckpoint(r.cp);
-		rsPool.clear();
-		rsFree.clear();
-		cpNodes.clear();
-		nodes.clear();
-		frontier.clear();
-		next.clear();
-		visited.clear();
-		macroScratch.clear();
-		pathScratch.clear();
-		keepScratch.clear();
-		neededScratch.clear();
-		expansions = dedupHits = deaths = steps = replaySteps = 0;
-		restoreCount = restoreFails = dropped = 0;
-		bestPct = 0.f;
-		bestNode = -1;
-		depth = 0;
-		expandIdx = 0;
-		phase = Phase::Init;
-		open.clear();
-		cellDeaths.clear();
-		cellTries.clear();
-		restoreUs = stepUs = 0.0;
-		cpInterval = 240;
-		memAtStart = 0;
-		running = false;
-	}
-
-	static Beam& get() { static Beam b; return b; }
-};
 
 // ---------------------------------------------------------------------------
 // Go-Explore: archive of cells, return-then-explore
@@ -3811,120 +3379,6 @@ struct GoDecision {
 	int     macroLen     = 0;      // curMacro length on arrival, for truncation
 };
 
-struct GoExplore {
-	bool running = false;
-	// The archive is seeded on the first update AFTER the level reset, not at
-	// keypress: at keypress the level has not been reset yet, so the level-start
-	// checkpoint would capture wherever the player happened to be standing.
-	bool seeded  = false;
-
-	// The archive, keyed by cell. A cell is a coarse bucket of state, NOT an
-	// exact state: two genuinely different states landing in one cell is
-	// expected and benign here, because we keep exploring from the cell and a
-	// poor representative gets replaced when a better one arrives. That is why
-	// this structure tolerates an imperfect key where a transposition table
-	// would not - a bad prune is permanent, a bad archive entry is not.
-	std::unordered_map<uint64_t, GoEntry> archive;
-	std::vector<uint64_t> keys;     // archive keys, for selection sampling
-
-	// Current episode.
-	bool     exploring    = false;
-	uint64_t currentCell  = 0;
-	int      episodeSteps = 0;
-	int      curStep      = 0;
-	std::vector<uint8_t> curMacro;
-
-	// Exploration decides at DECISION POINTS, not on a clock.
-	//
-	// The first version sampled run lengths in time (mean 8 steps). MEASURED
-	// result: saturation at 28.56% of Stereo Madness with 3,000 episodes and
-	// 400,000 steps producing zero new cells, on a stretch the DFS walks through
-	// in about a second.
-	//
-	// The reason is that a cube's decisions are events, not durations. A jump
-	// arc is ~35 steps of which only the 1-3 on the ground can do anything, so
-	// ~11 of every 15 random input changes landed in mid-air where the button is
-	// inert - and worse, consecutive landings were CORRELATED, because one long
-	// hold jumps at all of them. That policy cannot produce "jump, don't jump,
-	// jump", which is exactly what a cube corridor asks for.
-	//
-	// Deciding at decision points makes each choice independent, spends no
-	// randomness where it cannot matter, and gives this search the same action
-	// space as the DFS.
-	bool runHold       = false;
-	bool atDecision    = true;   // a fresh choice is due
-	int  sinceDecision = 0;
-	bool prevGround    = false;
-
-	// The local DFS stack for the current episode.
-	//
-	// Random exploration was measured out over three runs and ceilings at
-	// 20-29% of Stereo Madness, a stretch the DFS clears in about a second. The
-	// reason is coverage arithmetic that no knob touches: an episode holds ~25
-	// binary decisions, so 2^25 ~ 34 million sequences, and 20,000 random
-	// samples reach 0.06% of them. Systematic search with death pruning covers
-	// the same space instead of sampling it.
-	std::vector<GoDecision> stack;
-
-	// Seeded so a run is reproducible. An unseeded search that misbehaves once
-	// and never again is not debuggable.
-	uint64_t rng = 0;
-
-	uint64_t episodes   = 0;
-	uint64_t decisions  = 0;  // decision nodes pushed
-	uint64_t backtracks = 0;  // deaths converted into a retry rather than an exit
-	uint64_t exhausted  = 0;  // episodes that ran their whole subtree out
-	uint64_t deaths    = 0;
-	uint64_t steps     = 0;
-	uint64_t returns   = 0;
-	uint64_t newCells  = 0;
-	uint64_t improved  = 0;
-	uint64_t evicted   = 0;
-	uint64_t returnFails = 0;
-	float    bestPct   = 0.f;
-	uint64_t bestKey   = 0;
-	bool     haveBest  = false;
-
-	size_t   memAtStart = 0;
-	uint64_t startTicks = 0;
-	uint64_t lastReport = 0;
-
-	// xorshift64*, so the sequence is ours and does not depend on the CRT.
-	uint64_t next() {
-		rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
-		return rng * 2685821657736338717ull;
-	}
-	double nextUnit() { return (next() >> 11) * (1.0 / 9007199254740992.0); }
-
-	void clear() {
-		if (auto* pl = PlayLayer::get()) {
-			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
-		}
-		for (auto& kv : archive) releaseCheckpoint(kv.second.rs.cp);
-		archive.clear();
-		keys.clear();
-		curMacro.clear();
-		exploring = false;
-		currentCell = 0;
-		episodeSteps = curStep = 0;
-		runHold = false;
-		atDecision = true;
-		sinceDecision = 0;
-		prevGround = false;
-		for (auto& d : stack) releaseCheckpoint(d.rs.cp);
-		stack.clear();
-		episodes = decisions = backtracks = exhausted = deaths = steps = returns = 0;
-		newCells = improved = evicted = returnFails = 0;
-		bestPct = 0.f;
-		bestKey = 0;
-		haveBest = false;
-		memAtStart = 0;
-		running = false;
-		seeded  = false;
-	}
-
-	static GoExplore& get() { static GoExplore g; return g; }
-};
 
 // A read-only census of the cells the DFS actually visits.
 //
@@ -6188,108 +5642,7 @@ void pollHotkeys() {
 		startVerify(false, "best.txt");
 	}
 
-	// Player-only checkpoints are deliberately NOT offered. PlayerCheckpoint
-	// carries no level state, so restoring one discards trigger and
-	// moving-object state - fine on a 2013 level, wrong everywhere this project
-	// is aiming. The full CheckpointObject path is the only correct one.
 
-	// The beam has NO hotkey. Its code is kept - it compiles, it is correct, and
-	// beam-stack search would build on it - but plain beam lost to the DFS on
-	// both levels it was measured on (58x slower on Stereo Madness, frontier
-	// collapse at 10.02% on Theory of Everything where the DFS reaches 32.49%),
-	// so nothing should be able to start one by accident. Restoring it is one
-	// if-block; see Mode::Beam and beamStep.
-
-	// F3 = Go-Explore. Sits next to F2 so the two live searches are adjacent.
-	// It replaced verify-in-practice-mode, which was redundant with F4 - a
-	// solution only counts if it reproduces in NORMAL mode.
-	if (keyPressedEdge(VK_F3)) {
-		auto& gx = GoExplore::get();
-		if (gx.running) {
-			// Stopped inline rather than through goStop: pollHotkeys is a free
-			// function and cannot reach the modify class's members.
-			log::info("Go-Explore: stopped by user at best {:.2f}%, {} cells.",
-			          gx.bestPct, gx.archive.size());
-			if (gx.haveBest) {
-				auto it = gx.archive.find(gx.bestKey);
-				if (it != gx.archive.end() && !it->second.macro.empty()) {
-					Solver::get().bestMacro = it->second.macro;
-					solverWriteBestMacro();
-				}
-			}
-			gx.clear();
-			st.mode = Mode::Idle;
-		} else if (PlayLayer::get()) {
-			g_config.physicsFix   = true;  // fixed-dt stepping is required
-			g_config.noSavestates = false; // returning to a cell IS a savestate load
-
-			// Practice mode for the same reason the DFS needs it: it is what
-			// makes resetLevel a usable revive path.
-			PlayLayer::get()->m_isPracticeMode = true;
-
-			Solver::get().clear();   // the searches share the macro buffers
-			gx.clear();
-			gx.running    = true;
-			gx.rng        = g_config.goSeed;
-			gx.startTicks = probe::nowTicks();
-			gx.lastReport = gx.startTicks;
-			st.mode       = Mode::GoExplore;
-			st.resetPending = true;
-			log::info("Go-Explore: starting. F3 again to stop, F4 verifies a finished "
-			          "solution, F9 replays the best path so far.");
-		}
-	}
-
-	// B = beam search.
-	//
-	// The help text has advertised B since the beam was written, but nothing
-	// ever started it: beamInit and beamStep were both complete and
-	// unreachable, so every "the beam was tried" claim in this project rests on
-	// runs made before the entry point went missing. Wired here to match the
-	// Go-Explore start exactly - same physics requirements, same practice-mode
-	// revive path, same shared-buffer reset.
-	//
-	// beamStep dispatches Phase::Init to beamInit on its first call, so all this
-	// has to do is reset the level and hand over.
-	if (keyPressedEdge('B')) {
-		auto& bm = Beam::get();
-		auto& st = ProbeState::get();
-		if (st.mode == Mode::Beam && bm.running) {
-			log::info("Beam: stopped by user at best {:.2f}%, {} expansions, "
-			          "{} dropped by selection.",
-			          bm.bestPct, bm.expansions, bm.dropped);
-			if (!Solver::get().bestMacro.empty()) solverWriteBestMacro();
-			bm.clear();
-			st.mode = Mode::Idle;
-		} else if (PlayLayer::get()) {
-			g_config.physicsFix   = true;
-			g_config.noSavestates = false;
-			PlayLayer::get()->m_isPracticeMode = true;
-
-			Solver::get().clear();   // the searches share the macro buffers
-			CellProbe::get().clear();
-
-			// The beam's geometry ranking needs the map, and unlike F2 nothing
-			// else here builds it.
-			if (!geometryBuildMap())
-				log::warn("Beam: no geometry map - geometry ranking will score "
-				          "every state the same.");
-
-			bm.clear();
-			bm.running    = true;
-			bm.startTicks = probe::nowTicks();
-			bm.lastReport = bm.startTicks;
-			st.mode       = Mode::Beam;
-			st.resetPending = true;
-			static const char* kRank[3] = {
-				"diverse (mode, y-band)", "progress only", "progress, then geometry"};
-			log::info("Beam: starting, width {}, ranking {}. B again to stop, "
-			          "V cycles the ranking.",
-			          g_config.beamWidth, kRank[g_config.beamRankMode]);
-		} else {
-			log::warn("Beam: not in a level");
-		}
-	}
 
 	// G = dump level geometry (Probe 7). Read-only: no search state is touched,
 	// so this is safe to press at any time, including mid-solve.
@@ -6436,25 +5789,6 @@ void pollHotkeys() {
 		          kRoof[g_config.geomPortalRoof]);
 	}
 
-	// 1 = urgency steering. The map is otherwise purely REACTIVE: the steer
-	// returns 0 whenever the player is within geomClearanceBand of the
-	// target centre, so it only ever speaks after a drift has happened.
-	// MEASURED: every steer in every run was a drift correction (dead 0,
-	// win 14204), and Clutterfunk's wall is a mini ship that clears a saw,
-	// rides the ceiling, and meets a roof dropping 30 units 23 steps later -
-	// the steer fires far too late to reverse a climb.
-	//
-	// Urgency speaks in the band where the manoeuvre is becoming urgent but
-	// is still possible, which needs only the climb rate and no model of
-	// acceleration or turning.
-	if (keyPressedEdge('1')) {
-		g_config.geomUrgencySteer = !g_config.geomUrgencySteer;
-		log::info("Urgency steering: {}. F2 to solve with this.",
-		          g_config.geomUrgencySteer
-		              ? "ON - speak when a move is becoming urgent, not once it "
-		                "is already missed"
-		              : "off - steer only on drift, as before");
-	}
 
 	// F = cycle escapesBeforeAnchorRelease. Stage 2 of the ladder frees the
 	// mode-transition anchor, and MEASURED it is the only stage that can move
@@ -6496,28 +5830,7 @@ void pollHotkeys() {
 		              : "samples one slice at the lookahead, as before");
 	}
 
-	// M = branch on geometry change rather than on a fixed cadence.
-	if (keyPressedEdge('M')) {
-		g_config.geomBranchMode = (g_config.geomBranchMode + 1) % 3;
-		static const char* kName[3] = {
-			"every airBranchInterval steps, as before",
-			"where the corridor ahead CHANGES",
-			"where it CHANGES, but full cadence in tight corridors"};
-		log::info("Air branching: {} (min {} steps, max {}, tight < {:.0f} units). "
-		          "F2 to solve with this.",
-		          kName[g_config.geomBranchMode],
-		          g_config.airBranchInterval, g_config.airBranchIntervalMax,
-		          g_config.geomTightHeights * GeoMap::get().playerH);
-	}
 
-	// P = best-first instead of width-K beam.
-	if (keyPressedEdge('P')) {
-		g_config.beamBestFirst = !g_config.beamBestFirst;
-		log::info("Frontier search: {}. B to run it.",
-		          g_config.beamBestFirst
-		              ? "BEST-FIRST - one priority queue, nothing discarded, dives like DFS"
-		              : "width-K beam (lockstep, K per level)");
-	}
 
 	// O = route steering: follow the corridor the player is actually in.
 	if (keyPressedEdge('O')) {
@@ -6539,16 +5852,6 @@ void pollHotkeys() {
 		              : "off - steer whenever off-centre");
 	}
 
-	// V = cycle how the beam ranks its frontier.
-	if (keyPressedEdge('V')) {
-		g_config.beamRankMode = (g_config.beamRankMode + 1) % 3;
-		static const char* kName[3] = {
-			"diversity buckets (as before)",
-			"progress only",
-			"progress, then geometry - centredness in the live corridor"};
-		log::info("Beam ranking: {} (width {}). B to run the beam with this.",
-		          kName[g_config.beamRankMode], g_config.beamWidth);
-	}
 
 	// R = reach sweep (Probe 9). Read-only; rebuilds the map several times and
 	// leaves it as it found it.
@@ -6624,18 +5927,18 @@ void pollHotkeys() {
 			sv.clear();
 			CellProbe::get().clear();
 			SolverArchive::get().clear();
-			if (g_config.geometryDeadPrune || g_config.geometryOrdering) {
+			if (g_config.geometryOrdering) {
 				if (geometryBuildMap()) {
 					auto& m = GeoMap::get();
 					log::info("Solver: geometry map built - {} free intervals, {} dead "
-					          "({:.1f}%). Ordering {}, dead-space pruning {}. Lookahead "
-					          "{} steps. Reach {}. Speed {:.2f}..{:.2f} dx/step over "
-					          "{} segments.",
+					          "({:.1f}%). Ordering {}. Lookahead {} units. Reach {}. "
+					          "Speed {:.2f}..{:.2f} dx/step over {} segments.",
 					          m.freeCount, m.deadCount,
 					          m.freeCount > 0 ? 100.0 * m.deadCount / m.freeCount : 0.0,
 					          g_config.geometryOrdering ? "ON" : "off",
-					          g_config.geometryDeadPrune ? "ON" : "off",
-					          g_config.geomLookaheadSteps,
+					          g_config.geomLookaheadScaleWithSpeed
+					              ? g_config.geomLookaheadSteps
+					              : g_config.geomLookaheadFixedX,
 					          geomReachModeName(g_config.geomReachMode),
 					          m.segSpeed.empty() ? 0.0f
 					              : *std::min_element(m.segSpeed.begin(), m.segSpeed.end()),
@@ -8540,198 +7843,17 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		Solver::get().pendingPostRestore = true;
 	}
 
-	// --- beam: state pool --------------------------------------------------
 
-	int beamRsAlloc() {
-		auto& bm = Beam::get();
-		if (!bm.rsFree.empty()) { const int i = bm.rsFree.back(); bm.rsFree.pop_back(); return i; }
-		bm.rsPool.emplace_back();
-		return static_cast<int>(bm.rsPool.size()) - 1;
-	}
 
-	// Return a slot to the pool. swap-with-empty rather than clear(): clear()
-	// keeps the capacity, and playerBytes is nearly the whole slot, so clearing
-	// would reclaim the checkpoint's ~22 KB and leak the rest indefinitely.
-	void beamRsRelease(int slot) {
-		auto& bm = Beam::get();
-		if (slot < 0 || slot >= static_cast<int>(bm.rsPool.size())) return;
-		auto& r = bm.rsPool[static_cast<size_t>(slot)];
-		releaseCheckpoint(r.cp);
-		std::vector<uint8_t>().swap(r.playerBytes);
-		std::vector<PlayerButtonCommand>().swap(r.queuedButtons);
-		bm.rsFree.push_back(slot);
-	}
 
-	// Restore a beam node's own captured state, with no forward replay.
-	void beamRestoreCheckpointOnly(BeamNode const& n) {
-		auto& bm = Beam::get();
-		if (n.rsIndex < 0) return;
-		applyRestoreState(bm.rsPool[static_cast<size_t>(n.rsIndex)], n.hold);
-		bm.restoreCount++;
-	}
 
-	// Reconstruct the input sequence from the root to `idx` into `out`.
-	//
-	// Nodes store only (parent, step, hold), so a macro costs O(depth) to
-	// rebuild but O(1) to store. With a frontier in the thousands, storing a
-	// full macro per node instead would dominate memory.
-	void beamMacro(int idx, std::vector<uint8_t>& out) {
-		auto& bm = Beam::get();
-		auto& path = bm.pathScratch;
-		path.clear();
-		for (int i = idx; i >= 0; i = bm.nodes[static_cast<size_t>(i)].parent) path.push_back(i);
 
-		const int endStep = idx >= 0 ? bm.nodes[static_cast<size_t>(idx)].step : 0;
-		out.assign(static_cast<size_t>(endStep), 0);
-		// Walk root-ward to leaf, filling each edge's span with its hold.
-		for (size_t k = path.size(); k-- > 0; ) {
-			const BeamNode& n = bm.nodes[static_cast<size_t>(path[k])];
-			if (n.parent < 0) continue;
-			const int from = bm.nodes[static_cast<size_t>(n.parent)].step;
-			for (int t = from; t < n.step && t < endStep; t++)
-				out[static_cast<size_t>(t)] = n.hold ? 1 : 0;
-		}
-	}
 
-	// Put the player into node `idx`'s exact state.
-	//
-	// Direct restore when the node holds a checkpoint; otherwise restore its
-	// nearest checkpointed ancestor and replay forward. The replay is exact in
-	// every mode (13.11), so this is sound - unlike the superficially identical
-	// hybrid it replaces, which existed because air restores were NOT exact.
-	//
-	// Replay is bounded by Beam::cpInterval and runs synchronously. The deleted
-	// hybrid spread its replay across frames as a state machine and was a
-	// recurring source of bugs; a bounded synchronous loop cannot get out of
-	// sync with itself.
-	bool beamRestoreNode(int idx) {
-		auto& bm = Beam::get();
-		if (idx < 0 || idx >= static_cast<int>(bm.nodes.size())) return false;
 
-		const int anc = bm.nodes[static_cast<size_t>(idx)].rsIndex >= 0
-		                ? idx : bm.nodes[static_cast<size_t>(idx)].cpAncestor;
-		if (anc < 0 || bm.nodes[static_cast<size_t>(anc)].rsIndex < 0) return false;
 
-		beamRestoreCheckpointOnly(bm.nodes[static_cast<size_t>(anc)]);
-		if (anc == idx) return true;
 
-		// Replay the edge span from the ancestor to this node.
-		beamMacro(idx, bm.macroScratch);
-		const int from = bm.nodes[static_cast<size_t>(anc)].step;
-		const int to   = bm.nodes[static_cast<size_t>(idx)].step;
-		for (int t = from; t < to; t++) {
-			const bool pressed = static_cast<size_t>(t) < bm.macroScratch.size() &&
-			                     bm.macroScratch[static_cast<size_t>(t)] != 0;
-			applyInput(pressed);
-			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
-			bm.replaySteps++;
-			// A replayed prefix must not die: it is a path we already simulated.
-			if (m_player1 && m_player1->m_isDead) return false;
-		}
-		return true;
-	}
 
-	// --- beam: node construction -------------------------------------------
 
-	int beamNewNode(int parent, int step, bool hold) {
-		auto& bm = Beam::get();
-		BeamNode n;
-		n.parent = parent;
-		n.step   = step;
-		n.hold   = hold;
-		if (parent >= 0) {
-			auto const& pn = bm.nodes[static_cast<size_t>(parent)];
-			n.cpAncestor   = pn.rsIndex >= 0 ? parent : pn.cpAncestor;
-			n.stepsSinceCp = pn.stepsSinceCp + (step - pn.step);
-		}
-		bm.nodes.push_back(n);
-		return static_cast<int>(bm.nodes.size()) - 1;
-	}
-
-	// Give node `idx` its own checkpoint at the CURRENT game state, which the
-	// caller must already have stepped to.
-	void beamCapture(int idx) {
-		auto& bm = Beam::get();
-		{
-			auto& n = bm.nodes[static_cast<size_t>(idx)];
-			if (n.rsIndex >= 0) return;
-			n.rsIndex = beamRsAlloc();
-		}
-		const int slot = bm.nodes[static_cast<size_t>(idx)].rsIndex;
-		captureRestoreState(bm.rsPool[static_cast<size_t>(slot)]);
-		if (!bm.rsPool[static_cast<size_t>(slot)].cp) {
-			beamRsRelease(slot);
-			bm.nodes[static_cast<size_t>(idx)].rsIndex = -1;
-			return;
-		}
-		bm.nodes[static_cast<size_t>(idx)].cpAncestor   = idx;
-		bm.nodes[static_cast<size_t>(idx)].stepsSinceCp = 0;
-		bm.cpNodes.push_back(idx);
-	}
-
-	// Diversity bucket for the CURRENT state: game mode plus a band of height.
-	//
-	// Mode and altitude are what actually distinguish two routes through the
-	// same stretch of level - a decoy corridor and the real one sit at different
-	// heights, which is exactly the distinction progress percent throws away.
-	uint32_t beamBucket() {
-		auto* p = m_player1;
-		if (!p) return 0;
-		const int size = std::max(1, g_config.beamYBucketSize);
-		const int band = static_cast<int>(std::floor(p->getPositionY() / size));
-		const uint32_t m = static_cast<uint32_t>(classifyMode(p));
-		return (m << 24) ^ (static_cast<uint32_t>(band) & 0x00FFFFFFu);
-	}
-
-	// Which death cell the player is standing in.
-	uint64_t beamDeathCell() {
-		auto* p = m_player1;
-		if (!p) return 0;
-		const int c = std::max(1, g_config.beamDeathCellSize);
-		const int64_t bx = static_cast<int64_t>(std::floor(p->getPositionX() / c));
-		const int64_t by = static_cast<int64_t>(std::floor(p->getPositionY() / c));
-		return (static_cast<uint64_t>(bx) << 32) ^ static_cast<uint32_t>(by);
-	}
-
-	// Progress, plus centredness, minus what this neighbourhood has already
-	// cost. Everything in percent-of-level units so the weights are readable.
-	float beamScoreOf(float pct, float geo, uint64_t cell) {
-		auto& bm = Beam::get();
-		const auto id = bm.cellDeaths.find(cell);
-		const auto it = bm.cellTries.find(cell);
-		const double d = id == bm.cellDeaths.end() ? 0.0 : static_cast<double>(id->second);
-		const double t = it == bm.cellTries.end()  ? 0.0 : static_cast<double>(it->second);
-		// Failure rate, damped so a cell with two tries and one death is not
-		// treated as confidently lethal as one with two hundred.
-		const double penalty = g_config.beamDeathWeight * (d / (8.0 + t));
-		return static_cast<float>(pct + g_config.beamGeoWeight * geo - penalty);
-	}
-
-	// Centredness inside the live corridor ahead: 1 dead centre, 0 at the rim,
-	// 0 with no reading at all.
-	//
-	// Uses the same lookahead the steer does, so it scores where the state is
-	// HEADED rather than where it sits. Neutral (0.5) on ground and wherever the
-	// map has no opinion, so those states are neither promoted nor buried.
-	float beamGeoScore() {
-		auto* p = m_player1;
-		if (!p || !GeoMap::get().valid) return 0.5f;
-		if (classifyMode(p) == ModeClass::Ground) return 0.5f;
-
-		const double lookX = p->getPositionX() +
-			(g_config.geomLookaheadScaleWithSpeed
-				? static_cast<double>(g_config.geomLookaheadSteps) * Solver::get().dxPerStep
-				: static_cast<double>(g_config.geomLookaheadFixedX));
-		double glo = 0.0, ghi = 0.0;
-		if (!geometryWindowAt(lookX, p->getPositionY(), &glo, &ghi)) return 0.0f;
-
-		const double half = 0.5 * (ghi - glo);
-		if (half <= 1e-6) return 0.0f;
-		const double off = std::abs(p->getPositionY() - 0.5 * (glo + ghi)) / half;
-		return static_cast<float>(std::max(0.0, 1.0 - off));
-	}
-
-	// --- beam: expansion ----------------------------------------------------
 
 	// Has the run reached the next decision point?
 	//
@@ -8754,423 +7876,17 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		return landed || onRing || steps >= g_config.groundBranchInterval;
 	}
 
-	// Expand one frontier node into its two children.
-	//
-	// TWO restores, one per child: after stepping the first child we are at the
-	// child's state, not the parent's, and there is no way back except another
-	// restore. This is the beam's dominant cost and the reason beamWidth lives
-	// in the tens - see the arithmetic on Config::beamWidth.
-	void beamExpandNode(int idx) {
-		auto& bm = Beam::get();
-		auto* pl = PlayLayer::get();
-		if (!pl) return;
 
-		for (int a = 0; a < 2; a++) {
-			if (!beamRestoreNode(idx)) { bm.restoreFails++; return; }
-			// Charged to where the branch STARTS, not where it ends, so deaths
-			// and tries land in the same cell and their ratio is a real rate.
-			const uint64_t cellAtExpand = beamDeathCell();
-			const bool hold = (a != 0);
 
-			int  steps = 0;
-			bool dead  = false;
-			bool prevGround = m_player1 && m_player1->m_isOnGround;
 
-			while (true) {
-				applyInput(hold);
-				GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
-				steps++;
-				bm.steps++;
-				if (!m_player1) return;
-				if (m_player1->m_isDead) { dead = true; break; }
-				if (ProbeState::get().finished) break;
-				if (atDecisionPoint(steps, prevGround)) break;
-				if (steps >= g_config.maxSegmentSteps) break;
-			}
 
-			// Charge the death to where it happened. That count is what every
-			// node later born nearby pays for, and it is the only thing that
-			// lets a best-first frontier retreat from a wall.
-			if (dead) {
-				bm.deaths++;
-				bm.cellDeaths[cellAtExpand]++;
-				bm.cellTries[cellAtExpand]++;
-				continue;
-			}
-			bm.cellTries[cellAtExpand]++;
 
-			const int childStep = bm.nodes[static_cast<size_t>(idx)].step + steps;
 
-			if (ProbeState::get().finished) {
-				beamSolved(beamNewNode(idx, childStep, hold));
-				return;
-			}
 
-			// Dedup. A state already expanded has a future already searched, so
-			// a second copy of it can only cost time. This is where the beam
-			// beats the DFS on cube sections, where many input sequences land on
-			// the same grounded state; in air it fires rarely, because the state
-			// is continuous.
-			const uint64_t key = solverStateKey();
-			if (!bm.visited.insert(key).second) { bm.dedupHits++; continue; }
 
-			const int ci = beamNewNode(idx, childStep, hold);
-			bm.nodes[static_cast<size_t>(ci)].key    = key;
-			bm.nodes[static_cast<size_t>(ci)].pct    = pl->getCurrentPercent();
-			bm.nodes[static_cast<size_t>(ci)].bucket = beamBucket();
-			bm.nodes[static_cast<size_t>(ci)].geoScore = beamGeoScore();
-			bm.nodes[static_cast<size_t>(ci)].score =
-				beamScoreOf(bm.nodes[static_cast<size_t>(ci)].pct,
-				            bm.nodes[static_cast<size_t>(ci)].geoScore,
-				            beamDeathCell());
 
-			// Checkpoint once replaying to this node would cost more than
-			// restoring it directly.
-			if (bm.nodes[static_cast<size_t>(ci)].stepsSinceCp >= bm.cpInterval)
-				beamCapture(ci);
 
-			const float cpct = bm.nodes[static_cast<size_t>(ci)].pct;
-			if (cpct > bm.bestPct) { bm.bestPct = cpct; bm.bestNode = ci; }
-			bm.next.push_back(ci);
-		}
-		bm.expansions++;
-	}
 
-	// --- beam: selection ----------------------------------------------------
-
-	// Keep K nodes spread across (mode, height) buckets rather than the K
-	// furthest along.
-	//
-	// Ranking by progress is what traps the DFS on a fake corridor: the decoy
-	// scores higher for a while, so every slot goes to it and the real route is
-	// gone before it ever pays off. Round-robin across buckets means a corridor
-	// that is currently behind still keeps a seat, because it is competing only
-	// against others at its own height in its own mode.
-	void beamSelectDiverse(size_t K) {
-		auto& bm = Beam::get();
-		// Runs once per beam level, not per step, so a map here costs nothing
-		// that matters.
-		std::unordered_map<uint32_t, std::vector<int>> buckets;
-		for (int i : bm.next) buckets[bm.nodes[static_cast<size_t>(i)].bucket].push_back(i);
-		for (auto& kv : buckets)
-			std::sort(kv.second.begin(), kv.second.end(), [&](int x, int y) {
-				return bm.nodes[static_cast<size_t>(x)].pct > bm.nodes[static_cast<size_t>(y)].pct;
-			});
-
-		auto& keep = bm.keepScratch;
-		keep.clear();
-		keep.reserve(K);
-		for (size_t pass = 0; keep.size() < K; pass++) {
-			bool took = false;
-			for (auto& kv : buckets) {
-				if (pass >= kv.second.size()) continue;
-				keep.push_back(kv.second[pass]);
-				took = true;
-				if (keep.size() >= K) break;
-			}
-			if (!took) break; // every bucket exhausted
-		}
-		bm.next.swap(keep);
-	}
-
-	void beamSelect() {
-		auto& bm = Beam::get();
-		const size_t K = static_cast<size_t>(std::max(1, g_config.beamWidth));
-
-		if (bm.next.size() > K) {
-			bm.dropped += bm.next.size() - K;
-			if (g_config.beamRankMode == 1) {
-				std::partial_sort(bm.next.begin(), bm.next.begin() + K, bm.next.end(),
-					[&](int x, int y) {
-						return bm.nodes[static_cast<size_t>(x)].pct >
-						       bm.nodes[static_cast<size_t>(y)].pct;
-					});
-				bm.next.resize(K);
-			} else if (g_config.beamRankMode == 2) {
-				// The composite score: progress, geometry, local failure. Not a
-				// tiebreak on pct - that never fired, see beamGeoWeight.
-				std::partial_sort(bm.next.begin(), bm.next.begin() + K, bm.next.end(),
-					[&](int x, int y) {
-						return bm.nodes[static_cast<size_t>(x)].score >
-						       bm.nodes[static_cast<size_t>(y)].score;
-					});
-				bm.next.resize(K);
-			} else {
-				beamSelectDiverse(K);
-			}
-		}
-
-		bm.frontier.swap(bm.next);
-		bm.next.clear();
-		beamReclaim();
-		bm.depth++;
-	}
-
-	// Best-first selection. Everything generated goes into one heap; one node
-	// comes out. Nothing is ever discarded, so no option can be lost the way a
-	// width cap loses it.
-	//
-	// Progress first so the search dives, geometry as the tiebreak progress
-	// cannot provide - the same order the width-K ranking uses, for the same
-	// reason: ranking on centredness alone would happily prefer a beautifully
-	// placed state that is behind everything else.
-	void beamSelectBestFirst() {
-		auto& bm = Beam::get();
-		auto worse = [&](int x, int y) {          // heap wants "less than"
-			return bm.nodes[static_cast<size_t>(x)].score <
-			       bm.nodes[static_cast<size_t>(y)].score;
-		};
-
-		for (int i : bm.next) {
-			bm.open.push_back(i);
-			std::push_heap(bm.open.begin(), bm.open.end(), worse);
-		}
-		bm.next.clear();
-
-		bm.frontier.clear();
-		if (!bm.open.empty()) {
-			std::pop_heap(bm.open.begin(), bm.open.end(), worse);
-			bm.frontier.push_back(bm.open.back());
-			bm.open.pop_back();
-		}
-		beamReclaim();
-		bm.depth++;
-	}
-
-	// Release every checkpoint no live node still depends on.
-	//
-	// This is what decouples width from memory. Each node's cpAncestor is within
-	// cpInterval steps by construction, so nothing further back than the current
-	// frontier's own ancestors can ever be reached again - but with no sweep
-	// those checkpoints are held until the search ends, which at width 500 is
-	// ~900 MB of state nothing can ever use.
-	//
-	// Recomputed from the frontier each level rather than reference-counted: a
-	// wrong refcount here frees a checkpoint a live node still needs, and that
-	// failure is silent and arbitrarily delayed.
-	void beamReclaim() {
-		auto& bm = Beam::get();
-		if (bm.cpNodes.empty()) return;
-
-		bm.neededScratch.clear();
-		for (int i : bm.frontier) {
-			auto const& n = bm.nodes[static_cast<size_t>(i)];
-			bm.neededScratch.insert(n.rsIndex >= 0 ? i : n.cpAncestor);
-		}
-		// Under best-first every node in the open list is still reachable, so
-		// its checkpoint ancestor must survive. Freeing on frontier membership
-		// alone would drop the state the search is about to return to, and that
-		// failure is silent and arbitrarily delayed.
-		for (int i : bm.open) {
-			auto const& n = bm.nodes[static_cast<size_t>(i)];
-			bm.neededScratch.insert(n.rsIndex >= 0 ? i : n.cpAncestor);
-		}
-
-		size_t w = 0;
-		for (size_t r = 0; r < bm.cpNodes.size(); r++) {
-			const int ni = bm.cpNodes[r];
-			if (bm.neededScratch.count(ni)) { bm.cpNodes[w++] = ni; continue; }
-			beamRsRelease(bm.nodes[static_cast<size_t>(ni)].rsIndex);
-			bm.nodes[static_cast<size_t>(ni)].rsIndex = -1;
-		}
-		bm.cpNodes.resize(w);
-	}
-
-	// --- beam: driver -------------------------------------------------------
-
-	void beamReport(bool force) {
-		auto& bm = Beam::get();
-		const uint64_t now = probe::nowTicks();
-		if (!force && probe::ticksToMicros(now - bm.lastReport) < 2'000'000.0) return;
-		bm.lastReport = now;
-
-		const double secs = probe::ticksToMicros(now - bm.startTicks) / 1e6;
-		const size_t mem  = processMemoryBytes();
-		const double memMB = (mem > bm.memAtStart ? mem - bm.memAtStart : 0) / (1024.0 * 1024.0);
-
-		// Memory is reported as a live delta rather than estimated from a
-		// per-checkpoint constant: that constant measured 22.0 KB on one level
-		// and 33.7 KB on another (Probe 5), so an estimate would be wrong by
-		// half on any level we have not separately probed.
-		log::info("Beam: best {:.2f}%  depth {}  frontier {}  nodes {}  cps {}  "
-		          "deaths {}  dedup {}  dropped {}  steps {}  restores {}  "
-		          "(+{:.0f} MB, {:.0f} steps/s, {:.0f} restores/s)",
-		          bm.bestPct, bm.depth, bm.frontier.size(), bm.nodes.size(),
-		          bm.cpNodes.size(), bm.deaths, bm.dedupHits, bm.dropped,
-		          bm.steps, bm.restoreCount, memMB,
-		          secs > 0 ? bm.steps / secs : 0.0,
-		          secs > 0 ? bm.restoreCount / secs : 0.0);
-	}
-
-	// Write the best path so far, so a stall can be watched with F9 instead of
-	// inferred from counters. Staged through the Solver's buffers because the
-	// macro writers and the verifier already read from there.
-	void beamStageBest() {
-		auto& bm = Beam::get();
-		if (bm.bestNode < 0) return;
-		beamMacro(bm.bestNode, bm.macroScratch);
-		Solver::get().bestMacro = bm.macroScratch;
-		solverWriteBestMacro();
-	}
-
-	void beamStop(const char* why) {
-		auto& bm = Beam::get();
-		beamReport(true);
-		log::info("Beam: {} - best {:.2f}% at depth {}", why, bm.bestPct, bm.depth);
-		beamStageBest();
-		bm.clear();
-		ProbeState::get().mode = Mode::Idle;
-	}
-
-	void beamSolved(int idx) {
-		auto& bm = Beam::get();
-		beamMacro(idx, bm.macroScratch);
-
-		beamReport(true);
-		log::info("================ BEAM SOLVED ================");
-		log::info("  {} steps, depth {}, {} nodes, {} deaths, {} deduped, {} restores",
-		          bm.macroScratch.size(), bm.depth, bm.nodes.size(), bm.deaths,
-		          bm.dedupHits, bm.restoreCount);
-
-		Solver::get().macro = bm.macroScratch;
-		solverWriteMacro("solution.txt");
-
-		// best.txt too. Leaving it stale meant F9 replayed the DFS's last macro
-		// and reported a clean PASS for a path the beam never produced.
-		Solver::get().bestMacro = bm.macroScratch;
-		solverWriteBestMacro();
-
-		// The beam does not record a step-by-step trace of the winning path the
-		// way the DFS does, so F4 can still PASS or FAIL the macro but cannot
-		// name the step where a clean replay departs from it. Said here rather
-		// than left for someone to discover from an empty diff file.
-		auto& ps = ProbeState::get();
-		ps.solvePathTrace.clear();
-		ps.solveDecisionSteps.clear();
-		log::info("  No path trace: F4 will verify this macro but cannot report a "
-		          "divergence step for it.");
-		log::info("  Verify by replaying from frame 0 - a solution found via "
-		          "savestates only counts if it reproduces in a clean run.");
-		log::info("=============================================");
-
-		bm.clear();
-		ps.mode = Mode::Idle;
-	}
-
-	// Measure what a restore and a step actually cost on THIS level, then set
-	// the checkpoint interval to the break-even point between them.
-	//
-	// Probe 5 measured 1.06 ms per restore on Stereo Madness and 40.9 ms on an
-	// object-heavy level - a 40x spread. At 1.06 ms it is cheaper to checkpoint
-	// almost every node; at 40.9 ms one restore is worth ~195 replayed steps.
-	// No single constant serves both, so it is measured rather than guessed.
-	void beamCalibrate(int root) {
-		auto& bm = Beam::get();
-
-		constexpr int kRestoreSamples = 8;
-		constexpr int kStepSamples    = 64;
-
-		uint64_t t0 = probe::nowTicks();
-		for (int i = 0; i < kRestoreSamples; i++)
-			beamRestoreCheckpointOnly(bm.nodes[static_cast<size_t>(root)]);
-		bm.restoreUs = probe::ticksToMicros(probe::nowTicks() - t0) / kRestoreSamples;
-
-		t0 = probe::nowTicks();
-		for (int i = 0; i < kStepSamples; i++) {
-			applyInput(false);
-			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
-			if (m_player1 && m_player1->m_isDead) break;
-		}
-		bm.stepUs = probe::ticksToMicros(probe::nowTicks() - t0) / kStepSamples;
-
-		// Leave the player exactly at the root, whatever the sampling did to it.
-		beamRestoreCheckpointOnly(bm.nodes[static_cast<size_t>(root)]);
-
-		if (g_config.beamCheckpointIntervalSteps > 0) {
-			bm.cpInterval = g_config.beamCheckpointIntervalSteps;
-		} else if (bm.stepUs > 0.0) {
-			const int d = static_cast<int>(bm.restoreUs / bm.stepUs);
-			bm.cpInterval = std::max(4, std::min(2000, d));
-		}
-
-		// The projection is what decides whether this run is worth waiting for,
-		// so it is printed BEFORE the search rather than inferred from
-		// throughput an hour in.
-		const double levels = 5000.0; // ~20k steps at a 4-step branch interval
-		const double hours  = 2.0 * g_config.beamWidth * levels * bm.restoreUs / 3.6e9;
-		log::info("Beam: restore {:.2f} ms, step {:.3f} ms -> checkpoint every {} steps ({}).",
-		          bm.restoreUs / 1000.0, bm.stepUs / 1000.0, bm.cpInterval,
-		          g_config.beamCheckpointIntervalSteps > 0 ? "pinned by config"
-		                                                   : "break-even, measured");
-		log::info("Beam: width {}, selection {}. At this restore cost a full 20k-step "
-		          "level projects to ~{:.1f} h of restores alone.",
-		          g_config.beamWidth,
-		          g_config.beamRankMode == 1 ? "progress only"
-		          : g_config.beamRankMode == 2 ? "progress, then geometry"
-		                                       : "diverse (mode, y-band)",
-		          hours);
-		if (bm.restoreUs > 10000.0)
-			log::warn("Beam: restores cost >10 ms on this level. Probe 5 calls that "
-			          "'architecture rethink' territory - this run will be "
-			          "restore-bound, so read the projection above before waiting on it.");
-	}
-
-	bool beamInit() {
-		auto& bm = Beam::get();
-		auto* pl = PlayLayer::get();
-		if (!pl || !m_player1) return false;
-
-		const int root = beamNewNode(-1, 0, false);
-		beamCapture(root);
-		if (bm.nodes[static_cast<size_t>(root)].rsIndex < 0) {
-			log::error("Beam: could not checkpoint the level start - nothing to search from.");
-			beamStop("failed to start");
-			return false;
-		}
-		bm.nodes[static_cast<size_t>(root)].pct    = pl->getCurrentPercent();
-		bm.nodes[static_cast<size_t>(root)].bucket = beamBucket();
-		bm.nodes[static_cast<size_t>(root)].geoScore = beamGeoScore();
-		bm.nodes[static_cast<size_t>(root)].score =
-			beamScoreOf(bm.nodes[static_cast<size_t>(root)].pct,
-			            bm.nodes[static_cast<size_t>(root)].geoScore, beamDeathCell());
-		bm.visited.insert(solverStateKey());
-		bm.frontier.assign(1, root);
-		bm.expandIdx  = 0;
-		bm.memAtStart = processMemoryBytes();
-
-		beamCalibrate(root);
-		bm.phase = Beam::Phase::Expand;
-		return true;
-	}
-
-	// One unit of beam work: expand a single frontier node, or - when the
-	// frontier is exhausted - choose the next one. Node-at-a-time so the caller
-	// can stop on its frame budget without leaving the search mid-node.
-	bool beamStep() {
-		auto& bm = Beam::get();
-		if (!PlayLayer::get() || !m_player1) return false;
-
-		if (bm.phase == Beam::Phase::Init) return beamInit();
-
-		if (bm.expandIdx >= static_cast<int>(bm.frontier.size())) {
-			if (g_config.beamBestFirst) beamSelectBestFirst();
-			else                        beamSelect();
-			bm.expandIdx = 0;
-			if (bm.frontier.empty()) {
-				log::error("Beam: {} at depth {} - every branch died or "
-				           "deduplicated. The search cannot continue from here.",
-				           g_config.beamBestFirst ? "open list empty" : "frontier empty",
-				           bm.depth);
-				beamStop("exhausted");
-				return false;
-			}
-			beamReport(false);
-			return bm.running;
-		}
-
-		beamExpandNode(bm.frontier[static_cast<size_t>(bm.expandIdx++)]);
-		return bm.running;
-	}
 
 	// --- Go-Explore ---------------------------------------------------------
 
@@ -9183,6 +7899,16 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	// vertical velocity is included because arriving at the same point rising
 	// and falling are completely different situations, and collapsing them would
 	// throw away the distinction that decides whether a gap is clearable.
+	// The cell key survived Go-Explore's removal: the escape archive and the
+	// cell census both key on it, and they are independent of that searcher.
+	// The go* prefix and the goCellX/Y/Vy constants are kept rather than renamed
+	// so the history stays greppable.
+	uint64_t goCellKey() {
+		if (!m_player1) return 0;
+		const CellCoords c = goCellCoords();
+		return probe::fnv1a(&c, sizeof(c));
+	}
+
 	CellCoords goCellCoords() {
 		CellCoords c{};
 		auto* p = m_player1;
@@ -9202,11 +7928,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		return c;
 	}
 
-	uint64_t goCellKey() {
-		if (!m_player1) return 0;
-		const CellCoords c = goCellCoords();
-		return probe::fnv1a(&c, sizeof(c));
-	}
 
 	// Census one step of the DFS. One hash and one map lookup; no checkpoint,
 	// no allocation past the map's own growth, and nothing read back.
@@ -9738,7 +8459,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		uint64_t bestKey = 0;
 		double   bestW   = -1.0;
-		const int kTournament = std::max(1, g_config.goTournament);
+		// Was g_config.goTournament, borrowed from Go-Explore. Inlined when that
+		// searcher was removed rather than given a config field of its own - the
+		// escape archive is itself unresolved, and a knob for an unresolved
+		// mechanism is how this file got the way it did.
+		const int kTournament = 64;
 		for (int t = 0; t < kTournament; t++) {
 			const uint64_t k = ar.keys[static_cast<size_t>(ar.next() % ar.keys.size())];
 			auto it = ar.cells.find(k);
@@ -9749,8 +8474,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// the place the search has been thrashing has an enormous `seen`.
 			double w = 1.0 / std::sqrt(1.0 + static_cast<double>(it->second.chosen));
 			w       /= std::sqrt(1.0 + static_cast<double>(it->second.seen));
-			if (g_config.goProgressBias > 0.0)
-				w *= 1.0 + g_config.goProgressBias * (it->second.pct / 100.0);
 			if (w > bestW) { bestW = w; bestKey = k; }
 		}
 		return bestKey;
@@ -9820,374 +8543,17 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	}
 
 
-	// Record the current state in the archive.
-	//
-	// Called after every explored step. createCheckpoint is ~12 us (Probe 5), so
-	// capturing is cheap; it is LOADING that costs a millisecond. That asymmetry
-	// is what makes an archive of this shape affordable at all.
-	void goRecordCell() {
-		auto& gx = GoExplore::get();
-		auto* pl = PlayLayer::get();
-		if (!pl || !m_player1 || m_player1->m_isDead) return;
 
-		const uint64_t key = goCellKey();
-		const float pct = pl->getCurrentPercent();
 
-		auto it = gx.archive.find(key);
-		if (it == gx.archive.end()) {
-			if (gx.archive.size() >= static_cast<size_t>(g_config.goArchiveCap) && !goEvictOne())
-				return;
-			GoEntry e;
-			captureRestoreState(e.rs);
-			if (!e.rs.cp) return;
-			e.macro = gx.curMacro;
-			e.pct   = pct;
-			e.step  = gx.curStep;
-			e.hold  = gx.runHold;
-			e.seen  = 1;
-			gx.archive.emplace(key, std::move(e));
-			gx.keys.push_back(key);
-			gx.newCells++;
-		} else {
-			auto& e = it->second;
-			e.seen++;
-			// A meaningfully shorter route replaces the representative, so a bad
-			// early one gets corrected instead of poisoning the cell forever.
-			// The margin matters: without it this fires on one- and two-step
-			// differences that carry no information here, and the state a return
-			// lands on never settles.
-			if (gx.curMacro.size() + static_cast<size_t>(g_config.goImproveMargin)
-			    <= e.macro.size()) {
-				releaseCheckpoint(e.rs.cp);
-				captureRestoreState(e.rs);
-				if (!e.rs.cp) return;
-				e.macro = gx.curMacro;
-				e.pct   = pct;
-				e.step  = gx.curStep;
-				e.hold  = gx.runHold;
-				gx.improved++;
-			}
-		}
 
-		if (pct > gx.bestPct) {
-			gx.bestPct  = pct;
-			gx.bestKey  = key;
-			gx.haveBest = true;
-		}
-	}
 
-	// Drop the least useful cell to make room. Least useful = furthest behind
-	// and most heavily explored already.
-	bool goEvictOne() {
-		auto& gx = GoExplore::get();
-		if (gx.keys.empty()) return false;
 
-		// Sampled rather than scanned: a full pass over the archive on every
-		// insertion at the cap would dominate the stepping path.
-		size_t worstIdx = 0;
-		double worstScore = 1e30;
-		bool found = false;
-		for (int t = 0; t < 32; t++) {
-			const size_t i = static_cast<size_t>(gx.next() % gx.keys.size());
-			auto it = gx.archive.find(gx.keys[i]);
-			if (it == gx.archive.end()) continue;
-			if (gx.haveBest && gx.keys[i] == gx.bestKey) continue;
-			const double score = it->second.pct - 0.01 * it->second.chosen;
-			if (!found || score < worstScore) { worstScore = score; worstIdx = i; found = true; }
-		}
-		if (!found) return false;
 
-		auto it = gx.archive.find(gx.keys[worstIdx]);
-		if (it != gx.archive.end()) {
-			releaseCheckpoint(it->second.rs.cp);
-			gx.archive.erase(it);
-		}
-		gx.keys[worstIdx] = gx.keys.back();
-		gx.keys.pop_back();
-		gx.evicted++;
-		return true;
-	}
 
-	// Choose a cell to explore from.
-	//
-	// Two novelty terms, both counting rather than scoring:
-	//
-	//   chosen - how often this cell has been an exploration start. Falls as a
-	//     cell is worked over, so attention drifts away from exhausted cells.
-	//   seen   - how often ANY trajectory has passed through it. This is the
-	//     term that identifies the frontier: a cell just discovered has been
-	//     seen once, while established cells are traversed by every episode
-	//     that starts nearby. It was being tracked and not used, and the
-	//     measured result was 92% of episodes re-exploring solved ground.
-	//
-	// Deliberately no progress term by default. Weighting by percent is the
-	// greedy ranking that traps on fake corridors; novelty gets the search
-	// forward without ever preferring "further along" as such. goProgressBias
-	// exists so that claim can be TESTED rather than asserted.
-	uint64_t goSelectCell() {
-		auto& gx = GoExplore::get();
-		if (gx.keys.empty()) return 0;
 
-		uint64_t bestKey = gx.keys[0];
-		double   bestW   = -1.0;
-		const int kTournament = std::max(1, g_config.goTournament);
-		for (int t = 0; t < kTournament; t++) {
-			const uint64_t k = gx.keys[static_cast<size_t>(gx.next() % gx.keys.size())];
-			auto it = gx.archive.find(k);
-			if (it == gx.archive.end()) continue;
-			double w = 1.0 / std::sqrt(1.0 + static_cast<double>(it->second.chosen));
-			w       /= std::sqrt(1.0 + static_cast<double>(it->second.seen));
-			if (g_config.goProgressBias > 0.0)
-				w *= 1.0 + g_config.goProgressBias * (it->second.pct / 100.0);
-			if (w > bestW) { bestW = w; bestKey = k; }
-		}
-		return bestKey;
-	}
 
-	// Return to a cell. No exploration happens here - that separation IS the
-	// algorithm's fix for derailment, and mixing any randomness into this step
-	// would quietly reintroduce the failure it exists to prevent.
-	bool goReturn(uint64_t key) {
-		auto& gx = GoExplore::get();
-		auto it = gx.archive.find(key);
-		if (it == gx.archive.end() || !it->second.rs.cp) return false;
 
-		applyRestoreState(it->second.rs, it->second.hold);
-		gx.currentCell   = key;
-		gx.curMacro      = it->second.macro;
-		gx.curStep       = it->second.step;
-		gx.runHold       = it->second.hold;
-		// A choice is due on the first step: returning to a cell and then
-		// continuing whatever input it arrived with would re-walk the trajectory
-		// that produced it, which is the one episode guaranteed to find nothing.
-		gx.atDecision    = true;
-		gx.sinceDecision = 0;
-		gx.prevGround    = m_player1 && m_player1->m_isOnGround;
-		for (auto& d : gx.stack) releaseCheckpoint(d.rs.cp);
-		gx.stack.clear();
-		it->second.chosen++;
-		gx.returns++;
-		return true;
-	}
 
-	// Release the episode's decision stack. Every entry holds a checkpoint, and
-	// an episode ends thousands of times per minute.
-	void goEndEpisode() {
-		auto& gx = GoExplore::get();
-		for (auto& d : gx.stack) releaseCheckpoint(d.rs.cp);
-		gx.stack.clear();
-		gx.exploring = false;
-	}
-
-	// A death is information, not a wasted episode: return to the nearest
-	// decision with an untried branch and take it.
-	//
-	// This is the whole difference from the coin-flip explorer. There, a death
-	// discarded everything learned and the next episode re-sampled blind. Here
-	// the subtree below a fatal choice is pruned and never revisited, which is
-	// why the DFS clears in a second what 20,000 random episodes could not.
-	bool goBacktrack() {
-		auto& gx = GoExplore::get();
-		while (!gx.stack.empty()) {
-			auto& d = gx.stack.back();
-			if (!(d.tried & 2u)) {
-				d.tried |= 2u;
-				applyRestoreState(d.rs, d.enteringHold);
-				gx.curMacro.resize(static_cast<size_t>(d.macroLen));
-				gx.curStep       = d.step;
-				gx.runHold       = true;   // the untried branch
-				gx.atDecision    = false;
-				gx.sinceDecision = 0;
-				gx.prevGround    = m_player1 && m_player1->m_isOnGround;
-				gx.backtracks++;
-				return true;
-			}
-			releaseCheckpoint(d.rs.cp);
-			gx.stack.pop_back();
-		}
-		return false;
-	}
-
-	void goSolved() {
-		auto& gx = GoExplore::get();
-		goReport(true);
-		log::info("============== GO-EXPLORE SOLVED ==============");
-		log::info("  {} steps, {} episodes, {} returns, {} cells, {} deaths",
-		          gx.curMacro.size(), gx.episodes, gx.returns, gx.archive.size(), gx.deaths);
-
-		Solver::get().macro     = gx.curMacro;
-		Solver::get().bestMacro = gx.curMacro;
-		solverWriteMacro("solution.txt");
-		solverWriteBestMacro();
-
-		auto& ps = ProbeState::get();
-		ps.solvePathTrace.clear();
-		ps.solveDecisionSteps.clear();
-		log::info("  No path trace: F4 will verify this macro but cannot report a "
-		          "divergence step for it.");
-		log::info("  Verify by replaying from frame 0 - a solution found via "
-		          "savestates only counts if it reproduces in a clean run.");
-		log::info("===============================================");
-
-		gx.clear();
-		ps.mode = Mode::Idle;
-	}
-
-	void goStageBest() {
-		auto& gx = GoExplore::get();
-		if (!gx.haveBest) return;
-		auto it = gx.archive.find(gx.bestKey);
-		if (it == gx.archive.end() || it->second.macro.empty()) return;
-		Solver::get().bestMacro = it->second.macro;
-		solverWriteBestMacro();
-	}
-
-	void goStop(const char* why) {
-		auto& gx = GoExplore::get();
-		goReport(true);
-		log::info("Go-Explore: {} - best {:.2f}%, {} cells", why, gx.bestPct, gx.archive.size());
-		goStageBest();
-		gx.clear();
-		ProbeState::get().mode = Mode::Idle;
-	}
-
-	void goReport(bool force) {
-		auto& gx = GoExplore::get();
-		const uint64_t now = probe::nowTicks();
-		if (!force && probe::ticksToMicros(now - gx.lastReport) < 2'000'000.0) return;
-		gx.lastReport = now;
-
-		const double secs = probe::ticksToMicros(now - gx.startTicks) / 1e6;
-		const size_t mem  = processMemoryBytes();
-		const double memMB = (mem > gx.memAtStart ? mem - gx.memAtStart : 0) / (1024.0 * 1024.0);
-
-		// How many cells sit at the leading edge, and how often an episode
-		// actually banks something. `new/ep` near zero with `died` low is the
-		// saturation signature: episodes surviving their full length and
-		// finding nothing, i.e. compute spent on solved ground.
-		size_t frontier = 0;
-		for (auto const& kv : gx.archive)
-			if (kv.second.pct >= gx.bestPct - g_config.goFrontierPct) frontier++;
-
-		log::info("Go: best {:.2f}%  cells {}  frontier {}  new {}  improved {}  "
-		          "evicted {}  episodes {}  dec/ep {:.1f}  depth {}  backtracks {}  "
-		          "exhausted {}  returns {}  deaths {}  steps {}  new/ep {:.3f}  "
-		          "(+{:.0f} MB, {:.0f} steps/s, {:.0f} returns/s)",
-		          gx.bestPct, gx.archive.size(), frontier, gx.newCells, gx.improved,
-		          gx.evicted, gx.episodes,
-		          gx.episodes > 0 ? static_cast<double>(gx.decisions) / gx.episodes : 0.0,
-		          gx.stack.size(), gx.backtracks, gx.exhausted,
-		          gx.returns, gx.deaths,
-		          gx.steps,
-		          gx.episodes > 0 ? static_cast<double>(gx.newCells) / gx.episodes : 0.0,
-		          memMB,
-		          secs > 0 ? gx.steps / secs : 0.0,
-		          secs > 0 ? gx.returns / secs : 0.0);
-	}
-
-	// Seed the archive with the level start, so there is something to return to.
-	bool goInit() {
-		auto& gx = GoExplore::get();
-		auto* pl = PlayLayer::get();
-		if (!pl || !m_player1) return false;
-
-		gx.curMacro.clear();
-		gx.curStep = 0;
-		gx.runHold = false;
-		goRecordCell();
-		if (gx.archive.empty()) {
-			log::error("Go-Explore: could not checkpoint the level start.");
-			goStop("failed to start");
-			return false;
-		}
-		gx.memAtStart = processMemoryBytes();
-		log::info("Go-Explore: seeded from level start. cell size x{:.0f} y{:.0f} vy{:.1f}, "
-		          "systematic DFS episodes of {} steps (max depth {}), decisions on "
-		          "landings/rings (ground) and every {} steps (air), tournament {}, "
-		          "archive cap {}, seed {}.",
-		          g_config.goCellX, g_config.goCellY, g_config.goCellVy,
-		          g_config.goEpisodeSteps, g_config.goMaxDepth, g_config.airBranchInterval,
-		          g_config.goTournament, g_config.goArchiveCap, g_config.goSeed);
-		return true;
-	}
-
-	// One unit of work: either return to a cell, or advance one explored step.
-	bool goStep() {
-		auto& gx = GoExplore::get();
-		auto* pl = PlayLayer::get();
-		if (!pl || !m_player1) return false;
-
-		// --- return phase ---
-		if (!gx.exploring) {
-			const uint64_t key = goSelectCell();
-			if (!key || !goReturn(key)) {
-				gx.returnFails++;
-				if (gx.returnFails > 64) {
-					log::error("Go-Explore: {} consecutive failed returns - the archive "
-					           "holds no restorable cell.", gx.returnFails);
-					goStop("archive unusable");
-					return false;
-				}
-				return true;
-			}
-			gx.returnFails  = 0;
-			gx.exploring    = true;
-			gx.episodeSteps = 0;
-			gx.episodes++;
-			return true;
-		}
-
-		// --- explore phase ---
-		if (gx.atDecision) {
-			if (static_cast<int>(gx.stack.size()) >= g_config.goMaxDepth) {
-				goEndEpisode();
-				return true;
-			}
-			GoDecision d;
-			captureRestoreState(d.rs);
-			if (!d.rs.cp) { goEndEpisode(); return true; }
-			d.enteringHold = gx.runHold;   // the input that produced this state
-			d.step         = gx.curStep;
-			d.macroLen     = static_cast<int>(gx.curMacro.size());
-			d.tried        = 1u;           // about to take the release branch
-			gx.stack.push_back(std::move(d));
-
-			gx.runHold       = false;      // release first, as the DFS does
-			gx.atDecision    = false;
-			gx.sinceDecision = 0;
-			gx.decisions++;
-		}
-
-		applyInput(gx.runHold);
-		GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
-		gx.sinceDecision++;
-		gx.episodeSteps++;
-		gx.curStep++;
-		gx.steps++;
-		gx.curMacro.push_back(gx.runHold ? 1 : 0);
-
-		if (ProbeState::get().finished) { goSolved(); return false; }
-
-		if (m_player1->m_isDead) {
-			gx.deaths++;
-			if (!goBacktrack()) {
-				// The whole subtree below this cell is dead. That is a real
-				// result, not a failure - the cell has been settled, and its
-				// rising `chosen` count moves selection elsewhere.
-				gx.exhausted++;
-				goEndEpisode();
-			}
-			return true;
-		}
-
-		goRecordCell();
-		goReport(false);
-
-		if (atDecisionPoint(gx.sinceDecision, gx.prevGround)) gx.atDecision = true;
-
-		if (gx.episodeSteps >= g_config.goEpisodeSteps) goEndEpisode();
-		return gx.running;
-	}
 
 	// Put the player back at decision `d`, whatever that takes.
 	//
@@ -10970,10 +9336,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// simulate it only postpones the same death by a few hundred steps - and
 		// postponing it is what freezes the decision that caused it.
 		bool geoDead = false;
-		if (g_config.geometryDeadPrune && GeoMap::get().valid && !m_player1->m_isDead) {
-			geoDead = GeoMap::get().isDead(m_player1->getPositionX(),
-			                               m_player1->getPositionY());
-		}
 
 		if (m_player1->m_isDead || geoDead) {
 			sv.deaths++;
@@ -11132,30 +9494,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// Has the corridor ahead changed since the last decision? Only consulted
 		// between airBranchInterval and airBranchIntervalMax: below the minimum
 		// nothing branches, above the maximum everything does.
-		auto geometryWantsBranch = [&]() -> bool {
-			if (g_config.geomBranchMode == 0 || !GeoMap::get().valid) return true;
-			const uint64_t elapsed = sv.step - sv.lastBranch;
-			if (elapsed >= static_cast<uint64_t>(g_config.airBranchIntervalMax)) return true;
-			const double lookX = m_player1->getPositionX() +
-				(g_config.geomLookaheadScaleWithSpeed
-					? static_cast<double>(g_config.geomLookaheadSteps) * sv.dxPerStep
-					: static_cast<double>(g_config.geomLookaheadFixedX));
-			double glo = 0.0, ghi = 0.0;
-			// No reading means no opinion: keep the old cadence rather than
-			// suppressing a decision the map cannot vouch for.
-			if (!geometryWindowAt(lookX, m_player1->getPositionY(), &glo, &ghi)) return true;
-			// Tight corridor: keep every decision. Suppressing them here is what
-			// cost the mini ship section in mode 1.
-			if (g_config.geomBranchMode >= 2 &&
-			    (ghi - glo) < g_config.geomTightHeights * GeoMap::get().playerH) {
-				sv.lastGeoLo = glo; sv.lastGeoHi = ghi;
-				return true;
-			}
-			const bool changed = std::abs(glo - sv.lastGeoLo) > 0.01 ||
-			                     std::abs(ghi - sv.lastGeoHi) > 0.01;
-			if (changed) { sv.lastGeoLo = glo; sv.lastGeoHi = ghi; }
-			return changed;
-		};
+		// Was geomBranchMode: branch on a geometry CHANGE rather than a fixed
+		// cadence. Mode 0 - the default and the only mode ever shipped - returned
+		// true immediately, so the whole rule was unreachable. Removed with the
+		// mode; the fixed cadence is what has always run.
+		auto geometryWantsBranch = [&]() -> bool { return true; };
 
 		if (mc == ModeClass::Tap) {
 			// Discrete events: decide whether to tap, on the same cadence. No
@@ -11668,18 +10011,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// exactly when it needs to backtrack and respawn. Gating it behind
 		// !m_isDead froze the search on the first death.
 		const bool solving = st.mode == Mode::Solve && Solver::get().running;
-		// Same reasoning as the DFS: the beam spends most of its time with a
-		// dead player, because a branch that dies is the normal outcome and the
-		// next restore is what revives it.
-		const bool beaming = st.mode == Mode::Beam && Beam::get().running;
-		// Go-Explore spends most of its time with a dead player too: an episode
-		// ending in death is the normal outcome, and the next return revives it.
-		const bool going   = st.mode == Mode::GoExplore && GoExplore::get().running;
 		// Same reason as the searches: a variant that dies is the normal
 		// outcome, and the sweep has to keep running to record it and reset.
 		const bool sweeping = st.mode == Mode::Sweep && Sweep::get().running;
 		const bool active  = pl && m_player1 &&
-		                     (solving || beaming || going || sweeping ||
+		                     (solving || sweeping ||
 		                      (!m_player1->m_isDead && !st.finished));
 
 		if (st.mode == Mode::Idle || !active) {
@@ -11790,32 +10126,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			return;
 		}
 
-		if (st.mode == Mode::GoExplore) {
-			auto& gx = GoExplore::get();
-			if (!gx.seeded) {
-				if (!goInit()) return;
-				gx.seeded = true;
-			}
-			const uint64_t frameStart = probe::nowTicks();
-			while (gx.running) {
-				if (!goStep()) break;
-				if (probe::ticksToMicros(probe::nowTicks() - frameStart) > kSolverFrameBudgetUs) break;
-			}
-			return;
-		}
 
-		// Same shape as the solver's loop: as much work per rendered frame as the
-		// budget allows. One beamStep is one node expansion (two restores) or one
-		// frontier selection, so the budget can never cut a node in half.
-		if (st.mode == Mode::Beam) {
-			auto& bm = Beam::get();
-			const uint64_t frameStart = probe::nowTicks();
-			while (bm.running) {
-				if (!beamStep()) break;
-				if (probe::ticksToMicros(probe::nowTicks() - frameStart) > kSolverFrameBudgetUs) break;
-			}
-			return;
-		}
 
 		// With the fix on, one update(1/240) call is exactly one physics step,
 		// so several run per rendered frame to hold real-time pace. Without it,
@@ -11952,7 +10263,7 @@ class $modify(SolverPlayLayer, PlayLayer) {
 
 		log::info("gd-solver: level '{}' loaded - output files are namespaced as {}_*",
 		          ProbeState::get().levelKey, ProbeState::get().levelKey);
-		log::info("  F2 = solve/stop, B = beam, F4 = verify, F5 = record input, F6 = load input, "
+		log::info("  F2 = solve/stop, F4 = verify, F5 = record input, F6 = load input, "
 		          "F7 = dump trace, F8 = toggle resync, F11 = savestate cost, "
 		          "F12 = restore fidelity");
 		return true;

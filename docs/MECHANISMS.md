@@ -231,9 +231,18 @@ Modes: 0 speak at every air decision, 1 only where liveness separates something,
 How far ahead the map samples for live space, expressed as a reaction time in
 steps and converted to distance using the player's measured horizontal speed.
 
-*Provenance:* 229 steps is 300 units at 1×, chosen so the change from a flat 300
-units is inert on every level that already solved. The underlying 300 was fitted
-to ToE, whose corridors split at x 20,130 and seal at x 20,400.
+*Provenance:* the 300 was fitted to ToE, whose corridors split at x 20,130 and
+seal at x 20,400. 229 steps is 300 units at 1×.
+
+> **CORRECTION (found while deleting):** `geomLookaheadSteps = 229` is **not the
+> live value.** `geomLookaheadScaleWithSpeed` is `false`, so the ternary always
+> picks `geomLookaheadFixedX = 300` — a flat distance. The speed-scaled version
+> was written, documented, and never enabled. Its own comment argues it matters:
+> *"At 2x speed the player covers 300 units in half the time, so it gets half the
+> warning; at 3x, a third. Electrodynamix introduces 2x and 3x and stalls three
+> times (34.89%, 73.65%, 94.01% - 67 of its 111 seconds), which is what that
+> would look like."* This moves from GROUND to **ISOLATE** — a built fix, with a
+> stated prediction, sitting switched off.
 
 *What it should be:* how far ahead the player can still act, which depends on
 climb rate — the measured quantity. This is velocity item 4c.
