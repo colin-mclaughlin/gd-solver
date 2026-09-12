@@ -225,6 +225,30 @@ struct Config {
 	// F toggles it.
 	bool geoStateRestore = true;
 
+	// 4b: kill a branch whose reachable band, propagated from the player's ACTUAL
+	// vertical velocity, intersects no live space at the horizon.
+	//
+	// MEASURED, and this is the whole case for it. Reachable band as a fraction of
+	// the naive terminal-rate cone, propagated over the motion census from vy = 0:
+	//
+	//    10 steps  7%     40 steps  26%     120 steps  65%     231 steps  82%
+	//
+	// At 20 steps it pins a ship to 9 units inside a 247-unit corridor. At the
+	// steer's 300-unit lookahead (231 steps) the band is 612-729 units - wider than
+	// any corridor, so nothing would ever be prunable. Velocity knowledge lives at
+	// the DECISION horizon, not the steering one, which is why this is ~30 steps
+	// and not tied to geomLookaheadFixedX.
+	//
+	// V toggles it. Default off until it has a before/after suite.
+	bool velocityPrune = false;
+	int  velocityPruneSteps = 30;
+
+	// Safety factor on the measured envelope. The census is a SAMPLE, so the true
+	// extremes can exceed the observed ones; widening is the safe direction because
+	// a wider band prunes LESS. Not a tuning knob - lowering it trades soundness
+	// for pruning and should not be done without a completeness argument.
+	double velocityPruneMargin = 1.10;
+
 	// How long a discrete tap holds the button. Only needs to outlast the
 	// measured one-step injection latency so the press registers as an edge;
 	// holding longer does nothing in UFO or swing and would only crowd the next
@@ -2994,6 +3018,11 @@ struct Solver {
 	double                motionPrevVy   = 0.0;
 	bool                  motionPrevHold = false;
 	bool                  motionHavePrev = false;
+	bool                  motionPrevGround = false;
+	uint8_t               motionPrevMode   = 255;
+	bool                  motionPrevPad        = false;
+	bool                  motionPrevRing       = false;
+	bool                  motionPrevCustomRing = false;
 
 	double                prevX        = 0.0;
 	double                dxPerStep    = 1.31;  // 1x; replaced on the first step
@@ -3195,6 +3224,7 @@ struct Solver {
 	// be evaluated both ways and the difference counted. Measurement only.
 	double                shadowGeoLo  = 0.0;
 	double                shadowGeoHi  = 0.0;
+	uint64_t              velPrunes = 0;   // 4b: branches killed by the velocity band
 	uint64_t              geoStaleEvals    = 0;  // branch-rule comparisons made
 	uint64_t              geoStaleDiverged = 0;  // ...where stale and correct disagree
 	double                resumeGeoLo    = 0.0;
@@ -3279,6 +3309,9 @@ struct Solver {
 		lastGoodMacro.clear();
 		motionPrevVy   = 0.0;
 		motionPrevHold = false;
+		motionPrevGround = false;
+		motionPrevMode   = 255;
+		motionPrevPad = motionPrevRing = motionPrevCustomRing = false;
 		motionHavePrev = false;
 		bestMacro.clear();
 		pathTrace.clear();
@@ -3349,6 +3382,7 @@ struct Solver {
 		lastGeoLo = lastGeoHi = 0.0;
 		resumeGeoLo = resumeGeoHi = 0.0;
 		shadowGeoLo = shadowGeoHi = 0.0;
+		velPrunes = 0;
 		geoStaleEvals = geoStaleDiverged = 0;
 		std::memset(maxClimb, 0, sizeof(maxClimb));
 		tapDecisions = tapFirstChosen = 0;
@@ -3621,7 +3655,9 @@ void motionModelDump(const char* why) {
 	if (!f) { log::error("Probe 9: cannot write {}", path); return; }
 
 	std::fprintf(f, "# motion model (%s): vy' = f(mode,size,speed,grav,ground,"
-	                "prevHold,hold,vy)\n", why);
+	                "prevHold,hold,isAccel,jumpBuf,event,vy)\n", why);
+	std::fprintf(f, "# READ THE SPREAD COLUMN FIRST. vy is a function of the "
+	                "key, so a nonzero spread means an axis is still missing.\n");
 	std::fprintf(f, "# %llu transitions recorded, %llu distinct keys, %llu capped, "
 	                "vy bucket %.4f\n",
 	             static_cast<unsigned long long>(mm.recorded),
@@ -3629,6 +3665,7 @@ void motionModelDump(const char* why) {
 	             static_cast<unsigned long long>(mm.capped),
 	             g_config.motionVyBucket);
 	std::fprintf(f, "mode,size,speed,upsideDown,onGround,prevHold,hold,"
+	                "isAccel,jumpBuf,event,"
 	                "vy,vyNextMin,vyNextMax,spread,dyMean,count\n");
 
 	// Per-configuration coverage and consistency, accumulated while writing.
@@ -3660,10 +3697,11 @@ void motionModelDump(const char* why) {
 		const double vy      = r.vyb * g_config.motionVyBucket;
 		const double spread  = r.vyNextMax - r.vyNextMin;
 		const double dyMean  = r.count ? r.dySum / r.count : 0.0;
-		std::fprintf(f, "%s,%d,%d,%d,%d,%d,%d,%.4f,%.6f,%.6f,%.6f,%.4f,%u\n",
+		std::fprintf(f, "%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.6f,%.6f,%.6f,%.4f,%u\n",
 		             kMode[r.mode & 7], r.size, r.speed,
 		             (r.flags & 1) ? 1 : 0, (r.flags & 8) ? 1 : 0,
 		             (r.flags & 2) ? 1 : 0, (r.flags & 4) ? 1 : 0,
+		             (r.flags & 16) ? 1 : 0, (r.flags & 32) ? 1 : 0, (r.flags & 64) ? 1 : 0,
 		             vy, r.vyNextMin, r.vyNextMax, spread, dyMean, r.count);
 
 		const uint32_t ck = (static_cast<uint32_t>(r.mode) << 16)
@@ -4024,6 +4062,15 @@ struct GeoMap {
 	// map. With a per-x roof that check can never fire: Time Machine's yHi is
 	// 810 while the roof holds the back half at 390.
 	std::vector<float> segRoof;
+	// Slices holding an object that can OVERRIDE velocity: jump pads, jump rings,
+	// gravity pads/rings, and every portal. Marked per slice, which over-marks
+	// (an orb inside a slice flags the whole slice) - the safe direction.
+	//
+	// This exists for the velocity prune's soundness rule. MEASURED: the motion
+	// census is consistent to 0.36% in free flight but the exceptions are all
+	// velocity overrides, so the reachable band is only a true bound where no
+	// override can fire. See velocityUnreachable.
+	std::vector<uint8_t> segEvent;
 	double yLo = 0.0, yHi = 0.0;
 	double playerH = 15.0;         // smallest hitbox height: permissive
 	int  freeCount = 0, deadCount = 0;
@@ -4082,6 +4129,7 @@ bool geometryBuildMap() {
 	const double eps = 1e-6;
 
 	struct Obj { double x0, x1; float lo, hi; uint8_t type; };
+	std::vector<std::pair<double,double>> eventRanges;
 	std::vector<Obj> objs;
 	std::vector<double> edges;
 	// (x, y) of every portal that re-snaps the camera band, for the per-x roof.
@@ -4098,6 +4146,28 @@ bool geometryBuildMap() {
 		auto* o = static_cast<GameObject*>(arr->objectAtIndex(i));
 		if (!o) continue;
 		const int t = static_cast<int>(o->getType());
+		{
+			using G = GameObjectType;
+			const bool isEvt =
+			   t == static_cast<int>(G::YellowJumpPad)  || t == static_cast<int>(G::PinkJumpPad)
+			|| t == static_cast<int>(G::GravityPad)     || t == static_cast<int>(G::YellowJumpRing)
+			|| t == static_cast<int>(G::PinkJumpRing)   || t == static_cast<int>(G::GravityRing)
+			|| t == static_cast<int>(G::GreenRing)      || t == static_cast<int>(G::InverseGravityPortal)
+			|| t == static_cast<int>(G::NormalGravityPortal) || t == static_cast<int>(G::ShipPortal)
+			|| t == static_cast<int>(G::CubePortal)     || t == static_cast<int>(G::BallPortal)
+			|| t == static_cast<int>(G::UfoPortal)      || t == static_cast<int>(G::WavePortal)
+			|| t == static_cast<int>(G::RobotPortal)    || t == static_cast<int>(G::SpiderPortal)
+			|| t == static_cast<int>(G::RegularSizePortal) || t == static_cast<int>(G::MiniSizePortal)
+			|| t == static_cast<int>(G::TeleportPortal) || t == static_cast<int>(G::DualPortal)
+			|| t == static_cast<int>(G::SoloPortal)     || t == static_cast<int>(G::InverseMirrorPortal)
+			|| t == static_cast<int>(G::NormalMirrorPortal)
+			|| t == static_cast<int>(G::SpiderOrb)      || t == static_cast<int>(G::SpiderPad)
+			|| t == static_cast<int>(G::TeleportOrb);
+			if (isEvt) {
+				const cocos2d::CCRect er = o->getObjectRect();
+				eventRanges.emplace_back(er.getMinX(), er.getMaxX());
+			}
+		}
 
 		// Mode portals, for the roof bound. IDs are the ones already established
 		// in this file's portal handling; an unrecognised one simply does not
@@ -4182,6 +4252,14 @@ bool geometryBuildMap() {
 	m.blocked.assign(n, {});
 	m.freeSpans.assign(n, {});
 	m.segRoof.assign(n, 0.f);
+	m.segEvent.assign(n, 0);
+	for (auto const& er : eventRanges) {
+		for (int si = 0; si < n; si++) {
+			if (m.xs[si + 1] <= er.first) continue;
+			if (m.xs[si] >= er.second)    break;
+			m.segEvent[static_cast<size_t>(si)] = 1;
+		}
+	}
 	m.roofKilledSlices = 0;
 	m.roofRemovedIvls  = 0;
 	m.roofFirstKillX   = 0.0;
@@ -4656,6 +4734,8 @@ bool geometryBlockedAt(double x, double y) {
 }
 
 bool geometryWindowAt(double x, double y, double* lo, double* hi);
+bool velocityUnreachable(double x, double y, double vy, double dxPerStep,
+                         bool mini, double* bandLo, double* bandHi);
 
 // Which way to steer at `(x, y)`: +1 prefer the climbing branch, -1 the falling
 // one, 0 leave the existing ordering alone.
@@ -5013,6 +5093,66 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 // Bounds of the LIVE interval containing `y` at `x`, or false if the altitude
 // is blocked, in dead space, or off the map. Used to notice when the corridor
 // ahead changes - see geomBranchMode.
+// 4b. Is every reachable altitude dead at the horizon?
+//
+// The envelope below is MEASURED from the motion census (event-free rows, >=3
+// samples, 917k transitions over the 15-level suite):
+//
+//              accel up/step   accel down/step   |vy| seen
+//   ship        +0.118           -0.103            8.00      (P99 / P1)
+//   ship mini   +0.137           -0.122            9.42
+//
+// and dy = vy * 0.2279 (median over the census; 1/0.2279 = 4.389, which is the
+// same scale Probe 16 cross-checked at 4.4444). Terminal check: 8.00 * 0.2279 =
+// 1.823 units/step against Probe 16's independently measured 1.800.
+//
+// SOUNDNESS. The census is a true bound only where nothing can override velocity,
+// so this refuses to answer when a pad, ring or portal lies inside the horizon -
+// those are exactly the transitions the census marks as events, and GeoMap::
+// segEvent records where they are. Refusing costs a missed prune; answering
+// anyway would delete a reachable branch.
+//
+// Hold modes only. A UFO tap SETS velocity (measured: a single step moves vy by
+// +13.27 from any value), so its reachable band is the whole corridor after one
+// tap and a prune would essentially never fire.
+bool velocityUnreachable(double x, double y, double vy, double dxPerStep,
+                         bool mini, double* bandLo, double* bandHi) {
+	auto const& m = GeoMap::get();
+	if (!m.valid || dxPerStep <= 0.0) return false;
+
+	const double aUp = (mini ? 0.137 : 0.118) * g_config.velocityPruneMargin;
+	const double aDn = (mini ? 0.122 : 0.103) * g_config.velocityPruneMargin;
+	const double vCl = (mini ? 9.42  : 8.00 ) * g_config.velocityPruneMargin;
+	const double kDy = 0.2279;
+
+	const int n = std::max(1, g_config.velocityPruneSteps);
+	double vHi = vy, vLo = vy, yHi = y, yLo = y;
+	for (int i = 0; i < n; i++) {
+		vHi = std::min( vCl, vHi + aUp);
+		vLo = std::max(-vCl, vLo - aDn);
+		yHi += vHi * kDy;
+		yLo += vLo * kDy;
+	}
+	if (bandLo) *bandLo = yLo;
+	if (bandHi) *bandHi = yHi;
+
+	const double hx = x + static_cast<double>(n) * dxPerStep;
+	const int s0 = m.segIndex(x), s1 = m.segIndex(hx);
+	if (s0 < 0 || s1 < 0) return false;                 // off the map: no opinion
+
+	// Refuse where velocity can be overridden.
+	for (int si = s0; si <= s1 && si < static_cast<int>(m.segEvent.size()); si++)
+		if (m.segEvent[static_cast<size_t>(si)]) return false;
+
+	for (auto const& f : m.freeSpans[static_cast<size_t>(s1)]) {
+		if (!f.live) continue;
+		if (static_cast<double>(f.hi) < yLo || static_cast<double>(f.lo) > yHi) continue;
+		if (std::min<double>(f.hi, yHi) - std::max<double>(f.lo, yLo) >= m.playerH)
+			return false;                                // something live is reachable
+	}
+	return true;
+}
+
 bool geometryWindowAt(double x, double y, double* lo, double* hi) {
 	auto const& m = GeoMap::get();
 	if (!m.valid) return false;
@@ -6027,6 +6167,17 @@ void pollHotkeys() {
 	}
 
 
+	// V = velocity reachability prune (4b).
+	if (keyPressedEdge('V')) {
+		g_config.velocityPrune = !g_config.velocityPrune;
+		log::info("Velocity prune: {} (horizon {} steps, margin {:.2f}). "
+		          "F2 to solve with this.",
+		          g_config.velocityPrune ? "ON - a hold-mode branch whose reachable "
+		                                   "band is all dead at the horizon is killed"
+		                                 : "OFF",
+		          g_config.velocityPruneSteps, g_config.velocityPruneMargin);
+	}
+
 	// M = branch on geometry change rather than on a fixed cadence.
 	if (keyPressedEdge('M')) {
 		g_config.geomBranchMode = (g_config.geomBranchMode + 1) % 3;
@@ -6271,6 +6422,12 @@ void pollHotkeys() {
 			          "checkpoint. Plan 13.13.",
 			          g_config.hybridRestore ? "ON" : "OFF",
 			          g_config.hybridRestore ? "do NOT carry" : "carry");
+log::info("Solver: velocity prune {} (V toggles).",
+			          g_config.velocityPrune
+			              ? fmt::format("ON, horizon {} steps, margin {:.2f}",
+			                            g_config.velocityPruneSteps,
+			                            g_config.velocityPruneMargin)
+			              : std::string("OFF"));
 			log::info("Solver: branch-rule carried state {} (F toggles).",
 			          g_config.geoStateRestore
 			              ? "is RESTORED on reposition - BEHAVIOUR CHANGE from a02573c"
@@ -8593,7 +8750,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	//
 	// Keyed on everything that can change the answer. If the spread column in the
 	// dump is non-zero, something is missing from exactly this list.
-	void motionModelRecord(double vyBefore, bool prevHold, bool hold, double dy) {
+	void motionModelRecord(double vyBefore, bool prevHold, bool hold, double dy,
+	                      bool evt) {
 		auto* p = m_player1;
 		if (!g_config.motionModelEnabled || !p || p->m_isDead) return;
 
@@ -8609,9 +8767,47 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		       : p->m_isSpider ? 6 : p->m_isSwing ? 7 : 0);
 		k.size  = p->m_vehicleSize < 0.9f ? 1 : 0;
 		k.speed = static_cast<uint8_t>(Solver::speedBucket(Solver::get().dxPerStep));
+		// m_isAccelerating and m_jumpBuffered are in the key because the decompiled
+		// updateJump selects the ship's acceleration COEFFICIENT with them -
+		// camila314/gdp gives 0.8 / 1.2 / -1.0 depending on jumpBuffered,
+		// isAccelerating, and whether velocity direction matches gravity.
+		//
+		// MEASURED consequence of leaving them out: over a 15-level census of
+		// 1,168,629 transitions and 51,255 keys, 53.65% of keys had NONZERO SPREAD,
+		// max 31.0 - so vy was not a function of the key at all. Ship was worst at
+		// 70.4%, and the bad rate ROSE with sample count (0% at one sample, 81.5% at
+		// 5-19, 82.8% at 20-99), which is a missing axis rather than noise.
 		k.flags = static_cast<uint8_t>((p->m_isUpsideDown ? 1 : 0)
 		        | (prevHold ? 2 : 0) | (hold ? 4 : 0)
-		        | (p->m_isOnGround ? 8 : 0));
+		        | (p->m_isOnGround ? 8 : 0)
+		        | (p->m_isAccelerating ? 16 : 0)
+		// EVENT bit. Set when something OTHER than the integrator touched the
+		// velocity this step: an orb/pad was in contact, the ground state changed,
+		// the mode changed, or vy was forced to exactly zero while airborne
+		// (ceiling or wall contact).
+		   //
+		   // m_touchedPad / m_touchedRing / m_touchedCustomRing were added after the
+		   // first census with the event bit: m_touchingRings alone left 68 ship-air
+		   // free-flight keys inconsistent, and their extremes still sat on +-6.40 -
+		   // one of the same fixed pad/orb constants (16.0, 12.8, 10.4, 6.4). Pads fire
+		   // on contact without a click and are not in m_touchingRings.
+		   //
+		   // They are STICKY per attempt, not per step - MEASURED: testing the level
+		   // instead of the rising edge marked nearly everything as an event and
+		   // collapsed air free-flight from 18,790 keys to 40. Hence the edge test.
+		//
+		// MARKED rather than dropped, so the claim can be checked instead of
+		// assumed. MEASURED beforehand: of the 584 inconsistent air-mode keys, 503
+		// (86.1%) have an extreme sitting on an event constant - 0.0 dominates at
+		// 450 - and the 81 that do not are 0.43% of all air keys.
+		//
+		// It is in the KEY, so event and free-flight transitions never share a row
+		// and the clean rows carry clean min/max. It is derived partly from AFTER
+		// state, so it is not predictable at search time - which is the point: the
+		// model predicts free flight, and the geometry map already knows where every
+		// orb, pad, floor and ceiling is. Those were never the model's job.
+		        | (p->m_jumpBuffered ? 32 : 0)
+		        | (evt ? 64 : 0));
 
 		struct Packed { int32_t vyb; uint8_t mode, size, speed, flags; } pk{
 			k.vyb, k.mode, k.size, k.speed, k.flags };
@@ -9268,7 +9464,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
 		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
 		          "archive {}c/{}r/{}f  gate {} free {}T/{}H  mute {}  "
-		          "geoStale {}/{}  "
+		          "geoStale {}/{}  velPrune {}  "
 		          "ceil {}/{}c/{}p/{}s out {}/{}  roofMargin {}  "
 		          "dx {:.2f}/{:.2f}  vs map {:.2f}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
@@ -9281,7 +9477,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          SolverArchive::get().restartFail,
 		          sv.budgetGateEvals, sv.gateFreeTap, sv.gateFreeHold,
 		          sv.geoSteerMute,
-		          sv.geoStaleDiverged, sv.geoStaleEvals,
+		          sv.geoStaleDiverged, sv.geoStaleEvals, sv.velPrunes,
 		          sv.learnedCeiling > 1e29
 		              ? std::string("--")
 		              : fmt::format("{:.0f}", sv.learnedCeiling),
@@ -9651,6 +9847,20 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// simulate it only postpones the same death by a few hundred steps - and
 		// postponing it is what freezes the decision that caused it.
 		bool geoDead = false;
+		if (g_config.velocityPrune && !m_player1->m_isDead) {
+			const ModeClass pmc = classifyMode(m_player1);
+			if (pmc == ModeClass::Hold) {
+				double bl = 0.0, bh = 0.0;
+				if (velocityUnreachable(m_player1->getPositionX(),
+				                        m_player1->getPositionY(),
+				                        static_cast<double>(m_player1->m_yVelocity),
+				                        sv.dxPerStep,
+				                        m_player1->m_vehicleSize < 0.9f, &bl, &bh)) {
+					geoDead = true;
+					sv.velPrunes++;
+				}
+			}
+		}
 
 		if (m_player1->m_isDead || geoDead) {
 			sv.deaths++;
@@ -9759,7 +9969,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				// the input that was applied during this step - the tap countdown
 				// that can change it runs further down.
 				if (s.motionHavePrev) {
-					motionModelRecord(s.motionPrevVy, s.motionPrevHold, sv.hold, rawDy);
+					const uint8_t mmMode = static_cast<uint8_t>(classifyMode(m_player1));
+					const bool mmGround = m_player1->m_isOnGround;
+					const bool mmEvt =
+						      (m_player1->m_touchingRings && m_player1->m_touchingRings->count() > 0)
+						   || (m_player1->m_touchedPad       && !s.motionPrevPad)
+						   || (m_player1->m_touchedRing      && !s.motionPrevRing)
+						   || (m_player1->m_touchedCustomRing && !s.motionPrevCustomRing)
+						|| (mmGround != s.motionPrevGround)
+						|| (s.motionPrevMode != 255 && mmMode != s.motionPrevMode)
+						|| (!mmGround && m_player1->m_yVelocity == 0.0
+						    && std::abs(s.motionPrevVy) > 0.01);
+					motionModelRecord(s.motionPrevVy, s.motionPrevHold, sv.hold, rawDy, mmEvt);
 					ceilingProbeRecord(s.motionPrevVy);
 					ceilingUpdate(s.motionPrevVy);
 				}
@@ -9770,6 +9991,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// against the state it actually started from.
 			s.motionPrevVy   = m_player1->m_yVelocity;
 			s.motionPrevHold = sv.hold;
+			s.motionPrevGround = m_player1->m_isOnGround;
+			s.motionPrevMode   = static_cast<uint8_t>(classifyMode(m_player1));
+			s.motionPrevPad        = m_player1->m_touchedPad;
+			s.motionPrevRing       = m_player1->m_touchedRing;
+			s.motionPrevCustomRing = m_player1->m_touchedCustomRing;
 			s.motionHavePrev = true;
 		}
 
