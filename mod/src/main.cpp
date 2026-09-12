@@ -240,6 +240,81 @@ struct Config {
 	// and not tied to geomLookaheadFixedX.
 	//
 	// V toggles it. Default off until it has a before/after suite.
+	// The steer projects the altitude before asking the map anything:
+	//
+	//     y += lead * vy;          // geomLeadHold = 8.0, vy = m_yVelocity
+	//
+	// That is dimensionally wrong. MEASURED from the motion census, dy per step =
+	// vy * 0.2279 (median over 917k transitions; 1/0.2279 = 4.389, the same scale
+	// Probe 16 cross-checked at 4.4444). A climbing normal ship sits at vy ~ 7.9,
+	// so the current expression projects
+	//
+	//     8 * 7.9  = 63 world units
+	//
+	// against a TRUE eight-step travel of 8 * 1.800 = 14.4. It overshoots by
+	// exactly 1/0.2279, and 63 units is a quarter of the 247-unit mean corridor,
+	// applied upward on every climbing air decision of every level.
+	//
+	// No reading of "8" produces 63: eight steps is 14.4, and projecting all the
+	// way to the 300-unit lookahead (231 steps) would be 415. The af008c1 values
+	// (8 ship/wave, 4 mini, 2 UFO/swing) were fitted, and mini getting HALF of
+	// ship's lead while measurably climbing FASTER (2.118 vs 1.800) is the tell.
+	//
+	// With this ON, `lead` means STEPS and the conversion is applied, so the
+	// projection is where the player will actually be. Default OFF until measured.
+	// P toggles it.
+	// ABLATION: silence the steer entirely, leaving map ordering, liveness, the
+	// commit floor and everything else untouched. It answers one question that
+	// decides the ordering - how much is the steer WORTH?
+	//
+	// It is asked because the steer's constants are mutually compensating and two
+	// separate attempts to correct one of them have now failed in opposite
+	// directions (velocity 4c's lookahead/reach pair; the lead term's missing
+	// vy->dy conversion, which is dimensionally right and costs a level). Replacing
+	// the whole construction is the largest build on the list, so its urgency
+	// should be measured rather than assumed:
+	//
+	//   board collapses without the steer  -> it is load-bearing, replace it first
+	//   board barely moves                 -> the tangle is low-stakes, and the
+	//                                         value is elsewhere
+	//
+	// J toggles it.
+	// Aim at the live window's centre CLAMPED to what the player can physically
+	// reach, instead of pre-projecting the altitude with a fitted lead term.
+	//
+	// This replaces the whole compensating set at once rather than one term at a
+	// time, which has now failed twice: velocity 4c's lookahead/reach pair (whose
+	// own comment concluded "they have to be fixed together") and the lead term's
+	// missing vy->dy conversion, which is dimensionally correct and costs a level
+	// because geomClearanceBand and the geomLead values were fitted around it.
+	//
+	// With this ON the lead projection is NOT applied - the reach cone subsumes it -
+	// and the target becomes clamp(window centre, [y+dLo, y+dHi]) from the measured
+	// envelope at the player's actual vy.
+	//
+	// A CLAMP, not an intersection, on purpose. MEASURED: velocity information
+	// dissipates past ~120 steps (band is 65% of the naive cone at 120, 82% at 231)
+	// and the lookahead is 231 steps, so an intersection would never constrain and
+	// the change would be inert. A clamp degrades gracefully - wide at long
+	// horizons, binding at short ones - and its whole job is to stop the steer
+	// demanding an altitude the player cannot get to, which is what produces
+	// "holds too long, arrives too high".
+	//
+	// ABLATION that justifies replacing rather than deleting: with the steer
+	// silenced the board is 12/15, losing Theory of Everything and Electroman - but
+	// xStep 2176->1542 and Electrodynamix 4261->2953 both IMPROVE without it.
+	// Load-bearing and harmful at once. Q toggles it.
+	bool geomReachClamp = false;
+
+	bool geomSteerSilent = false;
+
+	bool geomLeadInSteps = false;
+
+	// dy per step per unit of m_yVelocity. MEASURED, motion census, event-free
+	// rows with >= 3 samples: 0.22787 ship, 0.22771 ship mini, 0.22896 ufo,
+	// 0.22857 ufo mini - flat across mode and size, as a unit conversion should be.
+	double geomVyToDy = 0.2279;
+
 	bool velocityPrune = false;
 	int  velocityPruneSteps = 30;
 
@@ -660,7 +735,30 @@ struct Config {
 	// roof from a band never entered, and if that band is lower, real space gets
 	// deleted. The difference now is that MAP ROOF TOO LOW detects exactly that,
 	// live, against the ceiling read at 0x764.
-	int geomPortalRoof = 0;
+
+	// DEFAULT 2 (MOST RECENT) as of this commit - the first 15/15 in the project.
+	//
+	// This was previously 0 and written off: it measured 11/14 and the ordering had
+	// it CUT, on the grounds that Base After Base solved without it. That
+	// measurement was taken BEFORE geoStateRestore, on a build whose search tree was
+	// history-dependent - up to 4.75% of branch-rule evaluations diverging from what
+	// correctly-restored state gives, and exhaustion never once firing on
+	// Clutterfunk. It was a correct mechanism judged by a broken instrument.
+	//
+	// MEASURED on the current default, full suite, reproduced bit-for-bit twice:
+	//
+	//   ALL 15 LEVELS SOLVE, Clubstep included (5,930 deaths).
+	//   On the 14 both configurations solve: 18,626 -> 13,404 deaths, 28% fewer.
+	//   Theory of Everything 4215 -> 1324, Electrodynamix 4261 -> 2263,
+	//   Jumper 649 -> 436, Time Machine 691 -> 546, Cycles 490 -> 419.
+	//   Worse on three: Stereo Madness 216 -> 350, Back on Track 255 -> 288,
+	//   Electroman 1938 -> 2024.
+	//
+	// Why it matters that this is the DEFAULT and not a hotkey: 9803757 recorded
+	// "Clubstep clears - first demon!" from an M-pressed run while its default
+	// stayed 0, and eleven days later the mechanism was deleted as unreachable.
+	// A tested configuration that is not the default configuration gets lost.
+	int geomPortalRoof = 2;
 
 	// Kept for the query-time clamp, now default off - see the measurements above
 	// it. The ceiling READ at 0x764 stays valid and is what this roof is
@@ -2241,6 +2339,9 @@ void reportDivergence(int endStep, bool passed) {
 }
 
 void pathAuditReport();   // Probe 17, defined with the map probes below
+void expressAuditStep(PlayerObject* p, bool pressed, uint64_t k);  // Probe 20
+void bestDecisionDump();  // Probe 21
+void expressAuditReport();
 
 void finishVerify(bool completed, int atStep, float pct) {
 	auto& st = ProbeState::get();
@@ -2767,6 +2868,38 @@ inline void releaseCheckpoint(CheckpointObject*& cp) {
 	cp = nullptr;
 }
 
+// Probe 17: audit a KNOWN-GOOD path against the map.
+//
+// Every argument about whether the liveness sweep is too strict has been
+// made from the geometry, and the geometry is exactly what is in question.
+// A solved macro settles it without any of that: the trajectory physically
+// happened, so anywhere the map disagrees with it, the MAP is wrong.
+// Probe 21: the decisions the search ACTUALLY placed along its best path.
+//
+// Probe 20 tried to answer this by re-deriving decision points with a shadow of
+// the branch rule. It got the phase wrong and produced byte-identical output for
+// mode 0 and mode 1, which is impossible - so it was measuring nothing. The
+// solver knows where its decisions are; read them instead of reconstructing.
+//
+// Snapshotted on each new best, so a stall leaves the decision sequence of the
+// furthest path behind. Diffed offline against a known-good macro's toggles,
+// this says whether the search could have expressed the winning input - and if
+// it could, what the steer was telling it to do instead.
+// The steer's internals from its most recent evaluation, so a decision can
+// record WHY the steer said what it said - not just what it said.
+//
+// MEASURED need: on Clubstep's stall the search had a decision at the exact
+// step the winning path releases (11933) and 6 toggles spent against a budget
+// of 9, so it could afford the move and simply was not told to make it. The
+// steer is silent across the whole 11891-11949 release window and says CLIMB
+// at 11874-11886. Knowing it was silent is not enough to fix it; we need the
+// target and the deadband it was silent ABOUT.
+struct SteerInfo {
+	double yNow = 0, yProj = 0, target = 0, band = 0, lo = 0, hi = 0, lookX = 0;
+	int    path = 0;      // which of the three target paths answered
+	bool   valid = false;
+};
+
 struct Decision {
 	int               step      = 0;       // solver step index at capture
 	uint8_t           tried     = 0;       // bit0 = tried release, bit1 = tried hold
@@ -2783,6 +2916,8 @@ struct Decision {
 	// exhaustion searches simple paths before complicated ones, and stays
 	// complete as the bound grows.
 	bool enteringHold  = false; // hold state on arrival, so a toggle is well-defined
+	SteerInfo si;            // the steer internals at the moment this was pushed
+	double    vyAt = 0.0;    // player vy at the same moment
 	// Corridor at the previous decision, on arrival here. Carried state for the
 	// mode 1/2 branch rule - see solverRepositionTo. Unread in mode 0.
 	double enteringGeoLo = 0.0;
@@ -3144,12 +3279,31 @@ struct Solver {
 	uint64_t              envRejected             = 0;   // repositions
 	uint64_t              envStationary           = 0;   // pinned or at rest
 
-	// Probe 17: audit a KNOWN-GOOD path against the map.
+	SteerInfo steerInfo;
+
+	struct DecRow {
+		int  step; uint8_t mode; bool choice, hasSteer, steerChoice; int togglesBefore;
+		double y, vy, yProj, target, band, lo, hi;
+		int    path;
+	};
+	std::vector<DecRow> bestDecisions;
+
+	// Probe 20: is the winning macro EXPRESSIBLE by the branch rule?
 	//
-	// Every argument about whether the liveness sweep is too strict has been
-	// made from the geometry, and the geometry is exactly what is in question.
-	// A solved macro settles it without any of that: the trajectory physically
-	// happened, so anywhere the map disagrees with it, the MAP is wrong.
+	// The one question three suite-level experiments could only infer. Replay a
+	// path that is known to clear the level and, at every step where it CHANGES
+	// INPUT, ask whether the branch rule would have offered a decision there. A
+	// toggle with no decision point is a move the search physically cannot make.
+	struct ExprMiss { double x, y, vy, pct; uint64_t step; int elapsed, mode, reason;
+	                  double glo, ghi; };
+	std::vector<ExprMiss> exprMisses;
+	bool                  exprPrevPressed = false, exprHavePrev = false;
+	uint64_t              exprLastBranch = 0;
+	double                exprGeoLo = 0.0, exprGeoHi = 0.0;
+	uint64_t              exprAirSteps = 0, exprToggles = 0;
+	uint64_t              exprOffered = 0, exprMissed = 0;
+	uint64_t              exprMissCadence = 0, exprMissUnchanged = 0, exprMissNoRead = 0;
+	uint64_t              exprOfferPoints = 0;
 	uint64_t              pathAuditSteps   = 0;
 	uint64_t              pathOffMap       = 0;  // no interval holds the player
 	uint64_t              pathDead         = 0;  // in an interval marked dead
@@ -3224,6 +3378,8 @@ struct Solver {
 	// be evaluated both ways and the difference counted. Measurement only.
 	double                shadowGeoLo  = 0.0;
 	double                shadowGeoHi  = 0.0;
+	uint64_t              brIvSum = 0, brIvN = 0;   // derived branch ceiling
+	int                   brIvMin = 1 << 30, brIvMax = 0;
 	uint64_t              velPrunes = 0;   // 4b: branches killed by the velocity band
 	uint64_t              geoStaleEvals    = 0;  // branch-rule comparisons made
 	uint64_t              geoStaleDiverged = 0;  // ...where stale and correct disagree
@@ -3382,6 +3538,7 @@ struct Solver {
 		lastGeoLo = lastGeoHi = 0.0;
 		resumeGeoLo = resumeGeoHi = 0.0;
 		shadowGeoLo = shadowGeoHi = 0.0;
+		brIvSum = brIvN = 0; brIvMin = 1 << 30; brIvMax = 0;
 		velPrunes = 0;
 		geoStaleEvals = geoStaleDiverged = 0;
 		std::memset(maxClimb, 0, sizeof(maxClimb));
@@ -4734,6 +4891,7 @@ bool geometryBlockedAt(double x, double y) {
 }
 
 bool geometryWindowAt(double x, double y, double* lo, double* hi);
+void reachOffsets(double vy, bool mini, int n, double* dLo, double* dHi);
 bool velocityUnreachable(double x, double y, double vy, double dxPerStep,
                          bool mini, double* bandLo, double* bandHi);
 
@@ -4784,7 +4942,22 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 	const double yNow = y;          // before the lead projection: where the
 	                                // player IS, which is what decides the
 	                                // corridor it is currently in
-	y += lead * vy;
+	if (!g_config.geomReachClamp)
+		y += g_config.geomLeadInSteps ? lead * vy * g_config.geomVyToDy
+	                              : lead * vy;
+
+	// Clamp a target to the reachable band. Identity when the flag is off.
+	auto clampReach = [&](double t) -> double {
+		if (!g_config.geomReachClamp) return t;
+		auto& sv = Solver::get();
+		if (sv.dxPerStep <= 0.0) return t;
+		const int n = std::max(1, static_cast<int>(lookaheadUnits / sv.dxPerStep));
+		const bool mini = sv.steerPlayer && sv.steerPlayer->m_vehicleSize < 0.9f;
+		double dLo = 0.0, dHi = 0.0;
+		reachOffsets(vy, mini, n, &dLo, &dHi);
+		return std::min(yNow + dHi, std::max(yNow + dLo, t));
+	};
+
 	const int si = m.segIndex(x + lookaheadUnits);
 	if (si < 0) return 0;
 
@@ -4829,7 +5002,7 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 			}
 		}
 		if (scanned) {
-			const double centre = 0.5 * (scanLo + scanHi);
+			const double centre = clampReach( 0.5 * (scanLo + scanHi));
 			// Band from the RAW interval the player is in, not from the scan's
 			// intersection. MEASURED: scaling it to the intersection fired the
 			// steer on 92.6%% of decisions against 36.7%% without the scan, and
@@ -4840,6 +5013,10 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 			// corridor gives 71 units of deadband, a 90-unit threaded gap gives
 			// 22. The target should tighten; the tolerance should not.
 			const double band = steerDeadband(rawHi - rawLo);
+			{ auto& si = Solver::get().steerInfo;
+			  si.yNow = yNow; si.yProj = y; si.target = centre; si.band = band;
+			  si.lo = rawLo; si.hi = rawHi; si.lookX = x + lookaheadUnits;
+			  si.path = 1; si.valid = true; }
 			if (std::abs(y - centre) <= band) return 0;
 			Solver::get().geoSteerWin++;
 			return y < centre ? 1 : -1;
@@ -4878,8 +5055,12 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 					clo = blo; chi = bhi;
 				}
 
-				const double centre = 0.5 * (clo + chi);
+				const double centre = clampReach( 0.5 * (clo + chi));
 				const double band = steerDeadband(chi - clo);
+				{ auto& si = Solver::get().steerInfo;
+				  si.yNow = yNow; si.yProj = y; si.target = centre; si.band = band;
+				  si.lo = clo; si.hi = chi; si.lookX = x + lookaheadUnits;
+				  si.path = 2; si.valid = true; }
 				if (std::abs(y - centre) <= band) return 0;
 
 				// Urgency gate. Route alone fired on 78.7%% of decisions and
@@ -4984,6 +5165,7 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 			return false;
 		return true;
 	};
+
 	auto targetReachable = [&](double t) -> bool {
 		if (!haveBand) return true;
 		return t >= floorY - 1.0 && t <= ceilY + 1.0;
@@ -5056,7 +5238,7 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 			// height from centre, which any band below 0.5 already catches.
 			const double lo = std::max(static_cast<double>(f.wlo), ulo);
 			const double hi = std::min(static_cast<double>(f.whi), uhi);
-			const double centre = 0.5 * (lo + hi);
+			const double centre = clampReach( 0.5 * (lo + hi));
 			// Fraction of the window HEIGHT. Slack-relative was tried and is
 			// worse overall: it made narrow windows demand near-perfect centring
 			// (a 20-unit gap has 2.5 units of slack, so under a unit of
@@ -5066,6 +5248,10 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 			// overfitting rather than tuning, so this is back to the only setting
 			// that solved all of them.
 			const double band = steerDeadband(hi - lo);
+			{ auto& si = Solver::get().steerInfo;
+			  si.yNow = yNow; si.yProj = y; si.target = centre; si.band = band;
+			  si.lo = lo; si.hi = hi; si.lookX = x + lookaheadUnits;
+			  si.path = 3; si.valid = true; }
 			if (std::abs(y - centre) <= band) return 0;
 			// Unreachable target: the player cannot occupy that altitude from
 			// here, so steering at it is worse than saying nothing.
@@ -5093,6 +5279,27 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 // Bounds of the LIVE interval containing `y` at `x`, or false if the altitude
 // is blocked, in dead space, or off the map. Used to notice when the corridor
 // ahead changes - see geomBranchMode.
+// The measured vertical envelope, shared by the 4b prune and the steer's reach
+// clamp so the constants exist once.
+//
+// MEASURED from the motion census (event-free rows, >=3 samples, 917k
+// transitions): ship +0.118 / -0.103 per step with |vy| <= 8.00, mini
+// +0.137 / -0.122 with |vy| <= 9.42, and dy = vy * 0.2279. Terminal check:
+// 8.00 * 0.2279 = 1.823 units/step against Probe 16's independent 1.800.
+void reachOffsets(double vy, bool mini, int n, double* dLo, double* dHi) {
+	const double aUp = (mini ? 0.137 : 0.118) * g_config.velocityPruneMargin;
+	const double aDn = (mini ? 0.122 : 0.103) * g_config.velocityPruneMargin;
+	const double vCl = (mini ? 9.42  : 8.00 ) * g_config.velocityPruneMargin;
+	double vHi = vy, vLo = vy, yHi = 0.0, yLo = 0.0;
+	for (int i = 0; i < n; i++) {
+		vHi = std::min( vCl, vHi + aUp);
+		vLo = std::max(-vCl, vLo - aDn);
+		yHi += vHi * g_config.geomVyToDy;
+		yLo += vLo * g_config.geomVyToDy;
+	}
+	*dLo = yLo; *dHi = yHi;
+}
+
 // 4b. Is every reachable altitude dead at the horizon?
 //
 // The envelope below is MEASURED from the motion census (event-free rows, >=3
@@ -5120,19 +5327,10 @@ bool velocityUnreachable(double x, double y, double vy, double dxPerStep,
 	auto const& m = GeoMap::get();
 	if (!m.valid || dxPerStep <= 0.0) return false;
 
-	const double aUp = (mini ? 0.137 : 0.118) * g_config.velocityPruneMargin;
-	const double aDn = (mini ? 0.122 : 0.103) * g_config.velocityPruneMargin;
-	const double vCl = (mini ? 9.42  : 8.00 ) * g_config.velocityPruneMargin;
-	const double kDy = 0.2279;
-
 	const int n = std::max(1, g_config.velocityPruneSteps);
-	double vHi = vy, vLo = vy, yHi = y, yLo = y;
-	for (int i = 0; i < n; i++) {
-		vHi = std::min( vCl, vHi + aUp);
-		vLo = std::max(-vCl, vLo - aDn);
-		yHi += vHi * kDy;
-		yLo += vLo * kDy;
-	}
+	double dLo = 0.0, dHi = 0.0;
+	reachOffsets(vy, mini, n, &dLo, &dHi);
+	const double yLo = y + dLo, yHi = y + dHi;
 	if (bandLo) *bandLo = yLo;
 	if (bandHi) *bandHi = yHi;
 
@@ -5765,6 +5963,168 @@ bool keyPressedEdge(int vk) {
 // from it - a false negative, since the run reached the end from there.
 // OUT-OF-WINDOW is the mildest: the space is live but the steering would
 // never have aimed at it.
+// Probe 20. Expressiveness of a known-good path under the current branch rule.
+//
+// Evaluates the SAME rule geometryWantsBranch uses, against its own shadow of
+// lastBranch/lastGeoLo/Hi, so it reports what the search would have been offered
+// rather than what the search happened to do.
+//
+// A missed toggle is classified by WHY the rule declined:
+//   cadence    - fewer than airBranchInterval steps since the last decision
+//   unchanged  - the corridor at the lookahead is the same as at the last one
+//   noread     - the map had no window there (the rule offers a decision anyway)
+void expressAuditStep(PlayerObject* p, bool pressed, uint64_t k) {
+	auto& sv = Solver::get();
+	auto& m  = GeoMap::get();
+	if (!p || p->m_isDead) return;
+	const bool toggled = sv.exprHavePrev && (pressed != sv.exprPrevPressed);
+	sv.exprPrevPressed = pressed;
+	sv.exprHavePrev    = true;
+
+	const ModeClass mc = classifyMode(p);
+	if (mc == ModeClass::Ground) { sv.exprLastBranch = k; return; }
+	sv.exprAirSteps++;
+
+	const int elapsed = static_cast<int>(k - sv.exprLastBranch);
+	int reason = 0;                       // 0 = offered
+	bool offer = true;
+	double glo = 0.0, ghi = 0.0;
+	bool haveWin = false;
+
+	if (elapsed < g_config.airBranchInterval) { offer = false; reason = 1; }
+	else if (g_config.geomBranchMode != 0 && m.valid) {
+		const double lookX = p->getPositionX() +
+			static_cast<double>(g_config.geomLookaheadFixedX);
+		haveWin = geometryWindowAt(lookX, p->getPositionY(), &glo, &ghi);
+		if (!haveWin) { offer = true; reason = 3; }
+		else {
+			bool forced = false;
+			if (g_config.geomBranchMode >= 3) {
+				const bool mini = p->m_vehicleSize < 0.9f;
+				const double rate = mini ? 2.118 : 1.800;
+				const double slack = (ghi - glo) - m.playerH;
+				int c = static_cast<int>(std::floor(std::max(0.0, slack) / rate));
+				c = std::max(g_config.airBranchInterval,
+				    std::min(g_config.airBranchIntervalMax, c));
+				forced = elapsed >= c;
+			} else {
+				forced = elapsed >= g_config.airBranchIntervalMax;
+			}
+			if (g_config.geomBranchMode == 2 &&
+			    (ghi - glo) < g_config.geomTightHeights * m.playerH) forced = true;
+			if (!forced) {
+				const bool changed = std::abs(glo - sv.exprGeoLo) > 0.01 ||
+				                     std::abs(ghi - sv.exprGeoHi) > 0.01;
+				if (!changed) { offer = false; reason = 2; }
+			}
+		}
+	}
+
+	if (offer) {
+		sv.exprLastBranch = k;
+		sv.exprOfferPoints++;
+		if (haveWin) { sv.exprGeoLo = glo; sv.exprGeoHi = ghi; }
+	}
+
+	if (toggled) {
+		sv.exprToggles++;
+		if (offer) sv.exprOffered++;
+		else {
+			sv.exprMissed++;
+			if (reason == 1) sv.exprMissCadence++;
+			else if (reason == 2) sv.exprMissUnchanged++;
+			else sv.exprMissNoRead++;
+			auto* pl = PlayLayer::get();
+			if (sv.exprMisses.size() < 20000)
+				sv.exprMisses.push_back({p->getPositionX(), p->getPositionY(),
+				                         static_cast<double>(p->m_yVelocity),
+				                         pl ? pl->getCurrentPercent() : 0.f,
+				                         k, elapsed, static_cast<int>(mc), reason,
+				                         glo, ghi});
+		}
+	}
+}
+
+// Probe 21. Dump the decisions behind the current best path.
+void bestDecisionDump() {
+	auto& sv = Solver::get();
+	if (sv.bestDecisions.empty()) { log::info("Probe 21: no best path yet."); return; }
+	const std::string path =
+		probe::outputPath(ProbeState::get().levelKey + "_decisions.csv");
+	std::FILE* f = std::fopen(path.c_str(), "w");
+	if (!f) { log::error("Probe 21: cannot write {}", path); return; }
+	std::fprintf(f, "# Probe 21: decisions on the best path (%.2f%%, %llu steps)\n",
+	             sv.bestPct, static_cast<unsigned long long>(sv.bestStep));
+	std::fprintf(f, "step,mode,choice,hasSteer,steerChoice,togglesBefore,"
+		                "y,vy,yProj,target,band,winLo,winHi,path\n");
+	int air = 0;
+	for (auto const& d : sv.bestDecisions) {
+		if (d.mode != static_cast<uint8_t>(ModeClass::Ground)) air++;
+		std::fprintf(f, "%d,%s,%d,%d,%d,%d,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%d\n",
+		             d.step, modeClassName(d.mode),
+		             d.choice ? 1 : 0, d.hasSteer ? 1 : 0, d.steerChoice ? 1 : 0,
+		             d.togglesBefore,
+		             d.y, d.vy, d.yProj, d.target, d.band, d.lo, d.hi, d.path);
+	}
+	std::fclose(f);
+	int steered = 0;
+	for (auto const& d : sv.bestDecisions) if (d.hasSteer) steered++;
+	log::info("Probe 21: {} decisions on the best path ({} air), {} with a steer "
+	          "({:.1f}%) -> {}",
+	          sv.bestDecisions.size(), air, steered,
+	          100.0 * steered / static_cast<double>(sv.bestDecisions.size()), path);
+}
+
+
+void expressAuditReport() {
+	auto& sv = Solver::get();
+	if (!sv.exprToggles) { log::info("Probe 20: no air toggles in the replay."); return; }
+	log::info("Probe 20 - is the winning path EXPRESSIBLE? branch mode {}, "
+	          "interval {}..{}",
+	          g_config.geomBranchMode, g_config.airBranchInterval,
+	          g_config.airBranchIntervalMax);
+	log::info("  air steps {}   decision points offered {}   one per {:.1f} steps",
+	          sv.exprAirSteps, sv.exprOfferPoints,
+	          sv.exprOfferPoints ? static_cast<double>(sv.exprAirSteps) / sv.exprOfferPoints : 0.0);
+	log::info("  input changes {}   ON a decision point {} ({:.1f}%)   "
+	          "MISSED {} ({:.1f}%)",
+	          sv.exprToggles, sv.exprOffered,
+	          100.0 * sv.exprOffered / sv.exprToggles,
+	          sv.exprMissed, 100.0 * sv.exprMissed / sv.exprToggles);
+	if (!sv.exprMissed) {
+		log::info("  EVERY input change lands on a decision point. The winning path "
+		          "is fully expressible under this rule, so the stall is NOT "
+		          "granularity.");
+		return;
+	}
+	log::info("  why the rule declined:  cadence {}   corridor unchanged {}   "
+	          "no map reading {}",
+	          sv.exprMissCadence, sv.exprMissUnchanged, sv.exprMissNoRead);
+
+	// Where they cluster, in 5% bands.
+	std::map<int, int> byPct;
+	for (auto const& e : sv.exprMisses) byPct[static_cast<int>(e.pct / 5.0) * 5]++;
+	std::string hist;
+	for (auto const& kv : byPct)
+		hist += fmt::format("{}%:{}  ", kv.first, kv.second);
+	log::info("  missed toggles by level position:  {}", hist);
+
+	const std::string path = probe::outputPath(ProbeState::get().levelKey + "_express.csv");
+	if (std::FILE* f = std::fopen(path.c_str(), "w")) {
+		std::fprintf(f, "# Probe 20: input changes in a known-good path with no "
+		                "decision point available\n");
+		std::fprintf(f, "step,pct,x,y,vy,mode,elapsed,reason,winLo,winHi\n");
+		static const char* kR[4] = {"offered","cadence","unchanged","noread"};
+		for (auto const& e : sv.exprMisses)
+			std::fprintf(f, "%llu,%.2f,%.1f,%.1f,%.3f,%s,%d,%s,%.1f,%.1f\n",
+			             static_cast<unsigned long long>(e.step), e.pct, e.x, e.y, e.vy,
+			             modeClassName(e.mode), e.elapsed, kR[e.reason & 3],
+			             e.glo, e.ghi);
+		std::fclose(f);
+		log::info("  every missed toggle -> {}", path);
+	}
+}
+
 void pathAuditStep(PlayerObject* p) {
 	auto& m  = GeoMap::get();
 	auto& sv = Solver::get();
@@ -6167,6 +6527,40 @@ void pollHotkeys() {
 	}
 
 
+	// Q = reach-clamped steer target (replaces the lead term).
+	if (keyPressedEdge('Q')) {
+		g_config.geomReachClamp = !g_config.geomReachClamp;
+		log::info("Steer target: {}. F2 to solve with this.",
+		          g_config.geomReachClamp
+		              ? "window centre CLAMPED to the measured reachable band, lead "
+		                "projection off"
+		              : "window centre with the lead projection, as before");
+	}
+
+	// J = silence the steer (ablation). Map ordering and liveness stay on.
+	if (keyPressedEdge('J')) {
+		g_config.geomSteerSilent = !g_config.geomSteerSilent;
+		log::info("Steering: {}. F2 to solve with this.",
+		          g_config.geomSteerSilent
+		              ? "SILENCED - the map still orders moves and marks dead space, "
+		                "but never tells a decision which way to go"
+		              : "on, as normal");
+	}
+
+	// P = lead term in steps, with the measured vy -> dy conversion.
+	if (keyPressedEdge('P')) {
+		g_config.geomLeadInSteps = !g_config.geomLeadInSteps;
+		log::info("Steer lead: {} (ship lead {:.0f} -> projects {:.1f} units at "
+		          "terminal climb). F2 to solve with this.",
+		          g_config.geomLeadInSteps
+		              ? "STEPS, with the measured vy->dy conversion"
+		              : "raw lead * m_yVelocity, as before",
+		          g_config.geomLeadHold,
+		          g_config.geomLeadInSteps
+		              ? g_config.geomLeadHold * 7.9 * g_config.geomVyToDy
+		              : g_config.geomLeadHold * 7.9);
+	}
+
 	// V = velocity reachability prune (4b).
 	if (keyPressedEdge('V')) {
 		g_config.velocityPrune = !g_config.velocityPrune;
@@ -6180,11 +6574,12 @@ void pollHotkeys() {
 
 	// M = branch on geometry change rather than on a fixed cadence.
 	if (keyPressedEdge('M')) {
-		g_config.geomBranchMode = (g_config.geomBranchMode + 1) % 3;
-		static const char* kName[3] = {
+		g_config.geomBranchMode = (g_config.geomBranchMode + 1) % 4;
+		static const char* kName[4] = {
 			"every airBranchInterval steps, as before",
 			"where the corridor ahead CHANGES",
-			"where it CHANGES, but full cadence in tight corridors"};
+			"where it CHANGES, but full cadence in tight corridors",
+			"where it CHANGES, ceiling DERIVED from slack/climb rate"};
 		log::info("Air branching: {} (min {} steps, max {}, tight < {:.0f} units). "
 		          "F2 to solve with this.",
 		          kName[g_config.geomBranchMode],
@@ -6215,6 +6610,10 @@ void pollHotkeys() {
 		log::info("Map roof: {}. F2 to solve with this (the map rebuilds on F2).",
 		          kRoof[g_config.geomPortalRoof]);
 	}
+
+
+	// 3 = the decisions behind the best path (Probe 21). Read-only.
+	if (keyPressedEdge('3')) bestDecisionDump();
 
 
 	// 2 = where the search is dying (Probe 19). Read-only.
@@ -6422,6 +6821,16 @@ void pollHotkeys() {
 			          "checkpoint. Plan 13.13.",
 			          g_config.hybridRestore ? "ON" : "OFF",
 			          g_config.hybridRestore ? "do NOT carry" : "carry");
+log::info("Solver: steer target is {} (Q toggles).",
+			          g_config.geomReachClamp
+			              ? "clamped to the measured reachable band"
+			              : "the live window centre with a fitted lead projection");
+log::info("Solver: steering is {} (J toggles).",
+			          g_config.geomSteerSilent ? "SILENCED (ablation)" : "on");
+log::info("Solver: steer lead is {} (P toggles).",
+			          g_config.geomLeadInSteps
+			              ? "in STEPS with the measured vy->dy conversion"
+			              : "raw lead * m_yVelocity - projects ~63 units at terminal climb");
 log::info("Solver: velocity prune {} (V toggles).",
 			          g_config.velocityPrune
 			              ? fmt::format("ON, horizon {} steps, margin {:.2f}",
@@ -7970,13 +8379,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					g_config.geomLookaheadScaleWithSpeed
 						? static_cast<double>(g_config.geomLookaheadSteps) * sv.dxPerStep
 						: static_cast<double>(g_config.geomLookaheadFixedX);
+				sv.steerInfo = SteerInfo{};
+				sv.steerInfo.yNow = m_player1->getPositionY();
 				sv.steerPlayer = m_player1;
 				steer = geometrySteer(m_player1->getPositionX(),
 				                      m_player1->getPositionY(),
 				                      static_cast<double>(m_player1->m_yVelocity),
 				                      lead, lookaheadUnits);
+				if (g_config.geomSteerSilent) steer = 0;
 				if (steer != 0) sv.geoSteers++;
 			}
+			d.si   = sv.steerInfo;
+			d.vyAt = static_cast<double>(m_player1->m_yVelocity);
 			if (steer != 0) {
 				d.hasSteer = true;
 				// geometrySteer speaks in WORLD y: +1 means get higher. Hold and
@@ -9464,7 +9878,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
 		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
 		          "archive {}c/{}r/{}f  gate {} free {}T/{}H  mute {}  "
-		          "geoStale {}/{}  velPrune {}  "
+		          "geoStale {}/{}  velPrune {}  brIv {}/{:.1f}/{}  "
 		          "ceil {}/{}c/{}p/{}s out {}/{}  roofMargin {}  "
 		          "dx {:.2f}/{:.2f}  vs map {:.2f}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
@@ -9478,6 +9892,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          sv.budgetGateEvals, sv.gateFreeTap, sv.gateFreeHold,
 		          sv.geoSteerMute,
 		          sv.geoStaleDiverged, sv.geoStaleEvals, sv.velPrunes,
+		          sv.brIvN ? sv.brIvMin : 0,
+		          sv.brIvN ? static_cast<double>(sv.brIvSum) / sv.brIvN : 0.0,
+		          sv.brIvMax,
 		          sv.learnedCeiling > 1e29
 		              ? std::string("--")
 		              : fmt::format("{:.0f}", sv.learnedCeiling),
@@ -9782,6 +10199,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			sv.bestMacro.assign(sv.macro.begin(),
 			                    sv.macro.begin() + std::min<size_t>(sv.step, sv.macro.size()));
 
+			// Probe 21: the decision sequence that produced this best.
+			sv.bestDecisions.clear();
+			sv.bestDecisions.reserve(sv.stack.size());
+			for (auto const& d : sv.stack) {
+				if (d.step > static_cast<int>(sv.bestStep)) break;
+				sv.bestDecisions.push_back({d.step, static_cast<uint8_t>(d.modeClass),
+				                            d.choice, d.hasSteer, d.steerChoice,
+				                            d.togglesBefore,
+				                            d.si.yNow, d.vyAt, d.si.yProj, d.si.target,
+				                            d.si.band, d.si.lo, d.si.hi, d.si.path});
+			}
+
 			// Progress: the window was wide enough, so return to the cheap
 			// default. A permanently wide window would keep the whole tail of the
 			// level mutable and undo the point of committing at all.
@@ -10068,7 +10497,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		auto geometryWantsBranch = [&]() -> bool {
 			if (g_config.geomBranchMode == 0 || !GeoMap::get().valid) return true;
 			const uint64_t elapsed = sv.step - sv.lastBranch;
-			if (elapsed >= static_cast<uint64_t>(g_config.airBranchIntervalMax)) return true;
+			const bool derivedIv = g_config.geomBranchMode >= 3;
+			if (!derivedIv &&
+			    elapsed >= static_cast<uint64_t>(g_config.airBranchIntervalMax)) return true;
 			const double lookX = p->getPositionX() +
 				(g_config.geomLookaheadScaleWithSpeed
 					? static_cast<double>(g_config.geomLookaheadSteps) * sv.dxPerStep
@@ -10077,8 +10508,42 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// No reading means no opinion: keep the old cadence rather than
 			// suppressing a decision the map cannot vouch for.
 			if (!geometryWindowAt(lookX, p->getPositionY(), &glo, &ghi)) return true;
+
+			// MODE 3: derive the decision ceiling from the corridor instead of fixing it.
+			//
+			// The question a branch interval answers is physical: how long can the
+			// player coast before it can no longer correct? With `slack` units of room
+			// and a measured climb rate of `rate` units per step, that is slack/rate
+			// steps. Tight corridor -> frequent decisions; open corridor -> coast.
+			//
+			// Rate is Probe 16, measured in a purpose-built level and cross-validated
+			// twice (mini/normal 1.1765 against a documented m_vehicleSize 0.85;
+			// 8.00 * 0.2279 = 1.823 against the same 1.800).
+			//
+			// This SUBSUMES mode 2, whose tight-corridor exemption is the same idea as
+			// a step function - so geomTightHeights goes with it.
+			//
+			// Why derived rather than swept: airBranchIntervalMax at 16/12/8/6 is
+			// NON-MONOTONIC (8 clears Clubstep's 58.41% wall, 6 does not), and mode 0
+			// solves Clubstep while losing Base After Base where mode 1 does the
+			// reverse. Two levels want opposite things from one constant and the sweep
+			// between them is not monotonic, which is the signature of a quantity that
+			// has to be derived.
+			if (derivedIv) {
+				const bool mini = p->m_vehicleSize < 0.9f;
+				const double rate = mini ? 2.118 : 1.800;
+				const double slack = (ghi - glo) - GeoMap::get().playerH;
+				int ceilSteps = static_cast<int>(std::floor(std::max(0.0, slack) / rate));
+				ceilSteps = std::max(g_config.airBranchInterval,
+				           std::min(g_config.airBranchIntervalMax, ceilSteps));
+				sv.brIvSum += static_cast<uint64_t>(ceilSteps);
+				sv.brIvN++;
+				if (ceilSteps < sv.brIvMin) sv.brIvMin = ceilSteps;
+				if (ceilSteps > sv.brIvMax) sv.brIvMax = ceilSteps;
+				if (elapsed >= static_cast<uint64_t>(ceilSteps)) return true;
+			}
 			// Tight corridor: keep every decision.
-			if (g_config.geomBranchMode >= 2 &&
+			if (g_config.geomBranchMode == 2 &&
 			    (ghi - glo) < g_config.geomTightHeights * GeoMap::get().playerH) {
 				sv.lastGeoLo = glo; sv.lastGeoHi = ghi;
 				sv.shadowGeoLo = glo; sv.shadowGeoHi = ghi;
@@ -10648,6 +11113,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (st.stepCounter == 0) {
 				auto& sv = Solver::get();
 				sv.pathAuditSteps = sv.pathOffMap = sv.pathDead = sv.pathOutWindow = 0;
+				sv.exprMisses.clear();
+				sv.exprPrevPressed = sv.exprHavePrev = false;
+				sv.exprLastBranch = 0; sv.exprGeoLo = sv.exprGeoHi = 0.0;
+				sv.exprAirSteps = sv.exprToggles = 0;
+				sv.exprOffered = sv.exprMissed = sv.exprOfferPoints = 0;
+				sv.exprMissCadence = sv.exprMissUnchanged = sv.exprMissNoRead = 0;
 				sv.pathFirstOffX = sv.pathFirstDeadX = sv.pathFirstOutX = -1.0;
 				sv.pathWorstOff  = sv.pathWorstOffX  = 0.0;
 				std::memset(sv.pathOffBin, 0, sizeof(sv.pathOffBin));

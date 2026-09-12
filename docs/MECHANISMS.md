@@ -829,6 +829,13 @@ verdict: "works" without "under what" is how both of those happened.
 | Velocity knowledge is useful at the current lookahead distance | interval propagation over the census | **No - it is short-horizon only.** Reachable band as a fraction of the naive terminal cone, from vy=0: **7% at 10 steps, 26% at 40, 65% at 120, 82% at 231**. At 20 steps it pins the ship to **9 units inside a 247-unit corridor**; at the current 300-unit lookahead (231 steps) the band is 612-729 units, wider than any corridor, so nothing is ever prunable. 4b belongs at the decision horizon (4-16 steps), not the steer lookahead. |
 | 4b velocity pruning recovers Clubstep | full suite, prune on vs off | **No.** It fires **1,527 times on Clubstep and the wall stays at 58.41%.** Sound (14/15 held, nothing lost) and cheap (throughput UP almost everywhere: xStep +42%, ToE +32%, Clubstep +23%), with real wins - xStep 20s->11s, Electrodynamix 41s->28s, Clutterfunk 20s->17s - cancelled by ToE 38s->50s and Electroman 19s->26s. **Net -2% on total time.** Those losses are search-order divergence, not overhead: ToE ran 32% faster per step and simply explored more. Kept, default OFF. |
 | Clubstep's 58.41% wall is a reachability problem | three independent tests | **No - it is decision granularity.** (1) mode 0, which offers a decision every 4 steps, SOLVES Clubstep while modes 1 and 2 do not; (2) `airBranchIntervalMax = 8` cleared 58.41% and hit a different wall at 66.74%; (3) 4b prunes 1,527 branches there and the wall does not move. The search is not exploring impossible branches - **the branch it needs is never offered as a decision.** |
+| Correcting the steer lead's missing vy->dy conversion helps | full suite, `P` on | **No - 13/15, it LOSES Cycles.** The fix is dimensionally right (`y += lead*vy` omits dy = vy*0.2279, so a climbing ship is projected **63 units** where eight steps of travel is 14.4) and the split is the finding: **long air levels improved** (ToE 4215->3538, Electroman 1938->1711, xStep 2176->2012, Clutterfunk 2051->1999) while **short/cube-heavy levels collapsed** (Stereo Madness 216->655, Base After Base 303->903, Can't Let Go 500->1165). `geomClearanceBand` and the `geomLead` values were fitted WITH the overshoot present. **Second recorded instance of compensating dimensional errors** - the first is velocity 4c's lookahead/reach pair, whose comment already concluded "they have to be fixed together". Do not correct these one at a time. |
+| `V` and `P` compose | full suite, both on | **No - 12/15**, worse than either alone, losing Clutterfunk AND Theory of Everything. Both change search order; stacking them compounds the divergence rather than adding their effects. |
+| The steer is load-bearing | ABLATION, `J`, full suite, `geoSteer 0/13712` so the mute is complete | **Yes - 12/15 without it**, losing Theory of Everything and Electroman Adventures. But it is load-bearing on some levels and HARMFUL on others: Clutterfunk 2051->4929 and Cycles 490->1002 without it, while **xStep 2176->1542 and Electrodynamix 4261->2953 both improve**. Directionally right, badly calibrated - the profile of a mutually-compensating constant set. **Replace, do not repair**: two attempts to correct one term have now failed in opposite directions. |
+| The steer's lead term can be corrected or removed | three runs, full suite | **No - it is strongly load-bearing, and the series is monotone.** Kept: **14/15**. Scaled by the measured 0.2279 (`P`): **13/15**. Removed entirely (`Q`): solved 2 of the first 3 attempted and **stalled on Polargeist**, a level that normally takes 482 deaths in 4s; the run was stopped there, so "2/15" is not a full-suite figure. Every attempt to change it regresses. Leave it alone until something replaces the whole construction. |
+| A reach-CLAMPED steer target can work at the current lookahead | `Q`, full suite, plus arithmetic | **No, and it is inert by construction, not mis-tuned.** At the live 300-unit lookahead (230 steps) the measured band is **779 units - wider than the entire 786-unit map band** - so the clamp never binds and `Q`'s only effect was deleting the lead. **Structural: reach constrains only at <=100 units (161-unit band) while corridors change over 150-200 units. Those windows do not overlap**, so an endpoint clamp cannot work at any horizon. Doing it properly means propagating the band step-by-step and intersecting with the live corridor at each step. PROCESS NOTE: this arithmetic was available before the build and was written down as the likely outcome; it was built anyway. |
+| Driving the steer's authority toward 100% collapses the board | `geomClearanceBand = 0.00`, full suite | **Third independent confirmation of the 92% law.** Band 0.00 (steer speaks on essentially every decision) solved 4 then stalled, and with the 4b prune solved 7 then stalled; both runs were stopped early, so these are not full-suite figures. Previously shown via `geomForwardScan` at 92.6% and the measured deadband at 94%. Also proves the deadband is doing real work rather than being inert. |
+| The branch interval can be derived from physics | mode 3, full suite | **No, and the reason is conceptual, not a tuning miss.** `brIv 4/15.7/16` - the derived ceiling is pinned at the clamp ~98% of the time, so mode 3 collapses into mode 1: **10 of 14 levels bit-identical**, only Time Machine moving (691 -> 532). The arithmetic: a mean 247-unit corridor less a 15-unit hitbox is 232 units of slack, and 232/1.800 = **129 steps**, against `airBranchIntervalMax = 16`. Physics says coast 8x longer than the constant allows, while every Clubstep result says decide MORE often (mode 0 at 4 steps solves it; 8 clears the wall; 16 does not). **The branch interval is a search-expressiveness parameter that merely has units of steps - it belongs in the search-strategy category, not the physics one.** |
 | Probe 16's ship figures are sound | independent cross-check | mini/normal measured at **1.1765** in both directions; the decompilation gives `m_vehicleSize = 0.85` for mini, and `1/0.85 = 1.17647`. Five-digit agreement with a documented game constant. |
 | Liveness has no false negatives | `geomReachMode = 1`, 22,696 steps | `DEAD = 0`. Re-confirmed on the F4-verified Clubstep macro: `OFF-MAP 0 / DEAD 0 / OUT-OF-WINDOW 0` over 20,482 steps. |
 | Clubstep's solution is real, not a savestate artifact | practice OFF, no savestates, from frame 0 | F4: zero diverging steps, clears the level. First verified demon on this lineage. |
@@ -1002,3 +1009,82 @@ Not tunable toward a true value. These get structural fixes or deletion.
   the same geometry with the same hitbox. `playerH = 15` level-wide is still wrong,
   but it needs its own failing case before it is worth building.
 - **`escapeArchiveRestart`.** Measured harmful: 58.98% where default solves.
+
+---
+
+## 14. Ordering, revision 4 — after the physics programme
+
+Revision 3 set out to build a physics foundation. That is done, and it changed
+what the ordering should be.
+
+### What the measurement programme produced
+
+- A validated free-flight model: **0.36% inconsistency in air, 0.00% for UFO**,
+  with every exception identified as a velocity override (orb, pad, portal,
+  landing, ceiling) that the geometry map already locates.
+- **Where velocity knowledge lives:** 7% of the naive cone at 10 steps, 26% at 40,
+  65% at 120, 82% at 231. It dies well before the steer's 300-unit lookahead.
+- **The UFO impulse, +13.27 in one step, SETS rather than adds** - measured from
+  the census, no custom level needed.
+- **Probe 16 independently cross-validated** twice: mini/normal 1.1765 against a
+  documented `m_vehicleSize = 0.85`, and 8.00 x 0.2279 = 1.823 units/step against
+  a measured 1.800.
+- **The velocity scale, dy = vy * 0.2279**, which is what finally makes
+  `geomLeadHold` measurable rather than arguable.
+
+Honest accounting: 4b itself is **net -2% and off by default**. The census was
+necessary to build it and the payoff was the knowledge, not the feature. The next
+item needs only Probe 16, which predates all of this.
+
+### The one failure left, and what it is
+
+Clubstep, 58.41%. **Decision granularity, not reachability or the map** - three
+independent results in the register say so. And neither uniform setting works:
+
+    mode 0 (decision every 4 steps)      solves Clubstep, LOSES Base After Base
+    mode 1 (decision on corridor change) solves Base After Base, LOSES Clubstep
+    airBranchIntervalMax 16/12/8/6       NON-MONOTONIC - 8 clears it, 6 does not
+
+Two levels want opposite things from one constant, and the sweep between them is
+not even monotonic. That is the signature of a quantity that must be derived.
+
+### The list
+
+**1. Derive the branch interval.** `slack / climbRate` steps rather than a fixed
+   ceiling: fine where the corridor is tight, coarse where it is open. Uses the
+   measured 1.800 (Probe 16). **Subsumes `geomBranchMode` mode 2 and
+   `geomTightHeights`** - one fewer mode and one fewer constant. Success is
+   recovering Clubstep while holding Base After Base; floor is 14/15.
+
+**2. The lead term.** `geomLeadHold = 8.0` is live in every steer call on every
+   level, and is now MEASURABLE rather than arguable: with dy = vy * 0.2279, a
+   climbing ship has vy ~ 8.0, so `y += lead * vy` projects **64 world units** -
+   a quarter of the 247-unit mean corridor - where a true 8-step projection is
+   14.4. It matches no interpretation of "8". Retire it together with
+   `geomVerticalReach` in favour of the reach interval; they are the same physics.
+
+**3. The reach envelope / steer target** (`docs/STEER_TARGET.md`), now with
+   measured inputs. Acceptance test unchanged: Probe 17 on the F4-verified
+   Clubstep macro must still read `OUT-OF-WINDOW 0`.
+
+**4. The search-strategy constants, by ablation, not tuning.** `toggleBudget`,
+   `stallLimit`, `commitLookbackSteps`, `minCommittedFraction` have no physical
+   value to converge on. Each has an off switch (`stallLimit = 0` restores pure
+   DFS). Turn each off across three representative levels; anything that can be
+   removed without losing a level gets deleted rather than tuned.
+
+**5. Cleanup.** `tapFirst` / `tapNeedFallSpeed` (computed every Tap decision,
+   never read), `geomUrgencyFrac`, `geomNarrowFrac`. Keep `geomLookaheadSteps` and
+   `geomVerticalReach` until item 3 consumes them.
+
+### Cut or parked
+
+- **4b** - kept, default off. Revisit if item 1 changes the search shape enough to
+  make its wins repeatable.
+- **`escapeArchiveRestart`** - measured harmful.
+- **The roof programme** - Base After Base solves without it.
+- **`segPlayerH` / size-aware clearance** - cannot explain 58.41%; needs its own
+  failing case.
+- **Velocity 4c as a flag flip** - measured, breaks Electrodynamix.
+- **Chasing the last 0.36%** of census inconsistency - it is events, and an
+  interval model loses only tightness to it, never soundness.
