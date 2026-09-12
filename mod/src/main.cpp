@@ -115,6 +115,33 @@ struct Config {
 	// knob to tighten if a section proves unsolvable.
 	int airBranchInterval = 4;
 
+	// Ceiling on how long modes 1/2 may go WITHOUT a decision when the corridor
+	// ahead is unchanged. Below airBranchInterval nothing branches; above this,
+	// everything does.
+	//
+	// This knob INTERPOLATES between the two branch modes. At 4 it equals
+	// airBranchInterval and mode 1 degenerates to mode 0; at 16 it is mode 1 as
+	// shipped. They are not two designs, they are the endpoints of one number.
+	//
+	// MEASURED, and this is what makes it the live question. With the lastGeoLo/Hi
+	// carried-state fix, all three modes on Clubstep:
+	//
+	//   mode 0   SOLVED, 20,274 deaths
+	//   mode 1   STALL 58.41%, exhausts budgets 2..9
+	//   mode 2   STALL 58.41%, identical wall
+	//
+	// Same map, same playerH, same hitbox - so the wall is NOT the map lying about
+	// clearance, because mode 0 walks past it. And it is not the commit floor or
+	// the budget: at the stall the log reads `budget 9  commit 820(w7680)`, leaving
+	// ~960 of ~1780 decisions mutable with nine toggles allowed. The search has the
+	// freedom to release earlier and exhausts every path it can EXPRESS.
+	//
+	// So the constraint is expressiveness: through a smooth up-then-down corridor
+	// the lookahead window does not change, no decision is offered, and this is the
+	// only thing that forces one. Observed under F9: the ship holds too long,
+	// releases too late, and is too high entering the cube portal.
+	//
+	// Undocumented and never swept until now. B cycles it.
 	int  airBranchIntervalMax = 16;
 
 	// A corridor narrower than this many player heights is "tight" and keeps the
@@ -160,6 +187,43 @@ struct Config {
 	// same fixed point. Nor is escapeArchiveRestart: A alone reaches 58.98% where
 	// default SOLVES, collapsing the commit floor to 0 and running the budget to 15.
 	int  geomBranchMode = 1;
+
+	// Restore lastGeoLo/Hi on a reposition instead of letting it carry across.
+	//
+	// DEFAULT ON as of this commit. Measured both ways over the full 15-level
+	// suite, same binary, one keypress apart:
+	//
+	//                       OFF (a02573c)     ON
+	//   board               14/15             14/15
+	//   Clutterfunk         STALL 55.65%      2,051 solve
+	//   Clubstep            5,805 solve       STALL 58.41%
+	//   Base After Base     318               303
+	//
+	// 10 of 15 levels faster ON, 3 slower, and the 13 levels both solve total
+	// 16,572 deaths OFF against 16,575 ON - the same work, redistributed.
+	//
+	// THE BOARD DOES NOT DECIDE THIS. Correctness does. With it OFF the branch rule
+	// compares against state left behind by whatever path was explored last, so the
+	// children of a node depend on history rather than on the node:
+	//
+	//   MEASURED on the committed binary: 0.47%-4.75% of branch-rule evaluations
+	//   return a different answer than they would with correctly-restored state -
+	//   1,727 of 36,388 on Clubstep, 1,049 of 38,608 on Clutterfunk. With this ON
+	//   the same counter reads 0/58,394, so those divergences are real and not an
+	//   artefact of the instrument.
+	//
+	//   CONSEQUENCE, measured: with it OFF Clutterfunk triggered exhaustion ZERO
+	//   times across the whole level, budget pinned at 1 through 2,867 deaths. With
+	//   it ON it exhausts at 55.65% and deepens. "Exhausted every path with <= N
+	//   air toggles" is false when the set of paths is not fixed, so budget
+	//   deepening had no completeness argument behind it.
+	//
+	// Solutions found with it OFF were still real - Clubstep's macro F4-verified
+	// from frame 0, zero diverging steps. The problem is not the answers; it is that
+	// nothing measured on a history-dependent tree can be trusted as evidence.
+	//
+	// F toggles it.
+	bool geoStateRestore = true;
 
 	// How long a discrete tap holds the button. Only needs to outlast the
 	// measured one-step injection latency so the press registers as an edge;
@@ -2695,6 +2759,10 @@ struct Decision {
 	// exhaustion searches simple paths before complicated ones, and stays
 	// complete as the bound grows.
 	bool enteringHold  = false; // hold state on arrival, so a toggle is well-defined
+	// Corridor at the previous decision, on arrival here. Carried state for the
+	// mode 1/2 branch rule - see solverRepositionTo. Unread in mode 0.
+	double enteringGeoLo = 0.0;
+	double enteringGeoHi = 0.0;
 	int  togglesBefore = 0;     // air toggles used on the path up to this decision
 	int  tapsBefore    = 0;     // taps used on the path up to this decision
 	bool modeTransition = false; // pushed because the game mode changed here
@@ -3123,6 +3191,14 @@ struct Solver {
 	bool                  resyncing      = false;
 	bool                  resyncForBacktrack = false;
 	bool                  resumeHold     = false;
+	// Shadow of lastGeoLo/Hi that IS restored on reposition, so the branch rule can
+	// be evaluated both ways and the difference counted. Measurement only.
+	double                shadowGeoLo  = 0.0;
+	double                shadowGeoHi  = 0.0;
+	uint64_t              geoStaleEvals    = 0;  // branch-rule comparisons made
+	uint64_t              geoStaleDiverged = 0;  // ...where stale and correct disagree
+	double                resumeGeoLo    = 0.0;
+	double                resumeGeoHi    = 0.0;
 	int                   resumeTap      = 0;
 	int                   resumeToggles  = 0;
 	int                   resumeTaps     = 0;
@@ -3271,6 +3347,9 @@ struct Solver {
 		dxPerStep = 1.31;
 		prevY = 0.0;
 		lastGeoLo = lastGeoHi = 0.0;
+		resumeGeoLo = resumeGeoHi = 0.0;
+		shadowGeoLo = shadowGeoHi = 0.0;
+		geoStaleEvals = geoStaleDiverged = 0;
 		std::memset(maxClimb, 0, sizeof(maxClimb));
 		tapDecisions = tapFirstChosen = 0;
 	}
@@ -5922,6 +6001,32 @@ void pollHotkeys() {
 	}
 
 
+	// B = ceiling on how long modes 1/2 may go without a decision. At
+	// airBranchInterval this collapses mode 1 into mode 0, so the sweep spans both.
+	if (keyPressedEdge('B')) {
+		int v = g_config.airBranchIntervalMax;
+		v = v == 16 ? 12 : v == 12 ? 8 : v == 8 ? 6 : v == 6 ? 4 : 16;
+		g_config.airBranchIntervalMax = v;
+		log::info("Air branch ceiling: a decision is forced after at most {} steps "
+		          "({:.3f}s) when the corridor ahead is unchanged{}. F2 to solve "
+		          "with this.",
+		          v, v / 240.0,
+		          v <= g_config.airBranchInterval
+		              ? " - equals airBranchInterval, so mode 1 is now mode 0"
+		              : "");
+	}
+
+
+	// F = restore the branch rule's carried state on a reposition.
+	if (keyPressedEdge('F')) {
+		g_config.geoStateRestore = !g_config.geoStateRestore;
+		log::info("Branch-rule carried state: {}. F2 to solve with this.",
+		          g_config.geoStateRestore
+		              ? "RESTORED on reposition - behaviour CHANGE from a02573c"
+		              : "carries across (stale), exactly as a02573c - the default");
+	}
+
+
 	// M = branch on geometry change rather than on a fixed cadence.
 	if (keyPressedEdge('M')) {
 		g_config.geomBranchMode = (g_config.geomBranchMode + 1) % 3;
@@ -6166,6 +6271,10 @@ void pollHotkeys() {
 			          "checkpoint. Plan 13.13.",
 			          g_config.hybridRestore ? "ON" : "OFF",
 			          g_config.hybridRestore ? "do NOT carry" : "carry");
+			log::info("Solver: branch-rule carried state {} (F toggles).",
+			          g_config.geoStateRestore
+			              ? "is RESTORED on reposition - BEHAVIOUR CHANGE from a02573c"
+			              : "carries across (stale), exactly as a02573c");
 			log::info("Solver: tap state {} (Y toggles).",
 			          g_config.tapStateSurvivesRestore
 			              ? "SURVIVES a reposition - stale, as when Clubstep "
@@ -7661,6 +7770,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		                             !(g_config.hybridRestore && d.airPolicy);
 		if (needsCheckpoint) captureRestoreState(d.rs);
 		d.enteringHold  = sv.hold;
+		d.enteringGeoLo = sv.lastGeoLo;
+		d.enteringGeoHi = sv.lastGeoHi;
 		d.togglesBefore = d.airPolicy ? sv.togglesUsed : 0;
 		d.tapsBefore    = d.airPolicy ? sv.tapsUsed    : 0;
 
@@ -8729,6 +8840,18 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		sv.resumeToggles = d.togglesBefore + decisionCost(d, d.choice);
 		sv.resumeTaps    = d.tapsBefore    + tapCost(d, d.choice);
 		sv.resumeBranch  = d.step;
+		// The branch rule in mode 1/2 compares the corridor ahead against the
+		// corridor at the LAST decision, so lastGeoLo/Hi is carried search state and
+		// has to be put back with everything else. Leaving it stale meant a replay
+		// could manufacture decision points the original pass never had, so the DFS
+		// was not enumerating a fixed tree and could never pop clean to the commit
+		// floor - which is the only thing that deepens the toggle budget.
+		//
+		// MEASURED, Clutterfunk: mode 0 exhausts budget 1 at 455 deaths, deepens to
+		// 2 and solves. Mode 1 sat on budget 1 for 5,943 deaths and 13 escapes and
+		// stalled at 55.65%, and Clutterfunk has needed budget 2 since 9803757.
+		sv.resumeGeoLo   = d.enteringGeoLo;
+		sv.resumeGeoHi   = d.enteringGeoHi;
 		sv.macro.resize(static_cast<size_t>(d.step), 0);
 		if (sv.pathTrace.size() > static_cast<size_t>(d.step))
 			sv.pathTrace.resize(static_cast<size_t>(d.step));
@@ -8739,6 +8862,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			solverRestoreState(d);
 			sv.step        = d.step;
 			sv.hold         = sv.resumeHold;
+			sv.shadowGeoLo  = sv.resumeGeoLo;
+			sv.shadowGeoHi  = sv.resumeGeoHi;
+			if (g_config.geoStateRestore) {
+				sv.lastGeoLo = sv.resumeGeoLo;
+				sv.lastGeoHi = sv.resumeGeoHi;
+			}
 			if (!g_config.tapStateSurvivesRestore) {
 				sv.tapping      = sv.resumeTapping;
 				sv.tapRemaining = sv.resumeTap;
@@ -8775,6 +8904,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					return true;
 				}
 				sv.hold         = sv.resumeHold;
+				sv.shadowGeoLo  = sv.resumeGeoLo;
+				sv.shadowGeoHi  = sv.resumeGeoHi;
+				if (g_config.geoStateRestore) {
+					sv.lastGeoLo = sv.resumeGeoLo;
+					sv.lastGeoHi = sv.resumeGeoHi;
+				}
 				if (!g_config.tapStateSurvivesRestore) {
 					sv.tapping      = sv.resumeTapping;
 					sv.tapRemaining = sv.resumeTap;
@@ -9133,6 +9268,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          "steps {}  budget {}  commit {}(w{})  resync {}/{}  cells {}  "
 		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
 		          "archive {}c/{}r/{}f  gate {} free {}T/{}H  mute {}  "
+		          "geoStale {}/{}  "
 		          "ceil {}/{}c/{}p/{}s out {}/{}  roofMargin {}  "
 		          "dx {:.2f}/{:.2f}  vs map {:.2f}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
@@ -9145,6 +9281,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          SolverArchive::get().restartFail,
 		          sv.budgetGateEvals, sv.gateFreeTap, sv.gateFreeHold,
 		          sv.geoSteerMute,
+		          sv.geoStaleDiverged, sv.geoStaleEvals,
 		          sv.learnedCeiling > 1e29
 		              ? std::string("--")
 		              : fmt::format("{:.0f}", sv.learnedCeiling),
@@ -9208,6 +9345,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			sv.resyncForBacktrack = false;
 			sv.resyncing   = false;
 			sv.hold         = sv.resumeHold;
+			sv.shadowGeoLo  = sv.resumeGeoLo;
+			sv.shadowGeoHi  = sv.resumeGeoHi;
+			if (g_config.geoStateRestore) {
+				sv.lastGeoLo = sv.resumeGeoLo;
+				sv.lastGeoHi = sv.resumeGeoHi;
+			}
 			if (!g_config.tapStateSurvivesRestore) {
 				sv.tapping      = sv.resumeTapping;
 				sv.tapRemaining = sv.resumeTap;
@@ -9359,6 +9502,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (sv.step >= sv.anchorReplayTarget) {
 				sv.anchorReplaying = false;
 				sv.hold         = sv.resumeHold;
+				sv.shadowGeoLo  = sv.resumeGeoLo;
+				sv.shadowGeoHi  = sv.resumeGeoHi;
+				if (g_config.geoStateRestore) {
+					sv.lastGeoLo = sv.resumeGeoLo;
+					sv.lastGeoHi = sv.resumeGeoHi;
+				}
 				sv.togglesUsed  = sv.resumeToggles;
 				sv.tapsUsed     = sv.resumeTaps;
 				sv.lastBranch   = sv.resumeBranch;
@@ -9706,11 +9855,26 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			if (g_config.geomBranchMode >= 2 &&
 			    (ghi - glo) < g_config.geomTightHeights * GeoMap::get().playerH) {
 				sv.lastGeoLo = glo; sv.lastGeoHi = ghi;
+				sv.shadowGeoLo = glo; sv.shadowGeoHi = ghi;
 				return true;
 			}
+			// MEASUREMENT, not behaviour. `changed` is what the search acts on and is
+			// computed exactly as before. `changedShadow` is the same test against
+			// state that WAS restored correctly on the last reposition, so the two
+			// differ precisely when the stale carry moved a decision point.
+			//
+			// This exists because the claim "the stale carry manufactures decision
+			// points" was reasoned from level outcomes and never counted. If
+			// geoStaleDiverged comes back 0, that claim is wrong and geoStateRestore
+			// should be deleted rather than committed.
 			const bool changed = std::abs(glo - sv.lastGeoLo) > 0.01 ||
 			                     std::abs(ghi - sv.lastGeoHi) > 0.01;
-			if (changed) { sv.lastGeoLo = glo; sv.lastGeoHi = ghi; }
+			const bool changedShadow = std::abs(glo - sv.shadowGeoLo) > 0.01 ||
+			                           std::abs(ghi - sv.shadowGeoHi) > 0.01;
+			sv.geoStaleEvals++;
+			if (changed != changedShadow) sv.geoStaleDiverged++;
+			if (changed)       { sv.lastGeoLo   = glo; sv.lastGeoHi   = ghi; }
+			if (changedShadow) { sv.shadowGeoLo = glo; sv.shadowGeoHi = ghi; }
 			return changed;
 		};
 
