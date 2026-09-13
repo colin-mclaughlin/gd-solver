@@ -1460,7 +1460,6 @@ struct Config {
 
 	// Give up on a branch that survives this long without a decision point or
 	// death, to avoid an unbounded descent.
-	int maxSegmentSteps = 2000;
 
 	// Hard cap on search depth. Each frame retains a ~22 KB checkpoint, and
 	// holding thousands of them also degrades restore cost badly (measured:
@@ -3121,8 +3120,6 @@ struct Solver {
 	// Testing against the widest band seen instead is conservative and needs no
 	// portal data: space above every ceiling this level has is phantom under all
 	// of them, while a lower section's real space stays untouched.
-	double                ceilMaxSeen     = -1e30;
-	double                floorMinSeen    =  1e30;
 
 	bool                  roofWarned      = false;
 	// Smallest (map roof at the player's x - live ceiling) seen, and where.
@@ -5203,10 +5200,16 @@ int geometrySteer(double x, double y, double vy, double lead, double lookaheadUn
 		*lo = static_cast<double>(f.lo);
 		*hi = static_cast<double>(f.hi);
 		if (*hi - *lo < m.playerH) return false;
-		// Against the WIDEST band seen, not the current one - see ceilMaxSeen.
-		if (haveBand && Solver::get().ceilMaxSeen > -1e29 &&
-		    (*lo > Solver::get().ceilMaxSeen || *hi < Solver::get().floorMinSeen))
-			return false;
+		// A phantom-space filter lived here: drop an interval sitting wholly above the
+		// widest ceiling seen, or wholly below the lowest floor. DELETED, MEASURED
+		// inert - 0 rejects in 126,140 evaluations across all fifteen levels. It
+		// suppressed space the player cannot occupy, and geomPortalRoof now removes
+		// that at map-build time instead (roofMargin mean ~700 -> 0-62).
+		//
+		// It also carried ceilMaxSeen/floorMinSeen: run-wide monotonic accumulators,
+		// read by the steer and never restored on a reposition, so the steer's view of
+		// the map depended on search history. Same defect class as lastGeoLo/Hi and
+		// prevAirMode, resolved by removal rather than by another restore.
 		return true;
 	};
 
@@ -8372,13 +8375,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// Gravity-relative fall speed: positive means moving the way gravity
 		// pulls, so the test reads the same upright and inverted. m_yVelocity is
 		// in world coordinates, so the sign flips with m_isUpsideDown.
-		bool tapFirst = false;
 		if (auto* p = m_player1) {
 			d.modeClass = classifyMode(p);
 			d.airPolicy = d.modeClass != ModeClass::Ground;
 			const double fall = p->m_isUpsideDown ?  static_cast<double>(p->m_yVelocity)
 			                                      : -static_cast<double>(p->m_yVelocity);
-			tapFirst = fall > g_config.tapNeedFallSpeed;
 		}
 		// EVERY decision gets a checkpoint now, air included. Air decisions used
 		// to be skipped because restoring to one was unreliable (Probe 4b under
@@ -9035,9 +9036,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		}
 
 		if (sv.learnedCeiling < 1e29) {
-			sv.ceilMaxSeen  = std::max(sv.ceilMaxSeen, sv.learnedCeiling);
-			sv.floorMinSeen = std::min(sv.floorMinSeen,
-			                           sv.learnedCeiling - sv.entryBand());
 		}
 
 		// Probe 15 lived here: a log::info on every CHANGE of the ground-truth
