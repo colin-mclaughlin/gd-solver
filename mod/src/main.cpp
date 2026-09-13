@@ -3413,6 +3413,23 @@ struct Solver {
 	bool                  resumeAirMode  = false;
 	bool                  resumeOnGround = false;
 	uint64_t              modeStaleEvals = 0, modeStaleDiverged = 0;
+	// Probe 22: completeness check for the prevAirMode/prevOnGround restore.
+	// modeStale above sits BEFORE the restore in the same function, so it counts
+	// EXPOSURE, not residual - which is exactly why an off-by-one in the capture
+	// survived a whole suite run. These read the RESTORED PLAYER instead of the
+	// search's own bookkeeping: once a reposition has put prevAirMode back, does
+	// it agree with the character that came back with it? A mismatch is a
+	// spurious forced transition waiting to fire on the very next step. Not
+	// circular, because the two sides come from different places.
+	uint64_t              modeAuditEvals = 0;
+	uint64_t              modeAuditAir = 0, modeAuditGround = 0;
+	// Forced decisions by cause. The `Only` counters are the ones option C turns
+	// on: decisions that exist ONLY because of that rule and would not have been
+	// pushed by anything else at that step. If fdLandingOnly is 0, deleting the
+	// landing force is provably a no-op rather than an inference from outcomes.
+	uint64_t              fdTransition = 0;
+	uint64_t              fdLanding = 0, fdLandingOnly = 0;
+	uint64_t              fdRing = 0, fdRingOnly = 0;
 	// Shadow of lastGeoLo/Hi that IS restored on reposition, so the branch rule can
 	// be evaluated both ways and the difference counted. Measurement only.
 	double                shadowGeoLo  = 0.0;
@@ -3578,6 +3595,8 @@ struct Solver {
 		resumeGeoLo = resumeGeoHi = 0.0;
 		resumeAirMode = resumeOnGround = false;
 		modeStaleEvals = modeStaleDiverged = 0;
+		modeAuditEvals = modeAuditAir = modeAuditGround = 0;
+		fdTransition = fdLanding = fdLandingOnly = fdRing = fdRingOnly = 0;
 		shadowGeoLo = shadowGeoHi = 0.0;
 		brIvSum = brIvN = 0; brIvMin = 1 << 30; brIvMax = 0;
 		velPrunes = 0;
@@ -3605,6 +3624,23 @@ struct Solver {
 
 	static Solver& get() { static Solver s; return s; }
 };
+
+// Probe 22. Called at every reposition, immediately after the player and the
+// search state have both been put back. resumeAirMode/resumeOnGround are what
+// the decision recorded on the way in; classifyMode reads the character that
+// actually arrived. They must agree - if they do not, the next step will see a
+// mode change that never happened and force a decision the original pass never
+// had. Measurement only: nothing here is read by the search.
+void solverAuditRestoredMode() {
+	auto* pl = PlayLayer::get();
+	if (!pl || !pl->m_player1) return;
+	auto& sv = Solver::get();
+	sv.modeAuditEvals++;
+	if ((classifyMode(pl->m_player1) != ModeClass::Ground) != sv.resumeAirMode)
+		sv.modeAuditAir++;
+	if (pl->m_player1->m_isOnGround != sv.resumeOnGround)
+		sv.modeAuditGround++;
+}
 
 
 // ---------------------------------------------------------------------------
@@ -9549,6 +9585,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				sv.prevAirMode  = sv.resumeAirMode;
 				sv.prevOnGround = sv.resumeOnGround;
 			}
+			solverAuditRestoredMode();
 			sv.shadowGeoLo  = sv.resumeGeoLo;
 			sv.shadowGeoHi  = sv.resumeGeoHi;
 			if (g_config.geoStateRestore) {
@@ -9595,6 +9632,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					sv.prevAirMode  = sv.resumeAirMode;
 					sv.prevOnGround = sv.resumeOnGround;
 				}
+				solverAuditRestoredMode();
 				sv.shadowGeoLo  = sv.resumeGeoLo;
 				sv.shadowGeoHi  = sv.resumeGeoHi;
 				if (g_config.geoStateRestore) {
@@ -9960,6 +9998,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          "anchorReplays {}  tapFirst {}/{}  geoSteer {}/{} (dead {} win {})  "
 		          "archive {}c/{}r/{}f  gate {} free {}T/{}H  mute {}  "
 		          "geoStale {}/{}  velPrune {}  brIv {}/{:.1f}/{}  modeStale {}/{}  "
+		          "modeAudit {}a/{}g of {}  forced {}T/{}L({})/{}R({})  "
 		          "ceil {}/{}c/{}p/{}s out {}/{}  roofMargin {}  "
 		          "dx {:.2f}/{:.2f}  vs map {:.2f}  "
 		          "({:.0f} steps/s = {:.1f}x real time, {:.0f} restores/s)",
@@ -9977,6 +10016,9 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		          sv.brIvN ? static_cast<double>(sv.brIvSum) / sv.brIvN : 0.0,
 		          sv.brIvMax,
 		          sv.modeStaleDiverged, sv.modeStaleEvals,
+		          sv.modeAuditAir, sv.modeAuditGround, sv.modeAuditEvals,
+		          sv.fdTransition, sv.fdLanding, sv.fdLandingOnly,
+		          sv.fdRing, sv.fdRingOnly,
 		          sv.learnedCeiling > 1e29
 		              ? std::string("--")
 		              : fmt::format("{:.0f}", sv.learnedCeiling),
@@ -10044,6 +10086,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				sv.prevAirMode  = sv.resumeAirMode;
 				sv.prevOnGround = sv.resumeOnGround;
 			}
+			solverAuditRestoredMode();
 			sv.shadowGeoLo  = sv.resumeGeoLo;
 			sv.shadowGeoHi  = sv.resumeGeoHi;
 			if (g_config.geoStateRestore) {
@@ -10205,6 +10248,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					sv.prevAirMode  = sv.resumeAirMode;
 					sv.prevOnGround = sv.resumeOnGround;
 				}
+				solverAuditRestoredMode();
 				sv.shadowGeoLo  = sv.resumeGeoLo;
 				sv.shadowGeoHi  = sv.resumeGeoHi;
 				if (g_config.geoStateRestore) {
@@ -10546,6 +10590,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// search can pick its hold state from the exact step the ship begins.
 		if (airMode != sv.prevAirMode) {
 			sv.prevAirMode = airMode;
+			sv.fdTransition++;
 			solverPushDecision();
 			if (!sv.stack.empty()) sv.stack.back().modeTransition = true;
 			return true;
@@ -10688,6 +10733,12 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			const bool landed      = onGround && !sv.prevOnGround;
 			const bool intervalDue = onGround &&
 				(sv.step - sv.lastBranch >= g_config.groundBranchInterval);
+
+			// Probe 22: who actually needs this decision point? A cause is
+			// counted as `Only` when nothing else at this step would have
+			// pushed the decision anyway.
+			if (landed) { sv.fdLanding++; if (!onRing && !intervalDue) sv.fdLandingOnly++; }
+			if (onRing) { sv.fdRing++;    if (!landed && !intervalDue) sv.fdRingOnly++; }
 
 			if (landed || onRing || intervalDue) solverPushDecision();
 			sv.prevOnGround = onGround;
