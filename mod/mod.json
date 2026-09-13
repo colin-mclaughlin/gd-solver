@@ -7,5 +7,5 @@
 	"name": "GD Solver",
 	"version": "v0.1.0",
 	"developer": "colin",
-	"description": "Phase 0 instrumentation for a live-game Geometry Dash solver."
+	"description": "Searches the live game for an input sequence that clears the level. Every input is chosen by search, not recorded."
 }
