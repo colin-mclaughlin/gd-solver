@@ -477,6 +477,86 @@ struct Config {
 	// Y toggles it.
 	bool tapStateSurvivesRestore = true;
 
+	// Phase A: keep stepping in the same rendered frame after a restore.
+	//
+	// solverStep has returned false after every backtrack since c776c9f
+	// (2026-08-18), which ends the frame, so the search does at most ONE restore
+	// per rendered frame. That rule dates from the practice-respawn restore; the
+	// direct-load restore that replaced it was never re-tested against it.
+	// MEASURED from the logs, not yet from timers: Clubstep 5,558 restores in 52 s
+	// (107/s), Stereo Madness 95/s, on a 120 Hz display - the frame rate, not the
+	// restore cost. The search does not read frame boundaries, so a correct build
+	// with this on must reproduce the board bit-for-bit (deaths, steps, depth).
+	// DEFAULT ON (2026-09-28, 19.11.39 log): full suite with it on reproduced all
+	// fifteen levels' deaths and steps exactly; suite 182 s -> 144.9 s, Clubstep
+	// 52 -> 43.7 s. The frame-rate cap was real but not dominant - the solver was
+	// still busy ~78% of each frame. 5 toggles it.
+	bool multiRestorePerFrame = true;
+
+	// Phase A: skip GD's visibility pass (and the game layer's draw) while the
+	// solver runs. The plan's Layer 2 called for this and it was never built:
+	// main.cpp had no updateVisibility hook at all. MEASURED with 5 on: a physics
+	// step costs 40-130 us and rises with level weight (Stereo Madness 43 us,
+	// Clubstep 130 us), against ~7 us gdsolver reports for one tick with the pass
+	// skipped. Whether the pass is the difference is exactly what this tests: it
+	// is display preparation, so a correct build must reproduce the board bit for
+	// bit. Skipping leaves visibility state stale, and drawing over stale state is
+	// a known crash, so nothing is drawn until one resetLevel has rebuilt it.
+	// DEFAULT ON (2026-09-28, 19.20.11 log, with 5 on): all fifteen levels' deaths
+	// and steps reproduced exactly, no crash, one rebuild per solve; suite
+	// 144.9 s -> 106.8 s, Clubstep 43.7 -> 31.9 s, a step 40-130 us -> 31-90 us.
+	// Still well above the ~7-26 us gdsolver measures for the same update(1/240)
+	// call, so something else in the step remains. 6 toggles it.
+	bool skipVisibility = true;
+
+	// Catch deaths during a solve instead of letting GD end the attempt, and
+	// restore WITHOUT resetLevel.
+	//
+	// The reset costs 0.5-2 ms of every restore on the light levels and 40.9 ms on
+	// Hypersonic, and grows with object count. It does two jobs: it revives the
+	// dead player, and it returns LEVEL state - moved groups, fired triggers,
+	// used orbs, the effect manager - to canonical before loadFromCheckpoint
+	// (which is sparse) applies the checkpoint on top. Catching the death removes
+	// the first job only. Whether loadFromCheckpoint alone restores the second is
+	// exactly what this tests, and gdsolver's own checkpoint restore still resets,
+	// so the expected answer is "not on levels with moving objects". A correct
+	// build must reproduce the board bit for bit; F4 after any clean pass.
+	//
+	// MEASURED UNSOUND (Probe 23, Deadlocked, 2026-09-28): without the reset the
+	// moving world comes back wrong (64 and 112 objects at the end of two windows)
+	// and the player diverges (+524, +121) - and it was only ~2x cheaper anyway.
+	// Kept off; candidate for deletion. 7 toggles it.
+	bool catchDeaths = false;
+
+	// Skip GJBaseGameLayer::updateShaderLayer while the solver runs. resetLevel
+	// calls it twice per restore, and each call moves the layers holding every
+	// object's sprite in and out of the shader container - walking the whole tree
+	// through onExit/onEnter. gdsolver measured 87% of a heavy restore there and
+	// skips it during search; display only. The rebuild reset after the solve runs
+	// it normally.
+	//
+	// MEASURED NO GAIN (Probe 23 v3, Deadlocked): full restore 38 ms either way,
+	// within noise. gdsolver's 87% was a sliced level late in a long search. Kept
+	// off; candidate for deletion. 9 toggles it.
+	bool skipShaderLayer = false;
+
+	// Restore through GD's own respawn: the checkpoint as the only entry in the
+	// list, then resetLevel, which loads it - instead of resetting to level START
+	// and then calling loadFromCheckpoint over the top. The same write-back runs
+	// after either way (196 player fields, containers, layer scalars), which is
+	// what overwrites the respawn's known error: 13.8's "one step early" was the
+	// PLAYER, and the write-back replaces the player wholesale.
+	//
+	// MEASURED (Probe 23 v3, Deadlocked, 19,666 objects, 155 gameplay objects
+	// moving): collision rects and player EXACT at all four capture points, as
+	// the full restore is; median 26/26/5/27 ms against 38/37/27/38 ms.
+	// DEFAULT ON (2026-09-28, 19.48.44 log): full suite with it on reproduced all
+	// fifteen levels' deaths and steps exactly, and Clubstep's macro clears from
+	// frame 0 under F4. No gain on these light levels (restores 26.0 s against
+	// 25.6 s) - the saving is on heavy ones, which is where this is headed.
+	// 0 toggles it.
+	bool restoreViaRespawn = true;
+
 	// Cells held by the solver's archive.
 	//
 	// Deliberately well below GoExplore's 8000. Each entry holds a checkpoint
@@ -1782,6 +1862,11 @@ struct ProbeState {
 	// defect; the decision at or before it is the restore to suspect.
 	std::vector<probe::TraceRow> solvePathTrace;
 	std::vector<int>             solveDecisionSteps;
+	// Which level the trajectory above belongs to. F4 used to compare against it
+	// whatever level was loaded: on 2026-09-28 Clubstep's replay was checked
+	// against Electrodynamix's trajectory (19,265 steps, the last level solved)
+	// and reported a "restore defect" at step 226 that was two different levels.
+	std::string                  solvePathLevel;
 
 	// The replay's own trajectory, so both can be dumped side by side. Latching
 	// only the FIRST divergence was not enough: a single bit that flips and
@@ -2249,6 +2334,13 @@ void startVerify(bool practiceMode, const char* file = "solution.txt") {
 	log::info("Verify: replaying {} ({} steps) from frame 0, practice mode {}, "
 	          "no savestates, no restores. physics_fix={}",
 	          file, st.scripted.size(), practiceMode ? "ON" : "OFF", fileFix ? 1 : 0);
+	if (!st.solvePathTrace.empty() && st.solvePathLevel != st.levelKey) {
+		log::info("  No trajectory recorded for this level (the last solve was {}) - "
+		          "the step-by-step comparison is skipped; the replay still decides "
+		          "pass or fail.", st.solvePathLevel);
+		st.solvePathTrace.clear();
+		st.solveDecisionSteps.clear();
+	}
 	if (!st.solvePathTrace.empty()) {
 		log::info("  Comparing against the solver's own trajectory ({} steps). The "
 		          "first differing step is where the run actually went wrong - the "
@@ -3413,6 +3505,12 @@ struct Solver {
 	bool                  resumeAirMode  = false;
 	bool                  resumeOnGround = false;
 	uint64_t              modeStaleEvals = 0, modeStaleDiverged = 0;
+	// Phase A time split. QueryPerformanceCounter ticks, accumulated inline and
+	// only formatted in solverReport. `frames` counts rendered frames the solver
+	// ran in; the two `framesEnded` counters say what ended each one.
+	uint64_t              tRestore = 0, tStep = 0, tSolver = 0;
+	uint64_t              nTimedSteps = 0, nTimedRestores = 0;
+	uint64_t              frames = 0, framesEndedRestore = 0, framesEndedBudget = 0;
 	// Probe 22: completeness check for the prevAirMode/prevOnGround restore.
 	// modeStale above sits BEFORE the restore in the same function, so it counts
 	// EXPOSURE, not residual - which is exactly why an off-by-one in the capture
@@ -3595,6 +3693,8 @@ struct Solver {
 		resumeGeoLo = resumeGeoHi = 0.0;
 		resumeAirMode = resumeOnGround = false;
 		modeStaleEvals = modeStaleDiverged = 0;
+		tRestore = tStep = tSolver = nTimedSteps = nTimedRestores = 0;
+		frames = framesEndedRestore = framesEndedBudget = 0;
 		modeAuditEvals = modeAuditAir = modeAuditGround = 0;
 		fdTransition = fdLanding = fdLandingOnly = fdRing = fdRingOnly = 0;
 		shadowGeoLo = shadowGeoHi = 0.0;
@@ -4319,6 +4419,9 @@ struct GeoMap {
 	double roofFirstKillX   = 0.0; // leftmost emptied slice, or 0
 	double roofSpaceRemoved = 0.0; // world units of free height the roof deleted
 	bool valid = false;
+	// Which level the map was built from. Probe 17 checks a verify replay against
+	// it, and after a suite the map in memory is the LAST level solved.
+	std::string level;
 
 	int segments() const { return static_cast<int>(xs.size()) - 1; }
 
@@ -4816,6 +4919,7 @@ bool geometryBuildMap() {
 	}
 
 	m.valid = true;
+	m.level = ProbeState::get().levelKey;
 	return true;
 }
 
@@ -6029,6 +6133,37 @@ void runProbe5(int count) {
 //
 // Polled once per rendered frame, never inside the stepping loop.
 
+// Phase A (skipVisibility). True while the visibility pass is being skipped;
+// g_visStale stays true after that until a resetLevel has rebuilt the state.
+bool g_visStale = false;
+// catchDeaths: set by destroyPlayer when a death is caught, cleared before each
+// search step. Only the search's own steps catch; replays see real deaths.
+bool g_caughtDeath = false;
+// Probe 23, requested by the 8 key and run at the next frame boundary.
+bool g_probe23Pending = false;
+// Probe 23 v2: while it runs, the visibility pass is skipped exactly as in a
+// solve, so its restore timings are the ones a solve would pay.
+bool g_probe23Running = false;
+// Probe 23 only: force a restore variant. -1 = normal. 0 = reset to start + load
+// (the solver's path), 1 = no reset + load (catchDeaths), 2 = GD's respawn to the
+// checkpoint, 3 = respawn + one realign step. Write-back is identical in all four.
+int g_restoreVariant = -1;
+// Probe 23 v3: while the probe runs, whether the visibility pass runs (to compare
+// collision geometry with and without it) and whether the shader layer is skipped.
+bool g_probe23Vis = false;
+bool g_probe23Shader = false;
+bool solverSkipsVisibility() {
+	if (g_probe23Running) return !g_probe23Vis;
+	return g_config.skipVisibility && ProbeState::get().mode == Mode::Solve &&
+	       Solver::get().running;
+}
+
+bool solverSkipsShaderLayer() {
+	if (g_probe23Running) return g_probe23Shader;
+	return g_config.skipShaderLayer && ProbeState::get().mode == Mode::Solve &&
+	       Solver::get().running;
+}
+
 bool keyPressedEdge(int vk) {
 	static bool prev[256] = {};
 	const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
@@ -6212,6 +6347,7 @@ void pathAuditStep(PlayerObject* p) {
 	auto& m  = GeoMap::get();
 	auto& sv = Solver::get();
 	if (!m.valid || !p || p->m_isDead) return;
+	if (m.level != ProbeState::get().levelKey) return;   // another level's map
 	const double x = p->getPositionX();
 	const int si = m.segIndex(x);
 	if (si < 0) return;
@@ -6306,6 +6442,11 @@ void deathMapReport(int topN) {
 
 void pathAuditReport() {
 	auto& sv = Solver::get();
+	if (GeoMap::get().valid && GeoMap::get().level != ProbeState::get().levelKey) {
+		log::info("Probe 17: skipped - the map in memory was built for {}, not this "
+		          "level. Solve this level first to audit its path.", GeoMap::get().level);
+		return;
+	}
 	if (!sv.pathAuditSteps) return;
 	const double n = static_cast<double>(sv.pathAuditSteps);
 	log::info("Probe 17: the winning path against this map - {} steps checked, "
@@ -6696,6 +6837,54 @@ void pollHotkeys() {
 
 
 	// 4 = restore prevAirMode/prevOnGround on a reposition.
+	// 8 = Probe 23: restore fidelity of the MOVING WORLD, with and without the
+	// reset. Works on any level, solvable or not. Read-only apart from its own run.
+	if (keyPressedEdge('0')) {
+		g_config.restoreViaRespawn = !g_config.restoreViaRespawn;
+		log::info("Restore path: {}. F2 to solve with this.",
+		          g_config.restoreViaRespawn
+		              ? "RESPAWN to the checkpoint, then the write-back (default)"
+		              : "reset to level start + loadFromCheckpoint, then the write-back");
+	}
+
+	if (keyPressedEdge('9')) {
+		g_config.skipShaderLayer = !g_config.skipShaderLayer;
+		log::info("Shader layer during a solve: {}. F2 to solve with this.",
+		          g_config.skipShaderLayer
+		              ? "SKIPPED - restores do not re-parent every sprite (test)"
+		              : "updated on every reset, as before (default)");
+	}
+
+	if (keyPressedEdge('8')) {
+		if (!PlayLayer::get()) log::warn("Probe 23: not in a level");
+		else if (ProbeState::get().mode != Mode::Idle) log::warn("Probe 23: stop the solver first");
+		else g_probe23Pending = true;
+	}
+
+	if (keyPressedEdge('7')) {
+		g_config.catchDeaths = !g_config.catchDeaths;
+		log::info("Deaths during a solve: {}. F2 to solve with this.",
+		          g_config.catchDeaths
+		              ? "CAUGHT - restores skip resetLevel (test; F4 after any clean pass)"
+		              : "real, and every restore resets the level first (default)");
+	}
+
+	if (keyPressedEdge('6')) {
+		g_config.skipVisibility = !g_config.skipVisibility;
+		log::info("Visibility pass during a solve: {}. F2 to solve with this.",
+		          g_config.skipVisibility
+		              ? "SKIPPED - no draw until a reset rebuilds it (default)"
+		              : "runs every step, as before");
+	}
+
+	if (keyPressedEdge('5')) {
+		g_config.multiRestorePerFrame = !g_config.multiRestorePerFrame;
+		log::info("Restores per rendered frame: {}. F2 to solve with this.",
+		          g_config.multiRestorePerFrame
+		              ? "MANY - keep stepping after a backtrack (default)"
+		              : "one - end the frame after every backtrack, as before c776c9f's rule");
+	}
+
 	if (keyPressedEdge('4')) {
 		g_config.modeStateRestore = !g_config.modeStateRestore;
 		log::info("Mode/ground state on a reposition: {}. F2 to solve with this.",
@@ -6969,6 +7158,20 @@ log::info("Solver: mode/ground state {} (4 toggles).",
 // ---------------------------------------------------------------------------
 
 class $modify(SolverBaseLayer, GJBaseGameLayer) {
+
+	// Phase A (skipVisibility): drawing over stale visibility state is the crash
+	// gdsolver documents, so the game layer is not drawn while it is stale.
+	void visit() {
+		if (solverSkipsVisibility() || g_visStale) return;
+		GJBaseGameLayer::visit();
+	}
+
+	// skipShaderLayer: display only; see the flag. A skipped call leaves the
+	// sprite layers where they are, so the visibility rebuild's reset puts it back.
+	void updateShaderLayer(float dt) {
+		if (solverSkipsShaderLayer()) { g_visStale = true; return; }
+		GJBaseGameLayer::updateShaderLayer(dt);
+	}
 
 	// Project plan 5.2 part 1. The original MUST be called first: it mutates
 	// internal state (m_extraDelta) that the rest of the frame depends on.
@@ -8696,12 +8899,38 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// Emptying the checkpoint array makes resetLevel go to level START
 		// rather than respawning to a checkpoint, so we get the full wipe with
 		// none of the respawn's positioning fudge, and revive the dead player.
-		if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
-		ps.solverRestoring = true;
-		pl->resetLevel();
-		ps.solverRestoring = false;
+		// catchDeaths: a caught death leaves the player alive, so there is nothing
+		// to revive - skip the reset and load the checkpoint over the live level.
+		const bool skipReset = g_config.catchDeaths && m_player1 && !m_player1->m_isDead;
+		const int variant = g_restoreVariant >= 0 ? g_restoreVariant
+		                  : skipReset                  ? 1
+		                  : g_config.restoreViaRespawn ? 2 : 0;
+		if (variant == 0) {
+			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+			ps.solverRestoring = true;
+			pl->resetLevel();
+			ps.solverRestoring = false;
+		}
+		g_caughtDeath = false;
 
-		pl->loadFromCheckpoint(r.cp);
+		if (variant == 2 || variant == 3) {
+			// GD's own respawn: the checkpoint as the only entry, then resetLevel,
+			// which loads it itself. The respawn's known error is in the PLAYER
+			// (placed one step early, 13.8), which the write-back below overwrites.
+			if (auto* arr = pl->m_checkpointArray) { arr->removeAllObjects(); arr->addObject(r.cp); }
+			ps.solverRestoring = true;
+			pl->resetLevel();
+			ps.solverRestoring = false;
+			// Out of the list again once it has loaded: left in, the next ordinary
+			// resetLevel (the rebuild after a solve, say) would respawn here.
+			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+			if (variant == 3) {
+				applyInput(false);
+				GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+			}
+		} else {
+			pl->loadFromCheckpoint(r.cp);
+		}
 		ps.suppressDeath = false;
 
 		// The held-button state, which no checkpoint stores. The captured state
@@ -8785,7 +9014,10 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	// and the beam cannot drift apart the way two hand-written copies did.
 	void solverRestoreState(Decision& d) {
 		if (!d.rs.cp) return;
+		const uint64_t tr0 = probe::nowTicks();
 		applyRestoreState(d.rs, d.enteringHold);
+		Solver::get().tRestore += probe::nowTicks() - tr0;
+		Solver::get().nTimedRestores++;
 		Solver::get().restores++;
 		Solver::get().pendingPostRestore = true;
 	}
@@ -9959,6 +10191,27 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		const double secs = probe::ticksToMicros(now - sv.startTicks) / 1e6;
 		const double stepsPerSec = secs > 0 ? sv.steps / secs : 0.0;
 
+		// Phase A: where the wall clock goes. `idle` is wall time the solver did not
+		// run at all - the rest of each rendered frame, spent waiting on the game.
+		{
+			const double solverS  = probe::ticksToMicros(sv.tSolver)  / 1e6;
+			const double restoreS = probe::ticksToMicros(sv.tRestore) / 1e6;
+			const double stepS    = probe::ticksToMicros(sv.tStep)    / 1e6;
+			log::info("Solver: time wall {:.1f}s = solver {:.1f}s ({:.0f}%) + idle {:.1f}s  |  "
+			          "restore {:.1f}s ({} x {:.0f} us)  step {:.1f}s ({} x {:.2f} us)  "
+			          "other {:.1f}s  |  frames {} ended by restore {} / budget {}  "
+			          "multiRestore {}",
+			          secs, solverS, secs > 0 ? 100.0 * solverS / secs : 0.0,
+			          std::max(0.0, secs - solverS),
+			          restoreS, sv.nTimedRestores,
+			          sv.nTimedRestores ? 1e6 * restoreS / sv.nTimedRestores : 0.0,
+			          stepS, sv.nTimedSteps,
+			          sv.nTimedSteps ? 1e6 * stepS / sv.nTimedSteps : 0.0,
+			          std::max(0.0, solverS - restoreS - stepS),
+			          sv.frames, sv.framesEndedRestore, sv.framesEndedBudget,
+			          g_config.multiRestorePerFrame ? "ON" : "off");
+		}
+
 		// The speed multiplier matters for interpreting anything observed by eye:
 		// the search runs many times faster than real time, so a rewind of 3.3
 		// GAME seconds plays back in a fraction of a wall-clock second. Game time
@@ -10316,7 +10569,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (sv.macro.size() <= static_cast<size_t>(sv.step)) sv.macro.resize(sv.step + 1, 0);
 		sv.macro[sv.step] = sv.hold ? 1 : 0;
 
+		g_caughtDeath = false;
+		const uint64_t ts0 = probe::nowTicks();
 		GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+		sv.tStep += probe::nowTicks() - ts0;
+		sv.nTimedSteps++;
 		sv.step++;
 		sv.steps++;
 		solverRecordPath(sv.hold);
@@ -10388,6 +10645,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					          "report where the paths diverge for this run.");
 				} else {
 					ps.solvePathTrace = sv.pathTrace;
+					ps.solvePathLevel = ps.levelKey;
 					ps.solveDecisionSteps.clear();
 					ps.solveDecisionSteps.reserve(sv.stack.size());
 					for (auto const& d : sv.stack) ps.solveDecisionSteps.push_back(d.step);
@@ -10425,7 +10683,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			}
 		}
 
-		if (m_player1->m_isDead || geoDead) {
+		if (m_player1->m_isDead || geoDead || g_caughtDeath) {
 			sv.deaths++;
 			if (geoDead) sv.geoDeaths++;
 			sv.diedAtX = m_player1->getPositionX();
@@ -11182,8 +11440,215 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		}
 	}
 
+	// Probe 23. Does a restore put the moving world back?
+	//
+	// The 15-level board cannot answer this: none of its levels has moving
+	// objects, so a restore that ignored them would still reproduce it. This asks
+	// the question directly, on any level, without solving it: play from the start
+	// with no input and deaths suppressed (so the run covers the whole timeline),
+	// capture at several points, and from each one run the same stretch three
+	// ways - undisturbed, after the full restore (reset + load), and after the
+	// no-reset restore catchDeaths uses - comparing the player and every object's
+	// position, rotation and scale on every step.
+	//
+	// The FULL restore is also a control nobody has run: its world fidelity has
+	// never been measured on a level where the world moves.
+	void runProbe23() {
+		auto* pl = PlayLayer::get();
+		if (!pl || !m_player1 || !pl->m_objects) { log::warn("Probe 23: no level"); return; }
+		auto& ps = ProbeState::get();
+		g_probe23Running = true;
+		g_probe23Vis = false;
+		g_probe23Shader = false;
+		constexpr int kD = 600;                              // 2.5 s compared per point
+		constexpr int kSample = 8;                           // steps kept in full, for the sample
+		constexpr int kTimed = 5;                            // restores timed per variant
+		constexpr int kF = 5;                                // floats per object
+		const int points[] = {1200, 2400, 4800, 9600};       // 5, 10, 20, 40 s
+		struct V { int id; bool shader; const char* label; };
+		const V variants[] = {{0, false, "full"}, {0, true, "full+shader"},
+		                      {2, true, "respawn+shader"}};
+
+		auto objs = pl->m_objects;
+		const unsigned n = objs->count();
+		std::vector<uint8_t> gameplay(n, 0);
+		unsigned nGameplay = 0;
+		for (unsigned i = 0; i < n; i++) {
+			auto* o = static_cast<GameObject*>(objs->objectAtIndex(i));
+			if (o && static_cast<int>(o->getType()) != static_cast<int>(GameObjectType::Decoration)) {
+				gameplay[i] = 1; nGameplay++;
+			}
+		}
+		// COLLISION geometry: the rect GD itself collides with, plus rotation.
+		// v2 read sprite positions, which only move when the visibility pass runs,
+		// so with the pass skipped it was blind to movement.
+		auto snapshotWorld = [&](std::vector<float>& out) {
+			out.resize(static_cast<size_t>(n) * kF);
+			for (unsigned i = 0; i < n; i++) {
+				auto* o = static_cast<GameObject*>(objs->objectAtIndex(i));
+				float* w = &out[static_cast<size_t>(i) * kF];
+				if (!o) { for (int k = 0; k < kF; k++) w[k] = 0.f; continue; }
+				const auto r = o->getObjectRect();
+				w[0] = r.origin.x; w[1] = r.origin.y; w[2] = r.size.width; w[3] = r.size.height;
+				w[4] = o->getRotation();
+			}
+		};
+		auto objDiffers = [&](std::vector<float> const& a, std::vector<float> const& b, unsigned i) {
+			for (int k = 0; k < kF; k++)
+				if (probe::bits(a[i * kF + k]) != probe::bits(b[i * kF + k])) return true;
+			return false;
+		};
+		auto diffCount = [&](std::vector<float> const& a, std::vector<float> const& b, bool gpOnly) {
+			int d = 0;
+			for (unsigned i = 0; i < n; i++)
+				if ((!gpOnly || gameplay[i]) && objDiffers(a, b, i)) d++;
+			return d;
+		};
+		auto hashes = [&](std::vector<float> const& w, uint64_t& all, uint64_t& gp) {
+			all = gp = 1469598103934665603ull;
+			for (unsigned i = 0; i < n; i++)
+				for (int k = 0; k < kF; k++) {
+					const uint64_t b = probe::bits(w[i * kF + k]);
+					all ^= b; all *= 1099511628211ull;
+					if (gameplay[i]) { gp ^= b; gp *= 1099511628211ull; }
+				}
+		};
+		auto startFromZero = [&]() {
+			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+			g_probe23Shader = false;
+			ps.suppressDeath = false;
+			pl->resetLevel();
+			ps.suppressDeath = true;
+		};
+		auto stepOnce = [&]() {
+			applyInput(false);
+			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+		};
+		struct Track {
+			std::vector<uint64_t> all, gp;
+			std::vector<float> px, py;
+			std::vector<std::vector<float>> full;
+			std::vector<float> end, start;
+		};
+		auto record = [&](Track& t) {
+			t.all.assign(kD, 0); t.gp.assign(kD, 0); t.px.assign(kD, 0); t.py.assign(kD, 0);
+			t.full.assign(kSample, {});
+			std::vector<float> w;
+			snapshotWorld(t.start);
+			for (int k = 0; k < kD; k++) {
+				stepOnce();
+				snapshotWorld(w);
+				hashes(w, t.all[k], t.gp[k]);
+				if (k < kSample) t.full[k] = w;
+				t.px[k] = m_player1->getPositionX(); t.py[k] = m_player1->getPositionY();
+			}
+			t.end = w;
+		};
+		auto at = [](int k) { return k < 0 ? std::string("EXACT") : fmt::format("+{}", k); };
+		// Compare a track against the reference and report.
+		auto compare = [&](Track const& ref, Track const& got, std::string const& label,
+		                   std::string const& timing) {
+			int firstAll = -1, firstGp = -1, firstPlayer = -1;
+			for (int k = 0; k < kD; k++) {
+				if (firstAll < 0 && got.all[k] != ref.all[k]) firstAll = k;
+				if (firstGp < 0 && got.gp[k] != ref.gp[k]) firstGp = k;
+				if (firstPlayer < 0 && (probe::bits(got.px[k]) != probe::bits(ref.px[k]) ||
+				                        probe::bits(got.py[k]) != probe::bits(ref.py[k])))
+					firstPlayer = k;
+			}
+			log::info("Probe 23: {:<22}{} | collision {} | gameplay {} | end: {} objects differ "
+			          "({} gameplay) | player {}",
+			          label, timing, at(firstAll), at(firstGp),
+			          diffCount(got.end, ref.end, false), diffCount(got.end, ref.end, true),
+			          at(firstPlayer));
+			if (firstAll >= 0 && firstAll < kSample) {
+				int shown = 0;
+				for (unsigned i = 0; i < n && shown < 8; i++) {
+					if (!objDiffers(got.full[firstAll], ref.full[firstAll], i)) continue;
+					auto* o = static_cast<GameObject*>(objs->objectAtIndex(i));
+					auto const& a = ref.full[firstAll]; auto const& b = got.full[firstAll];
+					log::info("Probe 23:     #{} id{} type{}{} rect({:.2f},{:.2f},{:.1f}x{:.1f},r{:.1f}) "
+					          "-> ({:.2f},{:.2f},{:.1f}x{:.1f},r{:.1f})",
+					          i, o ? o->m_objectID : -1, o ? static_cast<int>(o->getType()) : -1,
+					          gameplay[i] ? " GAMEPLAY" : "",
+					          a[i*kF], a[i*kF+1], a[i*kF+2], a[i*kF+3], a[i*kF+4],
+					          b[i*kF], b[i*kF+1], b[i*kF+2], b[i*kF+3], b[i*kF+4]);
+					shown++;
+				}
+			}
+		};
+
+		log::info("Probe 23 v3: {} objects ({} gameplay). Collision rects, {} steps per point, "
+		          "{} restores timed per variant.", n, nGameplay, kD, kTimed);
+
+		for (int A : points) {
+			// 1. With the visibility pass running, as a normal play would.
+			g_probe23Vis = true;
+			startFromZero();
+			for (int i = 0; i < A; i++) stepOnce();
+			if (m_player1->m_isDead) { log::info("Probe 23: player dead before t={}", A); break; }
+			Track vis; record(vis);
+
+			// 2. The reference: visibility skipped, as a solve runs.
+			g_probe23Vis = false;
+			startFromZero();
+			for (int i = 0; i < A; i++) stepOnce();
+			RestoreState rs;
+			captureRestoreState(rs);
+			if (!rs.cp) { log::warn("Probe 23: capture failed at t={}", A); break; }
+			Track ref; record(ref);
+
+			log::info("Probe 23: t={} - {} objects' collision rects changed in the window "
+			          "({} gameplay)", A, diffCount(ref.start, ref.end, false),
+			          diffCount(ref.start, ref.end, true));
+			compare(vis, ref, fmt::format("t={} vis-skipped", A), std::string(" (vs pass running)"));
+
+			for (auto const& v : variants) {
+				g_restoreVariant = v.id;
+				g_probe23Shader = v.shader;
+				std::vector<double> us;
+				for (int t = 0; t < kTimed; t++) {
+					const uint64_t t0 = probe::nowTicks();
+					applyRestoreState(rs, false);
+					us.push_back(probe::ticksToMicros(probe::nowTicks() - t0));
+				}
+				std::sort(us.begin(), us.end());
+				g_probe23Shader = false;
+				ps.suppressDeath = true;                 // the restore clears it
+				Track got; record(got);
+				compare(ref, got, fmt::format("t={} {}", A, v.label),
+				        fmt::format(" restore {:>6.0f} us (min {:.0f})", us[us.size() / 2], us.front()));
+			}
+			g_restoreVariant = -1;
+			releaseCheckpoint(rs.cp);
+		}
+
+		g_restoreVariant = -1;
+		g_probe23Vis = false;
+		g_probe23Shader = false;
+		startFromZero();
+		ps.suppressDeath = false;
+		g_probe23Running = false;       // g_visStale is set: update() rebuilds once
+		log::info("Probe 23: done.");
+	}
+
 	void update(float dt) {
 		pollHotkeys();
+
+		// Phase A (skipVisibility): the solve that skipped the visibility pass has
+		// ended. One reset rebuilds the state before anything is drawn again.
+		if (g_visStale && !solverSkipsVisibility()) {
+			g_visStale = false;
+			if (auto* rpl = PlayLayer::get()) rpl->resetLevel();
+			log::info("Visibility: rebuilt with a reset after the solve.");
+			return;
+		}
+
+		if (g_probe23Pending) {
+			g_probe23Pending = false;
+			runProbe23();
+			return;
+		}
 		liveCeilingStep();
 		climbEnvelopeStep();
 
@@ -11335,10 +11800,23 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (st.mode == Mode::Solve) {
 			auto& sv = Solver::get();
 			const uint64_t frameStart = probe::nowTicks();
+			sv.frames++;
 			while (sv.running) {
-				if (!solverStep()) break;
-				if (probe::ticksToMicros(probe::nowTicks() - frameStart) > kSolverFrameBudgetUs) break;
+				if (!solverStep()) {
+					// Phase A: a plain backtrack may keep going this frame. Anything
+					// that has queued a reset, stopped the solver or left Solve mode
+					// still ends the frame exactly as before.
+					const bool canContinue = g_config.multiRestorePerFrame && sv.running &&
+						st.mode == Mode::Solve && !st.resetPending && !sv.resyncing &&
+						!sv.anchorReplaying;
+					if (!canContinue) { sv.framesEndedRestore++; break; }
+				}
+				if (probe::ticksToMicros(probe::nowTicks() - frameStart) > kSolverFrameBudgetUs) {
+					sv.framesEndedBudget++;
+					break;
+				}
 			}
+			sv.tSolver += probe::nowTicks() - frameStart;
 			return;
 		}
 
@@ -11427,6 +11905,13 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 // ---------------------------------------------------------------------------
 
 class $modify(SolverPlayLayer, PlayLayer) {
+
+	// Phase A (skipVisibility). Display preparation only; see the flag.
+	void updateVisibility(float dt) {
+		if (solverSkipsVisibility()) { g_visStale = true; return; }
+		if (g_visStale) return;   // still stale: the reset in update() rebuilds it
+		PlayLayer::updateVisibility(dt);
+	}
 
 	bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
 		if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
@@ -11533,7 +12018,8 @@ class $modify(SolverPlayLayer, PlayLayer) {
 		if (ProbeState::get().suppressDeath) return;
 		// Probe 19. One hash and two map bumps, only while solving. Bucketed at
 		// one block so a cell is a place on screen rather than a coordinate.
-		if (Solver::get().running && player == m_player1 && !player->m_isDead) {
+		if (Solver::get().running && player == m_player1 && !player->m_isDead &&
+		    !g_caughtDeath) {
 			auto& sv = Solver::get();
 			const int xb = static_cast<int>(std::floor(player->getPositionX() / 30.0));
 			const int yb = static_cast<int>(std::floor(player->getPositionY() / 30.0));
@@ -11542,6 +12028,14 @@ class $modify(SolverPlayLayer, PlayLayer) {
 			sv.deathCells[k]++;
 			sv.deathVySum[k] += player->m_yVelocity;
 			sv.deathsRecorded++;
+		}
+		// catchDeaths: during the search's own steps only - a resync or anchor
+		// replay must see a real death, and so must F4.
+		if (g_config.catchDeaths && player == m_player1 &&
+		    ProbeState::get().mode == Mode::Solve && Solver::get().running &&
+		    !Solver::get().resyncing && !Solver::get().anchorReplaying) {
+			g_caughtDeath = true;
+			return;
 		}
 		PlayLayer::destroyPlayer(player, object);
 	}

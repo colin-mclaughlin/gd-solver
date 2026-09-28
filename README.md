@@ -3,7 +3,7 @@
 **A search that plays Geometry Dash by driving the real game.**
 
 GD Solver is a [Geode](https://geode-sdk.org/) mod that turns a running copy of Geometry Dash
-into a deterministic state machine — stepping its physics headlessly at ~30x real time, saving
+into a deterministic state machine — stepping its physics at ~30x real time, saving
 and restoring exact game states, and systematically searching the resulting tree for an input
 sequence that clears the level.
 
@@ -104,7 +104,7 @@ Naively that tree is 2^30000 for a long level. Three things collapse it:
 ```
   Layer 4   Search        DFS + iterative deepening on toggle count, geometry-guided ordering
   Layer 3   Savestate     createCheckpoint + full PlayerObject image + container state
-  Layer 2   Headless      N physics steps per rendered frame, rendering suppressed
+  Layer 2   Speed         many physics steps per rendered frame
   Layer 1   Determinism   fixed 1/240 dt — if this fails, nothing above it works
 ```
 
@@ -114,9 +114,10 @@ returning one. Returning `1/240` collapses GD's internal sub-stepping to exactly
 per call — the single-tick primitive everything else is built on. Physics dt stays at the true
 gameplay value, so a macro found here is valid in ordinary play.
 
-**Layer 2 — headless speed.** Visibility updates are suppressed and N physics steps run per
-rendered frame, under a 12 ms per-frame wall-clock budget so the window keeps pumping messages and
-the process never goes Not Responding.
+**Layer 2 — speed.** As many physics steps as fit in a 12 ms per-frame wall-clock budget run per
+rendered frame, so the window keeps pumping messages and the process never goes Not Responding.
+Suppressing GD's visibility pass during a search — true headless stepping — is being measured
+behind a flag and is not yet the default.
 
 **Layer 3 — savestates.** This was the hardest layer, and the finding is worth stating precisely:
 
