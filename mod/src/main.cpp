@@ -509,24 +509,29 @@ struct Config {
 	// call, so something else in the step remains. 6 toggles it.
 	bool skipVisibility = true;
 
-	// Catch deaths during a solve instead of letting GD end the attempt, and
-	// restore WITHOUT resetLevel.
+	// Catch deaths during the search's own steps instead of letting GD run its
+	// death sequence. The restore that follows is unchanged, reset included.
 	//
-	// The reset costs 0.5-2 ms of every restore on the light levels and 40.9 ms on
-	// Hypersonic, and grows with object count. It does two jobs: it revives the
-	// dead player, and it returns LEVEL state - moved groups, fired triggers,
-	// used orbs, the effect manager - to canonical before loadFromCheckpoint
-	// (which is sparse) applies the checkpoint on top. Catching the death removes
-	// the first job only. Whether loadFromCheckpoint alone restores the second is
-	// exactly what this tests, and gdsolver's own checkpoint restore still resets,
-	// so the expected answer is "not on levels with moving objects". A correct
-	// build must reproduce the board bit for bit; F4 after any clean pass.
+	// MEASURED (Probes 24-26, Clubstep): checkCollisions costs 3.9 us a call in an
+	// F4 replay and 75 us during the solve on the same path. Practice mode, 600
+	// live checkpoints, capturing and restoring each left it at ~3 us (Probe 26);
+	// the one thing the solve does that none of those did is DIE. GD runs the whole
+	// death sequence - explosion, particles, sound, shake, respawn scheduling -
+	// inside checkCollisions, and the extra cost works out at ~1 ms a death on
+	// Stereo Madness and ~2 ms on Clubstep: ~11 s of Clubstep's 32.
 	//
-	// MEASURED UNSOUND (Probe 23, Deadlocked, 2026-09-28): without the reset the
-	// moving world comes back wrong (64 and 112 objects at the end of two windows)
-	// and the player diverges (+524, +121) - and it was only ~2x cheaper anyway.
-	// Kept off; candidate for deletion. 7 toggles it.
-	bool catchDeaths = false;
+	// HISTORY: the first version of this flag also skipped the reset, and Probe 23
+	// measured that unsound on Deadlocked's moving world. That half is deleted. A
+	// live player restores exactly through the normal path - Probes 23 and 26 did
+	// it hundreds of times. A correct build must reproduce the board bit for bit.
+	//
+	// DEFAULT ON (2026-09-29, 11.41.31 log): all fifteen levels' deaths and steps
+	// reproduced exactly; Clubstep's macro clears under F4. Suite 106.8 -> 60.1 s,
+	// Clubstep 31.9 -> 16.9 s, a step 31-90 us -> 25-29 us and now flat across
+	// levels. First attempt failed at step 2: GD's anti-cheat calls destroyPlayer
+	// with m_anticheatSpike at the start of an attempt, and that call must pass
+	// through (see the destroyPlayer hook). 7 toggles it.
+	bool catchDeaths = true;
 
 	// Skip GJBaseGameLayer::updateShaderLayer while the solver runs. resetLevel
 	// calls it twice per restore, and each call moves the layers holding every
@@ -556,6 +561,10 @@ struct Config {
 	// 25.6 s) - the saving is on heavy ones, which is where this is headed.
 	// 0 toggles it.
 	bool restoreViaRespawn = true;
+
+	// Probe 24: time the parts of GD inside a physics step. Measurement only;
+	// default off because the timers themselves cost a little. 1 toggles it.
+	bool stepProfile = false;
 
 	// Cells held by the solver's archive.
 	//
@@ -2302,6 +2311,10 @@ void onAttemptEnded() {
 // with no restores and no practice mode. This is the check that makes an
 // unsound restore impossible to mistake for a success.
 
+void profCollisionCompare();   // Probe 24, defined with the profiler below
+void profCollisionReset(int which);
+void sectionCensus(GJBaseGameLayer* gl, const char* tag);
+
 void startVerify(bool practiceMode, const char* file = "solution.txt") {
 	auto& st = ProbeState::get();
 	auto* pl = PlayLayer::get();
@@ -2331,6 +2344,8 @@ void startVerify(bool practiceMode, const char* file = "solution.txt") {
 	st.verifyDivergeLogged  = false;
 	st.verifyPathTrace.clear();
 	st.verifyPathTrace.reserve(st.scripted.size() + 256);
+	profCollisionReset(1);
+	sectionCensus(PlayLayer::get(), "F4 start");
 	log::info("Verify: replaying {} ({} steps) from frame 0, practice mode {}, "
 	          "no savestates, no restores. physics_fix={}",
 	          file, st.scripted.size(), practiceMode ? "ON" : "OFF", fileFix ? 1 : 0);
@@ -2475,6 +2490,7 @@ void finishVerify(bool completed, int atStep, float pct) {
 	// Whether the replay passed or died, every step of it was checked
 	// against the map, and the disagreement is the point.
 	pathAuditReport();
+	profCollisionCompare();
 	if (completed) {
 		if (st.verifyDivergeStep >= 0) {
 			// A pass is not the same as a match. The search flew one trajectory and
@@ -6144,6 +6160,10 @@ bool g_probe23Pending = false;
 // Probe 23 v2: while it runs, the visibility pass is skipped exactly as in a
 // solve, so its restore timings are the ones a solve would pay.
 bool g_probe23Running = false;
+// Probe 26: requested by F3, run at the next frame boundary; while it runs the
+// profiler times checkCollisions and the visibility pass is skipped.
+bool g_probe26Pending = false;
+bool g_probe26Running = false;
 // Probe 23 only: force a restore variant. -1 = normal. 0 = reset to start + load
 // (the solver's path), 1 = no reset + load (catchDeaths), 2 = GD's respawn to the
 // checkpoint, 3 = respawn + one realign step. Write-back is identical in all four.
@@ -6154,6 +6174,7 @@ bool g_probe23Vis = false;
 bool g_probe23Shader = false;
 bool solverSkipsVisibility() {
 	if (g_probe23Running) return !g_probe23Vis;
+	if (g_probe26Running) return true;
 	return g_config.skipVisibility && ProbeState::get().mode == Mode::Solve &&
 	       Solver::get().running;
 }
@@ -6162,6 +6183,146 @@ bool solverSkipsShaderLayer() {
 	if (g_probe23Running) return g_probe23Shader;
 	return g_config.skipShaderLayer && ProbeState::get().mode == Mode::Solve &&
 	       Solver::get().running;
+}
+
+// Probe 25: section census.
+//
+// Probe 24 measured checkCollisions at 3.9 us a call during an F4 replay of
+// Clubstep's solution - flat across the whole level - and 75 us a call during
+// the solve that found it, on the same path: 19x, up to 29x in places. So
+// something the SEARCH does makes every collision check slower. checkCollisions
+// walks GD's section lists, so this counts what is in them. A list that keeps
+// growing while the solver runs, and not during a replay, is the leak.
+// Read-only; prints with the profiler on (1).
+void sectionCensus(GJBaseGameLayer* gl, const char* tag) {
+	if (!gl || !g_config.stepProfile) return;
+	uint64_t logical = 0, stored = 0, cells = 0, maxCell = 0;
+	for (auto* col : gl->m_sectionSizes) {
+		if (!col) continue;
+		for (int n : *col) { logical += static_cast<uint64_t>(std::max(0, n)); cells++;
+		                     maxCell = std::max<uint64_t>(maxCell, static_cast<uint64_t>(std::max(0, n))); }
+	}
+	for (auto* col : gl->m_sections) {
+		if (!col) continue;
+		for (auto* cell : *col) if (cell) stored += cell->size();
+	}
+	uint64_t neLogical = 0;
+	for (auto* col : gl->m_nonEffectObjectsSizes) {
+		if (!col) continue;
+		for (int n : *col) neLogical += static_cast<uint64_t>(std::max(0, n));
+	}
+	auto cnt = [](cocos2d::CCArray* a) { return a ? static_cast<int>(a->count()) : -1; };
+	auto* pl = PlayLayer::get();
+	log::info("Probe 25 [{}]: sections {} objects in {} cells (stored {}, largest cell {}) | "
+	          "non-effect {} | active {}/{} | solid cand {} hazard cand {} | toMove {} "
+	          "collisionBlocks {} checkpointArray {}",
+	          tag, logical, cells, stored, maxCell, neLogical,
+	          gl->m_activeObjectsCount, gl->m_activeObjects.size(),
+	          gl->m_solidCollisionObjectsCount, gl->m_hazardCollisionObjectsCount,
+	          cnt(gl->m_objectsToMove), cnt(gl->m_collisionBlocks),
+	          pl ? cnt(pl->m_checkpointArray) : -1);
+}
+
+// ---------------------------------------------------------------------------
+// Probe 24: step profiler
+// ---------------------------------------------------------------------------
+//
+// A physics step costs 30-90 us here against the 7-26 us gdsolver measures for
+// the same GJBaseGameLayer::update(1/240) call, and steps are 60% of the time a
+// solve spends working. This times the parts of GD that run inside a step.
+// Times are INCLUSIVE - a function called inside another counts in both - so
+// the table ranks where time goes rather than summing to the step. Only while
+// the solver runs, and only with the flag on: off, each hook is one branch.
+// Measurement only. 1 toggles it.
+enum ProfSlot { P_processCommands, P_checkCollisions, P_collisionCheckObjects, P_updateCamera, P_updateParticles, P_updateEnterEffects, P_processMoveActionsStep, P_processAreaActions, P_processTransformActions, P_processRotationActions, P_processDynamicObjectActions, P_processFollowActions, P_processPlayerFollowActions, P_processAdvancedFollowActions, P_processItems, P_checkSpawnObjects, P_updateAudioVisualizer, P_updateGradientLayers, P_processQueuedAudioTriggers, P_processActivatedAudioTriggers, P_updateProximityVolumeEffects, P_updateSpecialLabels, P_updateTimerLabels, P_updateGuideArt, P_updateExtraGameLayers, P_preUpdateVisibility, P_updateCollisionBlocks, P_updateDebugDraw, P_updateShaderLayer, P_PL_postUpdate, P_PL_updateVisibility, P_PL_updateProgressbar, P_PL_updateAttemptTime, P_PL_updateInfoLabel, P_PL_checkForEnd, P_PL_processCheckpoints, P_PO_update, P_PO_postCollision, P_PO_updateInternalActions, P_PO_placeStreakPoint, P_COUNT };
+const char* const kProfNames[P_COUNT] = { "processCommands", "checkCollisions", "collisionCheckObjects", "updateCamera", "updateParticles", "updateEnterEffects", "processMoveActionsStep", "processAreaActions", "processTransformActions", "processRotationActions", "processDynamicObjectActions", "processFollowActions", "processPlayerFollowActions", "processAdvancedFollowActions", "processItems", "checkSpawnObjects", "updateAudioVisualizer", "updateGradientLayers", "processQueuedAudioTriggers", "processActivatedAudioTriggers", "updateProximityVolumeEffects", "updateSpecialLabels", "updateTimerLabels", "updateGuideArt", "updateExtraGameLayers", "preUpdateVisibility", "updateCollisionBlocks", "updateDebugDraw", "updateShaderLayer", "PlayLayer::postUpdate", "PlayLayer::updateVisibility", "PlayLayer::updateProgressbar", "PlayLayer::updateAttemptTime", "PlayLayer::updateInfoLabel", "PlayLayer::checkForEnd", "PlayLayer::processCheckpoints", "Player::update", "Player::postCollision", "Player::updateInternalActions", "Player::placeStreakPoint" };
+uint64_t g_profTicks[P_COUNT] = {};
+uint64_t g_profCalls[P_COUNT] = {};
+bool profOn() {
+	if (!g_config.stepProfile) return false;
+	if (g_probe26Running) return true;
+	auto const m = ProbeState::get().mode;
+	return (m == Mode::Solve && Solver::get().running) || m == Mode::Verify;
+}
+
+// checkCollisions by position, for the solve [0] and for an F4 replay [1] of
+// the same level. The replay flies the same path with no search, no captures and
+// no restores, so the same bucket costing more during the solve means something
+// the search does is slowing every step - not the level being denser there.
+constexpr int kCollBuckets = 20;
+uint64_t g_collTicks[2][kCollBuckets] = {};
+uint64_t g_collCalls[2][kCollBuckets] = {};
+std::string g_collLevel[2];
+void profCollisionRecord(double x, uint64_t ticks) {
+	auto* pl = PlayLayer::get();
+	if (!pl || pl->m_levelLength <= 1.f) return;
+	const int which = ProbeState::get().mode == Mode::Verify ? 1 : 0;
+	int b = static_cast<int>(x / pl->m_levelLength * kCollBuckets);
+	b = std::max(0, std::min(kCollBuckets - 1, b));
+	g_collTicks[which][b] += ticks;
+	g_collCalls[which][b]++;
+	g_collLevel[which] = ProbeState::get().levelKey;
+}
+void profCollisionReset(int which) {
+	std::memset(g_collTicks[which], 0, sizeof(g_collTicks[which]));
+	std::memset(g_collCalls[which], 0, sizeof(g_collCalls[which]));
+	g_collLevel[which].clear();
+}
+struct ProfScope {
+	int slot; uint64_t t0;
+	explicit ProfScope(int s) : slot(s), t0(profOn() ? probe::nowTicks() : 0) {}
+	~ProfScope() {
+		if (t0) { g_profTicks[slot] += probe::nowTicks() - t0; g_profCalls[slot]++; }
+	}
+};
+void profReset() {
+	std::memset(g_profTicks, 0, sizeof(g_profTicks));
+	std::memset(g_profCalls, 0, sizeof(g_profCalls));
+	profCollisionReset(0);
+}
+
+// Solve [0] against F4 replay [1], bucket by bucket. Printed at the end of a
+// verify; the solve side is whatever the last solve of this level recorded.
+void profCollisionCompare() {
+	if (!g_config.stepProfile) return;
+	sectionCensus(PlayLayer::get(), "F4 end");
+	const bool haveSolve = g_collLevel[0] == g_collLevel[1] && !g_collLevel[0].empty();
+	log::info("Probe 24: checkCollisions by position - us per call, {}.",
+	          haveSolve ? "solve against this F4 replay"
+	                    : "F4 replay only (no solve of this level recorded with the profiler on)");
+	double sumS = 0, sumV = 0; uint64_t nS = 0, nV = 0;
+	for (int b = 0; b < kCollBuckets; b++) {
+		const double v = g_collCalls[1][b] ? probe::ticksToMicros(g_collTicks[1][b]) / g_collCalls[1][b] : 0.0;
+		const double sv = g_collCalls[0][b] ? probe::ticksToMicros(g_collTicks[0][b]) / g_collCalls[0][b] : 0.0;
+		sumS += probe::ticksToMicros(g_collTicks[0][b]); nS += g_collCalls[0][b];
+		sumV += probe::ticksToMicros(g_collTicks[1][b]); nV += g_collCalls[1][b];
+		if (!g_collCalls[1][b] && !g_collCalls[0][b]) continue;
+		log::info("Probe 24:   {:>3}-{:>3}%  replay {:>7.2f} us ({:>6} calls)   solve {:>7.2f} us ({:>7} calls){}",
+		          b * 100 / kCollBuckets, (b + 1) * 100 / kCollBuckets,
+		          v, g_collCalls[1][b], sv, g_collCalls[0][b],
+		          (haveSolve && v > 0 && sv > 0) ? fmt::format("   x{:.2f}", sv / v) : std::string());
+	}
+	log::info("Probe 24:   overall  replay {:.2f} us/call   solve {:.2f} us/call",
+	          nV ? sumV / nV : 0.0, nS ? sumS / nS : 0.0);
+}
+void profReport() {
+	if (!g_config.stepProfile) return;
+	auto& sv = Solver::get();
+	const double steps  = static_cast<double>(std::max<uint64_t>(1, sv.nTimedSteps));
+	const double stepUs = probe::ticksToMicros(sv.tStep) / steps;
+	log::info("Probe 24: step profile - {:.0f} steps at {:.2f} us each. Inclusive times; "
+	          "nested calls count in both.", steps, stepUs);
+	int order[P_COUNT];
+	for (int i = 0; i < P_COUNT; i++) order[i] = i;
+	std::sort(order, order + P_COUNT, [](int a, int b) { return g_profTicks[a] > g_profTicks[b]; });
+	for (int k = 0; k < P_COUNT; k++) {
+		const int i = order[k];
+		if (!g_profCalls[i]) continue;
+		const double us = probe::ticksToMicros(g_profTicks[i]);
+		log::info("Probe 24:   {:<34} {:>9.1f} ms  {:>9} calls  {:>8.2f} us/call  {:>7.2f} us/step  {:>5.1f}%",
+		          kProfNames[i], us / 1000.0, g_profCalls[i], us / g_profCalls[i],
+		          us / steps, stepUs > 0 ? 100.0 * (us / steps) / stepUs : 0.0);
+	}
 }
 
 bool keyPressedEdge(int vk) {
@@ -6839,6 +7000,13 @@ void pollHotkeys() {
 	// 4 = restore prevAirMode/prevOnGround on a reposition.
 	// 8 = Probe 23: restore fidelity of the MOVING WORLD, with and without the
 	// reset. Works on any level, solvable or not. Read-only apart from its own run.
+	if (keyPressedEdge('1')) {
+		g_config.stepProfile = !g_config.stepProfile;
+		log::info("Step profiler (Probe 24): {}. F2 to solve with this.",
+		          g_config.stepProfile ? "ON - a table prints when each level solves"
+		                               : "off (default)");
+	}
+
 	if (keyPressedEdge('0')) {
 		g_config.restoreViaRespawn = !g_config.restoreViaRespawn;
 		log::info("Restore path: {}. F2 to solve with this.",
@@ -6855,6 +7023,15 @@ void pollHotkeys() {
 		              : "updated on every reset, as before (default)");
 	}
 
+	// F3 = Probe 26: which part of the search makes checkCollisions 19x slower.
+	// Needs the profiler (1) on. Read-only apart from its own run.
+	if (keyPressedEdge(VK_F3)) {
+		if (!PlayLayer::get()) log::warn("Probe 26: not in a level");
+		else if (ProbeState::get().mode != Mode::Idle) log::warn("Probe 26: stop the solver first");
+		else if (!g_config.stepProfile) log::warn("Probe 26: turn the profiler on first (1)");
+		else g_probe26Pending = true;
+	}
+
 	if (keyPressedEdge('8')) {
 		if (!PlayLayer::get()) log::warn("Probe 23: not in a level");
 		else if (ProbeState::get().mode != Mode::Idle) log::warn("Probe 23: stop the solver first");
@@ -6865,8 +7042,8 @@ void pollHotkeys() {
 		g_config.catchDeaths = !g_config.catchDeaths;
 		log::info("Deaths during a solve: {}. F2 to solve with this.",
 		          g_config.catchDeaths
-		              ? "CAUGHT - restores skip resetLevel (test; F4 after any clean pass)"
-		              : "real, and every restore resets the level first (default)");
+		              ? "CAUGHT - no death sequence; the restore is unchanged (default)"
+		              : "real - GD runs its full death sequence each time");
 	}
 
 	if (keyPressedEdge('6')) {
@@ -7076,6 +7253,7 @@ void pollHotkeys() {
 			sv.startTicks = probe::nowTicks();
 			sv.lastReport = sv.startTicks;
 			st.mode       = Mode::Solve;
+			profReset();
 			st.resetPending = true;
 
 			if (!st.verifiedPrefix.empty()) {
@@ -7159,6 +7337,43 @@ log::info("Solver: mode/ground state {} (4 toggles).",
 
 class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
+	// Probe 24 hooks: each forwards unchanged, timed only while the profiler is on.
+	void processCommands(float dt, bool isHalfTick, bool isLastTick) { ProfScope p(P_processCommands); GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick); }
+	int checkCollisions(PlayerObject* o, float dt, bool ignoreDamage) {
+		ProfScope p(P_checkCollisions);
+		if (!p.t0 || o != m_player1) return GJBaseGameLayer::checkCollisions(o, dt, ignoreDamage);
+		const uint64_t t0 = probe::nowTicks();
+		const int r = GJBaseGameLayer::checkCollisions(o, dt, ignoreDamage);
+		profCollisionRecord(o->getPositionX(), probe::nowTicks() - t0);
+		return r;
+	}
+	void collisionCheckObjects(PlayerObject* o, gd::vector<GameObject*>* objs, int n, float dt) { ProfScope p(P_collisionCheckObjects); GJBaseGameLayer::collisionCheckObjects(o, objs, n, dt); }
+	void updateCamera(float dt) { ProfScope p(P_updateCamera); GJBaseGameLayer::updateCamera(dt); }
+	void updateParticles(float dt) { ProfScope p(P_updateParticles); GJBaseGameLayer::updateParticles(dt); }
+	void updateEnterEffects(float dt) { ProfScope p(P_updateEnterEffects); GJBaseGameLayer::updateEnterEffects(dt); }
+	void processMoveActionsStep(float dt, bool visibleFrame) { ProfScope p(P_processMoveActionsStep); GJBaseGameLayer::processMoveActionsStep(dt, visibleFrame); }
+	void processAreaActions(float dt, bool visibleFrame) { ProfScope p(P_processAreaActions); GJBaseGameLayer::processAreaActions(dt, visibleFrame); }
+	void processTransformActions(bool visibleFrame) { ProfScope p(P_processTransformActions); GJBaseGameLayer::processTransformActions(visibleFrame); }
+	void processRotationActions() { ProfScope p(P_processRotationActions); GJBaseGameLayer::processRotationActions(); }
+	void processDynamicObjectActions(int type, float dt) { ProfScope p(P_processDynamicObjectActions); GJBaseGameLayer::processDynamicObjectActions(type, dt); }
+	void processFollowActions() { ProfScope p(P_processFollowActions); GJBaseGameLayer::processFollowActions(); }
+	void processPlayerFollowActions(float dt) { ProfScope p(P_processPlayerFollowActions); GJBaseGameLayer::processPlayerFollowActions(dt); }
+	void processAdvancedFollowActions(float dt) { ProfScope p(P_processAdvancedFollowActions); GJBaseGameLayer::processAdvancedFollowActions(dt); }
+	void processItems() { ProfScope p(P_processItems); GJBaseGameLayer::processItems(); }
+	void checkSpawnObjects() { ProfScope p(P_checkSpawnObjects); GJBaseGameLayer::checkSpawnObjects(); }
+	void updateAudioVisualizer() { ProfScope p(P_updateAudioVisualizer); GJBaseGameLayer::updateAudioVisualizer(); }
+	void updateGradientLayers() { ProfScope p(P_updateGradientLayers); GJBaseGameLayer::updateGradientLayers(); }
+	void processQueuedAudioTriggers() { ProfScope p(P_processQueuedAudioTriggers); GJBaseGameLayer::processQueuedAudioTriggers(); }
+	void processActivatedAudioTriggers(float levelTime) { ProfScope p(P_processActivatedAudioTriggers); GJBaseGameLayer::processActivatedAudioTriggers(levelTime); }
+	void updateProximityVolumeEffects() { ProfScope p(P_updateProximityVolumeEffects); GJBaseGameLayer::updateProximityVolumeEffects(); }
+	void updateSpecialLabels() { ProfScope p(P_updateSpecialLabels); GJBaseGameLayer::updateSpecialLabels(); }
+	void updateTimerLabels() { ProfScope p(P_updateTimerLabels); GJBaseGameLayer::updateTimerLabels(); }
+	void updateGuideArt() { ProfScope p(P_updateGuideArt); GJBaseGameLayer::updateGuideArt(); }
+	void updateExtraGameLayers() { ProfScope p(P_updateExtraGameLayers); GJBaseGameLayer::updateExtraGameLayers(); }
+	void preUpdateVisibility(float dt) { ProfScope p(P_preUpdateVisibility); GJBaseGameLayer::preUpdateVisibility(dt); }
+	void updateCollisionBlocks() { ProfScope p(P_updateCollisionBlocks); GJBaseGameLayer::updateCollisionBlocks(); }
+	void updateDebugDraw() { ProfScope p(P_updateDebugDraw); GJBaseGameLayer::updateDebugDraw(); }
+
 	// Phase A (skipVisibility): drawing over stale visibility state is the crash
 	// gdsolver documents, so the game layer is not drawn while it is stale.
 	void visit() {
@@ -7169,6 +7384,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	// skipShaderLayer: display only; see the flag. A skipped call leaves the
 	// sprite layers where they are, so the visibility rebuild's reset puts it back.
 	void updateShaderLayer(float dt) {
+		ProfScope prof(P_updateShaderLayer);
 		if (solverSkipsShaderLayer()) { g_visStale = true; return; }
 		GJBaseGameLayer::updateShaderLayer(dt);
 	}
@@ -8899,11 +9115,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// Emptying the checkpoint array makes resetLevel go to level START
 		// rather than respawning to a checkpoint, so we get the full wipe with
 		// none of the respawn's positioning fudge, and revive the dead player.
-		// catchDeaths: a caught death leaves the player alive, so there is nothing
-		// to revive - skip the reset and load the checkpoint over the live level.
-		const bool skipReset = g_config.catchDeaths && m_player1 && !m_player1->m_isDead;
+		// Variant 1 (no reset) is reachable from Probe 23 only: measured unsound.
 		const int variant = g_restoreVariant >= 0 ? g_restoreVariant
-		                  : skipReset                  ? 1
 		                  : g_config.restoreViaRespawn ? 2 : 0;
 		if (variant == 0) {
 			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
@@ -10211,6 +10424,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			          sv.frames, sv.framesEndedRestore, sv.framesEndedBudget,
 			          g_config.multiRestorePerFrame ? "ON" : "off");
 		}
+		sectionCensus(this, "solve");
 
 		// The speed multiplier matters for interpreting anything observed by eye:
 		// the search runs many times faster than real time, so a rewind of 3.3
@@ -10625,6 +10839,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		if (ProbeState::get().finished) {
 			solverReport(true);
+			profReport();
 			log::info("================ SOLVED ================");
 			log::info("  {} steps, {} deaths, {} restores, depth {}",
 			          sv.step, sv.deaths, sv.restores, sv.stack.size());
@@ -11453,6 +11668,94 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	//
 	// The FULL restore is also a control nobody has run: its world fidelity has
 	// never been measured on a level where the world moves.
+	// Probe 26. Which part of the search makes checkCollisions slow?
+	//
+	// Probe 24: 3.9 us a call in an F4 replay of Clubstep's solution, flat across
+	// the level; 75 us during the solve, on the same path. Probe 25: the section
+	// lists do not grow. The remaining differences between a solve and a replay are
+	// practice mode (on in a solve, off in F4), live checkpoints (thousands on the
+	// solver's stack, none in a replay), capturing, and restoring. Each condition
+	// below adds one of them, over the same stretch of level, noclip, no input.
+	void runProbe26() {
+		auto* pl = PlayLayer::get();
+		if (!pl || !m_player1) { log::warn("Probe 26: no level"); return; }
+		auto& ps = ProbeState::get();
+		g_probe26Running = true;
+		const bool savedPractice = pl->m_isPracticeMode;
+		constexpr int kSteps = 2400;                 // 10 s
+		constexpr int kEvery = 4;                    // capture cadence, as airBranchInterval
+		constexpr int kRestoreEvery = 50;            // E: restore this often...
+		constexpr int kRestoreBack = 5;              // ...to the capture this many captures back
+
+		auto startFromZero = [&]() {
+			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
+			ps.suppressDeath = false;
+			pl->resetLevel();
+			ps.suppressDeath = true;
+		};
+		auto stepOnce = [&](uint64_t& stepTicks) {
+			applyInput(false);
+			const uint64_t t0 = probe::nowTicks();
+			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
+			stepTicks += probe::nowTicks() - t0;
+		};
+		struct C { const char* label; bool practice; int capture; bool restore; };
+		// capture: 0 none, 1 keep all, 2 release at once
+		const C conds[] = {
+			{"A practice off, plain",           false, 0, false},
+			{"B practice on, plain",            true,  0, false},
+			{"C practice on, capture+keep",     true,  1, false},
+			{"D practice on, capture+release",  true,  2, false},
+			{"E practice on, keep+restore",     true,  1, true},
+		};
+		log::info("Probe 26: {} steps from level start per condition, noclip, no input, "
+		          "visibility skipped; capture every {} steps.", kSteps, kEvery);
+		for (auto const& c : conds) {
+			pl->m_isPracticeMode = c.practice;
+			startFromZero();
+			const uint64_t cc0 = g_profTicks[P_checkCollisions], cn0 = g_profCalls[P_checkCollisions];
+			uint64_t stepTicks = 0, restoreTicks = 0;
+			int steps = 0, restores = 0;
+			std::vector<RestoreState> kept;
+			kept.reserve(kSteps / kEvery + 8);
+			for (int i = 0; i < kSteps; i++) {
+				if (c.capture && i % kEvery == 0) {
+					RestoreState rs;
+					captureRestoreState(rs);
+					if (c.capture == 1) kept.push_back(std::move(rs));
+					else releaseCheckpoint(rs.cp);
+				}
+				if (c.restore && i > 0 && i % kRestoreEvery == 0 &&
+				    kept.size() > static_cast<size_t>(kRestoreBack)) {
+					const uint64_t r0 = probe::nowTicks();
+					applyRestoreState(kept[kept.size() - 1 - kRestoreBack], false);
+					restoreTicks += probe::nowTicks() - r0;
+					ps.suppressDeath = true;
+					restores++;
+					// Step back up to where the restore left off, so the stretch covered
+					// matches the other conditions.
+					for (int k = 0; k < kRestoreBack * kEvery; k++) { stepOnce(stepTicks); steps++; }
+				}
+				stepOnce(stepTicks);
+				steps++;
+			}
+			const uint64_t ccT = g_profTicks[P_checkCollisions] - cc0;
+			const uint64_t ccN = g_profCalls[P_checkCollisions] - cn0;
+			log::info("Probe 26: {:<32} checkCollisions {:>7.2f} us/call ({} calls) | step {:>7.2f} us "
+			          "| live checkpoints {} | restores {} ({:.0f} us each)",
+			          c.label, ccN ? probe::ticksToMicros(ccT) / ccN : 0.0, ccN,
+			          steps ? probe::ticksToMicros(stepTicks) / steps : 0.0,
+			          kept.size(), restores,
+			          restores ? probe::ticksToMicros(restoreTicks) / restores : 0.0);
+			for (auto& k : kept) releaseCheckpoint(k.cp);
+		}
+		pl->m_isPracticeMode = savedPractice;
+		startFromZero();
+		ps.suppressDeath = false;
+		g_probe26Running = false;       // g_visStale is set: update() rebuilds once
+		log::info("Probe 26: done.");
+	}
+
 	void runProbe23() {
 		auto* pl = PlayLayer::get();
 		if (!pl || !m_player1 || !pl->m_objects) { log::warn("Probe 23: no level"); return; }
@@ -11647,6 +11950,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (g_probe23Pending) {
 			g_probe23Pending = false;
 			runProbe23();
+			return;
+		}
+		if (g_probe26Pending) {
+			g_probe26Pending = false;
+			runProbe26();
 			return;
 		}
 		liveCeilingStep();
@@ -11906,8 +12214,17 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 class $modify(SolverPlayLayer, PlayLayer) {
 
+	// Probe 24 hooks.
+	void postUpdate(float dt) { ProfScope p(P_PL_postUpdate); PlayLayer::postUpdate(dt); }
+	void updateProgressbar() { ProfScope p(P_PL_updateProgressbar); PlayLayer::updateProgressbar(); }
+	void updateAttemptTime(float t) { ProfScope p(P_PL_updateAttemptTime); PlayLayer::updateAttemptTime(t); }
+	void updateInfoLabel() { ProfScope p(P_PL_updateInfoLabel); PlayLayer::updateInfoLabel(); }
+	void checkForEnd() { ProfScope p(P_PL_checkForEnd); PlayLayer::checkForEnd(); }
+	void processCheckpoints() { ProfScope p(P_PL_processCheckpoints); PlayLayer::processCheckpoints(); }
+
 	// Phase A (skipVisibility). Display preparation only; see the flag.
 	void updateVisibility(float dt) {
+		ProfScope prof(P_PL_updateVisibility);
 		if (solverSkipsVisibility()) { g_visStale = true; return; }
 		if (g_visStale) return;   // still stale: the reset in update() rebuilds it
 		PlayLayer::updateVisibility(dt);
@@ -12031,7 +12348,10 @@ class $modify(SolverPlayLayer, PlayLayer) {
 		}
 		// catchDeaths: during the search's own steps only - a resync or anchor
 		// replay must see a real death, and so must F4.
-		if (g_config.catchDeaths && player == m_player1 &&
+		// GD's anti-cheat calls destroyPlayer with this hidden object at the start
+		// of an attempt to detect noclip; it is not a death and must pass through.
+		// Catching it made the first run "die" at step 2 (2026-09-29).
+		if (g_config.catchDeaths && player == m_player1 && object != m_anticheatSpike &&
 		    ProbeState::get().mode == Mode::Solve && Solver::get().running &&
 		    !Solver::get().resyncing && !Solver::get().anchorReplaying) {
 			g_caughtDeath = true;
@@ -12074,6 +12394,12 @@ class $modify(SolverPlayLayer, PlayLayer) {
 // this observer sits downstream of whatever input plumbing the game uses -
 // direct dispatch, queued commands, or replay playback.
 class $modify(SolverPlayerObject, PlayerObject) {
+
+	// Probe 24 hooks.
+	void update(float dt) { ProfScope p(P_PO_update); PlayerObject::update(dt); }
+	void postCollision(float dt, bool betweenSteps) { ProfScope p(P_PO_postCollision); PlayerObject::postCollision(dt, betweenSteps); }
+	void updateInternalActions(float dt) { ProfScope p(P_PO_updateInternalActions); PlayerObject::updateInternalActions(dt); }
+	void placeStreakPoint() { ProfScope p(P_PO_placeStreakPoint); PlayerObject::placeStreakPoint(); }
 
 	bool pushButton(PlayerButton button) {
 		auto& st = ProbeState::get();
