@@ -535,18 +535,6 @@ struct Config {
 	// through (see the destroyPlayer hook). 7 toggles it.
 	bool catchDeaths = true;
 
-	// Skip GJBaseGameLayer::updateShaderLayer while the solver runs. resetLevel
-	// calls it twice per restore, and each call moves the layers holding every
-	// object's sprite in and out of the shader container - walking the whole tree
-	// through onExit/onEnter. gdsolver measured 87% of a heavy restore there and
-	// skips it during search; display only. The rebuild reset after the solve runs
-	// it normally.
-	//
-	// MEASURED NO GAIN (Probe 23 v3, Deadlocked): full restore 38 ms either way,
-	// within noise. gdsolver's 87% was a sliced level late in a long search. Kept
-	// off; candidate for deletion. 9 toggles it.
-	bool skipShaderLayer = false;
-
 	// Restore through GD's own respawn: the checkpoint as the only entry in the
 	// list, then resetLevel, which loads it - instead of resetting to level START
 	// and then calling loadFromCheckpoint over the top. The same write-back runs
@@ -2335,9 +2323,6 @@ void onAttemptEnded() {
 // with no restores and no practice mode. This is the check that makes an
 // unsound restore impossible to mistake for a success.
 
-void profCollisionCompare();   // Probe 24, defined with the profiler below
-void profCollisionReset(int which);
-void sectionCensus(GJBaseGameLayer* gl, const char* tag);
 
 void startVerify(bool practiceMode, const char* file = "solution.txt") {
 	auto& st = ProbeState::get();
@@ -2368,8 +2353,6 @@ void startVerify(bool practiceMode, const char* file = "solution.txt") {
 	st.verifyDivergeLogged  = false;
 	st.verifyPathTrace.clear();
 	st.verifyPathTrace.reserve(st.scripted.size() + 256);
-	profCollisionReset(1);
-	sectionCensus(PlayLayer::get(), "F4 start");
 	log::info("Verify: replaying {} ({} steps) from frame 0, practice mode {}, "
 	          "no savestates, no restores. physics_fix={}",
 	          file, st.scripted.size(), practiceMode ? "ON" : "OFF", fileFix ? 1 : 0);
@@ -2514,7 +2497,6 @@ void finishVerify(bool completed, int atStep, float pct) {
 	// Whether the replay passed or died, every step of it was checked
 	// against the map, and the disagreement is the point.
 	pathAuditReport();
-	profCollisionCompare();
 	if (completed) {
 		if (st.verifyDivergeStep >= 0) {
 			// A pass is not the same as a match. The search flew one trajectory and
@@ -3313,29 +3295,6 @@ struct SnapshotWorld {
 	static SnapshotWorld& get() { static SnapshotWorld w; return w; }
 };
 
-// The objects a diff covers. Stage-2 snapshots carry only objects that can
-// change; a diff that only looks at those cannot find state the snapshot does
-// not carry. When `wide` is built, dumps cover every gameplay object instead.
-struct DumpWorld {
-	std::vector<SnapshotWorld::Entry> objs;
-	bool built = false;
-	void build(cocos2d::CCArray* all) {
-		objs.clear();
-		if (all) for (unsigned i = 0; i < all->count(); i++) {
-			auto* o = static_cast<GameObject*>(all->objectAtIndex(i));
-			if (!o || static_cast<int>(o->getType()) == static_cast<int>(GameObjectType::Decoration))
-				continue;
-			uint8_t level = 0;
-			if (geode::cast::typeinfo_cast<RingObject*>(o))              level = 3;
-			else if (geode::cast::typeinfo_cast<EffectGameObject*>(o))   level = 2;
-			else if (geode::cast::typeinfo_cast<EnhancedGameObject*>(o)) level = 1;
-			objs.push_back({o, level, o->m_groupCount > 0});
-		}
-		built = true;
-	}
-	static DumpWorld& get() { static DumpWorld w; return w; }
-};
-
 // Where a snapshot restore spends its time: world, GJGameState, player, rest.
 // Accumulated only while Probe 23 asks for it.
 bool     g_snapTiming = false;
@@ -3883,16 +3842,6 @@ struct Solver {
 	uint64_t              tRestore = 0, tStep = 0, tSolver = 0;
 	// Snapshot restore bookkeeping.
 	bool                  snapWorldReady = false;
-	// Snapshot audit: for the first kSnapAudit snapshot restores of a solve,
-	// restore by snapshot, record, restore fully, record, and count every field
-	// that differs. The solve continues from the FULL restore, so it runs exactly
-	// as the baseline does while the audit collects.
-	int                   snapAuditDone = 0;
-	std::map<std::string, std::pair<int, std::string>> snapAuditHits;
-	// v2: the same fields, split by whether the restore's next 120 steps came out
-	// the same (exact) or not (diverged) - which fields actually change play.
-	std::map<std::string, int> snapAuditDiverged, snapAuditExact;
-	int                   snapAuditNDiverged = 0;
 	// Truth check. On a sample of snapshot restores, the continuation the solver
 	// actually recorded from that decision - saved before it is cut - is replayed
 	// after the restore with the same inputs. A correct restore retraces it.
@@ -3903,10 +3852,6 @@ struct Solver {
 	std::vector<probe::TraceRow> truthRows;
 	std::vector<uint8_t>  truthIn;
 	int                   truthChecks = 0, truthSnapExact = 0, truthFullExact = 0, truthSnapFail = 0;
-	// Divergence hunter: on the first kHunt snapshot restores, play the snapshot
-	// and the full restore forward with the same input; where the player first
-	// differs, replay both to ONE STEP BEFORE and diff the whole state there.
-	int                   huntDone = 0, huntFound = 0;
 	bool                  snapDisabled = false;
 	// Death log: one row per death, written when the solve ends. Two runs of one
 	// level agree row for row until the first restore that behaves differently,
@@ -4102,17 +4047,11 @@ struct Solver {
 		tRestore = tStep = tSolver = nTimedSteps = nTimedRestores = 0;
 		snapWorldReady = false;
 		tSnapCapture = nSnapCaptures = snapDeltaBytes = nSnapRestores = 0;
-		snapAuditDone = 0;
-		snapAuditHits.clear();
-		snapAuditDiverged.clear();
-		snapAuditExact.clear();
-		snapAuditNDiverged = 0;
 		truthPending = false;
 		truthCounter = 0;
 		truthRows.clear();
 		truthIn.clear();
 		truthChecks = truthSnapExact = truthFullExact = truthSnapFail = 0;
-		huntDone = huntFound = 0;
 		snapDisabled = false;
 		deathLog.clear();
 		lastRestoreTarget = -1;
@@ -6581,69 +6520,20 @@ bool g_probe23Pending = false;
 // Probe 23 v2: while it runs, the visibility pass is skipped exactly as in a
 // solve, so its restore timings are the ones a solve would pay.
 bool g_probe23Running = false;
-// Probe 26: requested by F3, run at the next frame boundary; while it runs the
-// profiler times checkCollisions and the visibility pass is skipped.
-bool g_probe26Pending = false;
-bool g_probe26Running = false;
 bool g_probe27Pending = false;
-// Probe 23 only: force a restore variant. -1 = normal. 0 = reset to start + load
-// (the solver's path), 1 = no reset + load (catchDeaths), 2 = GD's respawn to the
-// checkpoint, 3 = respawn + one realign step. Write-back is identical in all four.
+// Probe 23 only: force a restore variant. -1 = normal. 0 = reset to start + load,
+// 1 = no reset + load (measured unsound on moving levels; reachable from here
+// only), 2 = GD's respawn to the checkpoint (the default). Write-back is identical.
 int g_restoreVariant = -1;
 // Probe 23 v3: while the probe runs, whether the visibility pass runs (to compare
-// collision geometry with and without it) and whether the shader layer is skipped.
+// collision geometry with and without it).
 bool g_probe23Vis = false;
-bool g_probe23Shader = false;
 bool solverSkipsVisibility() {
 	if (g_probe23Running) return !g_probe23Vis;
-	if (g_probe26Running) return true;
 	return g_config.skipVisibility && ProbeState::get().mode == Mode::Solve &&
 	       Solver::get().running;
 }
 
-bool solverSkipsShaderLayer() {
-	if (g_probe23Running) return g_probe23Shader;
-	return g_config.skipShaderLayer && ProbeState::get().mode == Mode::Solve &&
-	       Solver::get().running;
-}
-
-// Probe 25: section census.
-//
-// Probe 24 measured checkCollisions at 3.9 us a call during an F4 replay of
-// Clubstep's solution - flat across the whole level - and 75 us a call during
-// the solve that found it, on the same path: 19x, up to 29x in places. So
-// something the SEARCH does makes every collision check slower. checkCollisions
-// walks GD's section lists, so this counts what is in them. A list that keeps
-// growing while the solver runs, and not during a replay, is the leak.
-// Read-only; prints with the profiler on (1).
-void sectionCensus(GJBaseGameLayer* gl, const char* tag) {
-	if (!gl || !g_config.stepProfile) return;
-	uint64_t logical = 0, stored = 0, cells = 0, maxCell = 0;
-	for (auto* col : gl->m_sectionSizes) {
-		if (!col) continue;
-		for (int n : *col) { logical += static_cast<uint64_t>(std::max(0, n)); cells++;
-		                     maxCell = std::max<uint64_t>(maxCell, static_cast<uint64_t>(std::max(0, n))); }
-	}
-	for (auto* col : gl->m_sections) {
-		if (!col) continue;
-		for (auto* cell : *col) if (cell) stored += cell->size();
-	}
-	uint64_t neLogical = 0;
-	for (auto* col : gl->m_nonEffectObjectsSizes) {
-		if (!col) continue;
-		for (int n : *col) neLogical += static_cast<uint64_t>(std::max(0, n));
-	}
-	auto cnt = [](cocos2d::CCArray* a) { return a ? static_cast<int>(a->count()) : -1; };
-	auto* pl = PlayLayer::get();
-	log::info("Probe 25 [{}]: sections {} objects in {} cells (stored {}, largest cell {}) | "
-	          "non-effect {} | active {}/{} | solid cand {} hazard cand {} | toMove {} "
-	          "collisionBlocks {} checkpointArray {}",
-	          tag, logical, cells, stored, maxCell, neLogical,
-	          gl->m_activeObjectsCount, gl->m_activeObjects.size(),
-	          gl->m_solidCollisionObjectsCount, gl->m_hazardCollisionObjectsCount,
-	          cnt(gl->m_objectsToMove), cnt(gl->m_collisionBlocks),
-	          pl ? cnt(pl->m_checkpointArray) : -1);
-}
 
 // ---------------------------------------------------------------------------
 // Probe 24: step profiler
@@ -6656,40 +6546,16 @@ void sectionCensus(GJBaseGameLayer* gl, const char* tag) {
 // the table ranks where time goes rather than summing to the step. Only while
 // the solver runs, and only with the flag on: off, each hook is one branch.
 // Measurement only. 1 toggles it.
-enum ProfSlot { P_processCommands, P_checkCollisions, P_collisionCheckObjects, P_updateCamera, P_updateParticles, P_updateEnterEffects, P_processMoveActionsStep, P_processAreaActions, P_processTransformActions, P_processRotationActions, P_processDynamicObjectActions, P_processFollowActions, P_processPlayerFollowActions, P_processAdvancedFollowActions, P_processItems, P_checkSpawnObjects, P_updateAudioVisualizer, P_updateGradientLayers, P_processQueuedAudioTriggers, P_processActivatedAudioTriggers, P_updateProximityVolumeEffects, P_updateSpecialLabels, P_updateTimerLabels, P_updateGuideArt, P_updateExtraGameLayers, P_preUpdateVisibility, P_updateCollisionBlocks, P_updateDebugDraw, P_updateShaderLayer, P_PL_postUpdate, P_PL_updateVisibility, P_PL_updateProgressbar, P_PL_updateAttemptTime, P_PL_updateInfoLabel, P_PL_checkForEnd, P_PL_processCheckpoints, P_PO_update, P_PO_postCollision, P_PO_updateInternalActions, P_PO_placeStreakPoint, P_RESTORE_FIRST, P_R_PL_resetLevel, P_R_PL_loadFromCheckpoint, P_R_PL_createCheckpoint, P_R_PL_storeCheckpoint, P_R_PL_removeAllCheckpoints, P_R_PL_prepareMusic, P_R_PL_startMusic, P_R_PL_loadDefaultColors, P_R_PL_processLoadedMoveActions, P_R_PL_resetSPTriggered, P_R_resetLevelVariables, P_R_resetPlayer, P_R_resetCamera, P_R_resetAudio, P_R_resetGradientLayers, P_R_resetActiveEnterEffects, P_R_resetSpawnChannelIndex, P_R_resetStaticCamera, P_R_updateLevelColors, P_R_sortSectionVector, P_R_refreshKeyframeAnims, P_R_refreshCounterLabels, P_R_toggleFlipped, P_R_prepareSavePositionObjects, P_R_loadUpToPosition, P_R_toggleGroup, P_R_PO_resetAllParticles, P_R_PO_resetStreak, P_R_PO_stopParticles, P_R_GO_resetObject, P_COUNT };
-const char* const kProfNames[P_COUNT] = { "processCommands", "checkCollisions", "collisionCheckObjects", "updateCamera", "updateParticles", "updateEnterEffects", "processMoveActionsStep", "processAreaActions", "processTransformActions", "processRotationActions", "processDynamicObjectActions", "processFollowActions", "processPlayerFollowActions", "processAdvancedFollowActions", "processItems", "checkSpawnObjects", "updateAudioVisualizer", "updateGradientLayers", "processQueuedAudioTriggers", "processActivatedAudioTriggers", "updateProximityVolumeEffects", "updateSpecialLabels", "updateTimerLabels", "updateGuideArt", "updateExtraGameLayers", "preUpdateVisibility", "updateCollisionBlocks", "updateDebugDraw", "updateShaderLayer", "PlayLayer::postUpdate", "PlayLayer::updateVisibility", "PlayLayer::updateProgressbar", "PlayLayer::updateAttemptTime", "PlayLayer::updateInfoLabel", "PlayLayer::checkForEnd", "PlayLayer::processCheckpoints", "Player::update", "Player::postCollision", "Player::updateInternalActions", "Player::placeStreakPoint", "(marker)", "PlayLayer::resetLevel", "PlayLayer::loadFromCheckpoint", "PlayLayer::createCheckpoint (capture)", "PlayLayer::storeCheckpoint", "PlayLayer::removeAllCheckpoints", "PlayLayer::prepareMusic", "PlayLayer::startMusic", "PlayLayer::loadDefaultColors", "PlayLayer::processLoadedMoveActions", "PlayLayer::resetSPTriggered", "resetLevelVariables", "resetPlayer", "resetCamera", "resetAudio", "resetGradientLayers", "resetActiveEnterEffects", "resetSpawnChannelIndex", "resetStaticCamera", "updateLevelColors", "sortSectionVector", "refreshKeyframeAnims", "refreshCounterLabels", "toggleFlipped", "prepareSavePositionObjects", "loadUpToPosition", "toggleGroup", "Player::resetAllParticles", "Player::resetStreak", "Player::stopParticles", "GameObject::resetObject" };
+enum ProfSlot { P_processCommands, P_checkCollisions, P_collisionCheckObjects, P_updateCamera, P_updateParticles, P_updateEnterEffects, P_processMoveActionsStep, P_processAreaActions, P_processTransformActions, P_processRotationActions, P_processDynamicObjectActions, P_processFollowActions, P_processPlayerFollowActions, P_processAdvancedFollowActions, P_processItems, P_checkSpawnObjects, P_updateAudioVisualizer, P_updateGradientLayers, P_processQueuedAudioTriggers, P_processActivatedAudioTriggers, P_updateProximityVolumeEffects, P_updateSpecialLabels, P_updateTimerLabels, P_updateGuideArt, P_updateExtraGameLayers, P_preUpdateVisibility, P_updateCollisionBlocks, P_updateDebugDraw, P_updateShaderLayer, P_PL_postUpdate, P_PL_updateVisibility, P_PL_updateProgressbar, P_PL_updateAttemptTime, P_PL_updateInfoLabel, P_PL_checkForEnd, P_PL_processCheckpoints, P_PO_update, P_PO_postCollision, P_PO_updateInternalActions, P_PO_placeStreakPoint, P_RESTORE_FIRST, P_R_PL_resetLevel, P_R_PL_loadFromCheckpoint, P_R_PL_createCheckpoint, P_R_PL_storeCheckpoint, P_R_PL_removeAllCheckpoints, P_R_PL_prepareMusic, P_R_PL_startMusic, P_R_PL_loadDefaultColors, P_R_PL_processLoadedMoveActions, P_R_PL_resetSPTriggered, P_R_resetLevelVariables, P_R_resetPlayer, P_R_resetCamera, P_R_resetAudio, P_R_resetGradientLayers, P_R_resetActiveEnterEffects, P_R_resetSpawnChannelIndex, P_R_resetStaticCamera, P_R_updateLevelColors, P_R_sortSectionVector, P_R_refreshKeyframeAnims, P_R_refreshCounterLabels, P_R_toggleFlipped, P_R_prepareSavePositionObjects, P_R_loadUpToPosition, P_R_toggleGroup, P_R_PO_resetAllParticles, P_R_PO_resetStreak, P_R_PO_stopParticles, P_COUNT };
+const char* const kProfNames[P_COUNT] = { "processCommands", "checkCollisions", "collisionCheckObjects", "updateCamera", "updateParticles", "updateEnterEffects", "processMoveActionsStep", "processAreaActions", "processTransformActions", "processRotationActions", "processDynamicObjectActions", "processFollowActions", "processPlayerFollowActions", "processAdvancedFollowActions", "processItems", "checkSpawnObjects", "updateAudioVisualizer", "updateGradientLayers", "processQueuedAudioTriggers", "processActivatedAudioTriggers", "updateProximityVolumeEffects", "updateSpecialLabels", "updateTimerLabels", "updateGuideArt", "updateExtraGameLayers", "preUpdateVisibility", "updateCollisionBlocks", "updateDebugDraw", "updateShaderLayer", "PlayLayer::postUpdate", "PlayLayer::updateVisibility", "PlayLayer::updateProgressbar", "PlayLayer::updateAttemptTime", "PlayLayer::updateInfoLabel", "PlayLayer::checkForEnd", "PlayLayer::processCheckpoints", "Player::update", "Player::postCollision", "Player::updateInternalActions", "Player::placeStreakPoint", "(marker)", "PlayLayer::resetLevel", "PlayLayer::loadFromCheckpoint", "PlayLayer::createCheckpoint (capture)", "PlayLayer::storeCheckpoint", "PlayLayer::removeAllCheckpoints", "PlayLayer::prepareMusic", "PlayLayer::startMusic", "PlayLayer::loadDefaultColors", "PlayLayer::processLoadedMoveActions", "PlayLayer::resetSPTriggered", "resetLevelVariables", "resetPlayer", "resetCamera", "resetAudio", "resetGradientLayers", "resetActiveEnterEffects", "resetSpawnChannelIndex", "resetStaticCamera", "updateLevelColors", "sortSectionVector", "refreshKeyframeAnims", "refreshCounterLabels", "toggleFlipped", "prepareSavePositionObjects", "loadUpToPosition", "toggleGroup", "Player::resetAllParticles", "Player::resetStreak", "Player::stopParticles" };
 uint64_t g_profTicks[P_COUNT] = {};
 uint64_t g_profCalls[P_COUNT] = {};
 bool profOn() {
 	if (!g_config.stepProfile) return false;
-	if (g_probe26Running || g_probe23Running) return true;
-	auto const m = ProbeState::get().mode;
-	return (m == Mode::Solve && Solver::get().running) || m == Mode::Verify;
+	if (g_probe23Running) return true;
+	return ProbeState::get().mode == Mode::Solve && Solver::get().running;
 }
 
-// checkCollisions by position, for the solve [0] and for an F4 replay [1] of
-// the same level. The replay flies the same path with no search, no captures and
-// no restores, so the same bucket costing more during the solve means something
-// the search does is slowing every step - not the level being denser there.
-constexpr int kCollBuckets = 20;
-uint64_t g_collTicks[2][kCollBuckets] = {};
-uint64_t g_collCalls[2][kCollBuckets] = {};
-std::string g_collLevel[2];
-void profCollisionRecord(double x, uint64_t ticks) {
-	auto* pl = PlayLayer::get();
-	if (!pl || pl->m_levelLength <= 1.f) return;
-	const int which = ProbeState::get().mode == Mode::Verify ? 1 : 0;
-	int b = static_cast<int>(x / pl->m_levelLength * kCollBuckets);
-	b = std::max(0, std::min(kCollBuckets - 1, b));
-	g_collTicks[which][b] += ticks;
-	g_collCalls[which][b]++;
-	g_collLevel[which] = ProbeState::get().levelKey;
-}
-void profCollisionReset(int which) {
-	std::memset(g_collTicks[which], 0, sizeof(g_collTicks[which]));
-	std::memset(g_collCalls[which], 0, sizeof(g_collCalls[which]));
-	g_collLevel[which].clear();
-}
 struct ProfScope {
 	int slot; uint64_t t0;
 	explicit ProfScope(int s) : slot(s), t0(profOn() ? probe::nowTicks() : 0) {}
@@ -6700,33 +6566,8 @@ struct ProfScope {
 void profReset() {
 	std::memset(g_profTicks, 0, sizeof(g_profTicks));
 	std::memset(g_profCalls, 0, sizeof(g_profCalls));
-	profCollisionReset(0);
 }
 
-// Solve [0] against F4 replay [1], bucket by bucket. Printed at the end of a
-// verify; the solve side is whatever the last solve of this level recorded.
-void profCollisionCompare() {
-	if (!g_config.stepProfile) return;
-	sectionCensus(PlayLayer::get(), "F4 end");
-	const bool haveSolve = g_collLevel[0] == g_collLevel[1] && !g_collLevel[0].empty();
-	log::info("Probe 24: checkCollisions by position - us per call, {}.",
-	          haveSolve ? "solve against this F4 replay"
-	                    : "F4 replay only (no solve of this level recorded with the profiler on)");
-	double sumS = 0, sumV = 0; uint64_t nS = 0, nV = 0;
-	for (int b = 0; b < kCollBuckets; b++) {
-		const double v = g_collCalls[1][b] ? probe::ticksToMicros(g_collTicks[1][b]) / g_collCalls[1][b] : 0.0;
-		const double sv = g_collCalls[0][b] ? probe::ticksToMicros(g_collTicks[0][b]) / g_collCalls[0][b] : 0.0;
-		sumS += probe::ticksToMicros(g_collTicks[0][b]); nS += g_collCalls[0][b];
-		sumV += probe::ticksToMicros(g_collTicks[1][b]); nV += g_collCalls[1][b];
-		if (!g_collCalls[1][b] && !g_collCalls[0][b]) continue;
-		log::info("Probe 24:   {:>3}-{:>3}%  replay {:>7.2f} us ({:>6} calls)   solve {:>7.2f} us ({:>7} calls){}",
-		          b * 100 / kCollBuckets, (b + 1) * 100 / kCollBuckets,
-		          v, g_collCalls[1][b], sv, g_collCalls[0][b],
-		          (haveSolve && v > 0 && sv > 0) ? fmt::format("   x{:.2f}", sv / v) : std::string());
-	}
-	log::info("Probe 24:   overall  replay {:.2f} us/call   solve {:.2f} us/call",
-	          nV ? sumV / nV : 0.0, nS ? sumS / nS : 0.0);
-}
 void profReport() {
 	if (!g_config.stepProfile) return;
 	auto& sv = Solver::get();
@@ -7456,8 +7297,8 @@ void pollHotkeys() {
 		              : "reset to level start + loadFromCheckpoint, then the write-back");
 	}
 
-	// 9 = snapshot restore. (It toggled skipShaderLayer until that measured no
-	// gain; the setting remains, default off, with no key.)
+	// 9 = snapshot restore. (It toggled a shader-layer skip until that measured
+	// no gain and was deleted.)
 	if (keyPressedEdge('9')) {
 		g_config.snapshotRestore = !g_config.snapshotRestore;
 		log::info("Restores in a solve: {}. F2 to solve with this.",
@@ -7800,14 +7641,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	void toggleGroup(int id, bool activate) { ProfScope p(P_R_toggleGroup); GJBaseGameLayer::toggleGroup(id, activate); }
 	// Probe 24 hooks: each forwards unchanged, timed only while the profiler is on.
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) { ProfScope p(P_processCommands); GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick); }
-	int checkCollisions(PlayerObject* o, float dt, bool ignoreDamage) {
-		ProfScope p(P_checkCollisions);
-		if (!p.t0 || o != m_player1) return GJBaseGameLayer::checkCollisions(o, dt, ignoreDamage);
-		const uint64_t t0 = probe::nowTicks();
-		const int r = GJBaseGameLayer::checkCollisions(o, dt, ignoreDamage);
-		profCollisionRecord(o->getPositionX(), probe::nowTicks() - t0);
-		return r;
-	}
+	int checkCollisions(PlayerObject* o, float dt, bool ignoreDamage) { ProfScope p(P_checkCollisions); return GJBaseGameLayer::checkCollisions(o, dt, ignoreDamage); }
 	void collisionCheckObjects(PlayerObject* o, gd::vector<GameObject*>* objs, int n, float dt) { ProfScope p(P_collisionCheckObjects); GJBaseGameLayer::collisionCheckObjects(o, objs, n, dt); }
 	void updateCamera(float dt) { ProfScope p(P_updateCamera); GJBaseGameLayer::updateCamera(dt); }
 	void updateParticles(float dt) { ProfScope p(P_updateParticles); GJBaseGameLayer::updateParticles(dt); }
@@ -7842,11 +7676,8 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		GJBaseGameLayer::visit();
 	}
 
-	// skipShaderLayer: display only; see the flag. A skipped call leaves the
-	// sprite layers where they are, so the visibility rebuild's reset puts it back.
 	void updateShaderLayer(float dt) {
 		ProfScope prof(P_updateShaderLayer);
-		if (solverSkipsShaderLayer()) { g_visStale = true; return; }
 		GJBaseGameLayer::updateShaderLayer(dt);
 	}
 
@@ -9602,7 +9433,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		}
 		g_caughtDeath = false;
 
-		if (variant == 2 || variant == 3) {
+		if (variant == 2) {
 			// GD's own respawn: the checkpoint as the only entry, then resetLevel,
 			// which loads it itself. The respawn's known error is in the PLAYER
 			// (placed one step early, 13.8), which the write-back below overwrites.
@@ -9613,10 +9444,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 			// Out of the list again once it has loaded: left in, the next ordinary
 			// resetLevel (the rebuild after a solve, say) would respawn here.
 			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
-			if (variant == 3) {
-				applyInput(false);
-				GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
-			}
 		} else {
 			pl->loadFromCheckpoint(r.cp);
 		}
@@ -9919,7 +9746,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (m_effectManager)
 			table("effects ", reinterpret_cast<uint8_t const*>(m_effectManager),
 			      kEffectManagerScalarFields, kEffectManagerScalarFieldsNames);
-		auto const& w = DumpWorld::get().built ? DumpWorld::get().objs : SnapshotWorld::get().objs;
+		auto const& w = SnapshotWorld::get().objs;
 		d.objBegin = idx;
 		for (size_t k = 0; k < w.size(); k++) {
 			auto const& e = w[k];
@@ -10019,195 +9846,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		                     !effectsInFlight(m_effectManager) &&
 		                     m_player1 && !m_player1->m_isDead;
 		auto& sva = Solver::get();
-		// The divergence hunter found the last missing state (the player's level
-		// pointers; Clubstep's death log then matched the full-restore run for all
-		// 5,558 deaths) and is off: its full restores and level-start replays
-		// leave every object differing from the snapshot baseline, which bloated
-		// snapshots to the whole world. Raise kHunt to hunt again.
-		constexpr int kHunt = 0, kHuntFind = 3, kHuntSteps = 120;
-		if (useSnap && sva.huntDone < kHunt && sva.huntFound < kHuntFind) {
-			sva.huntDone++;
-			const bool hold = sva.resumeHold;
-			auto play = [&](int n, std::vector<uint64_t>* out) {
-				for (int k = 0; k < n; k++) {
-					applyInput(hold);
-					g_caughtDeath = false;
-					GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
-					if (out) {
-						uint64_t h = probe::bits(m_player1->getPositionX());
-						h = h * 1099511628211ull ^ probe::bits(m_player1->getPositionY());
-						h = h * 1099511628211ull ^ probe::bits(m_player1->m_yVelocity);
-						h = h * 1099511628211ull ^ (g_caughtDeath ? 1u : 0u);
-						out->push_back(h);
-					}
-				}
-			};
-			// Which restore follows what actually happened? The recorded path from
-			// this decision, replayed with its original inputs from each restore.
-			if (sva.truthPending) {
-				auto replayTruth = [&]() {
-					for (size_t k = 0; k < sva.truthRows.size(); k++) {
-						applyInput(sva.truthIn[k] != 0);
-						g_caughtDeath = false;
-						GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
-						auto const& t = sva.truthRows[k];
-						if (probe::bits(m_player1->getPositionX()) != t.x ||
-						    probe::bits(m_player1->getPositionY()) != t.y ||
-						    probe::bits(m_player1->m_yVelocity) != t.yVelocity)
-							return static_cast<int>(k);
-					}
-					return -1;
-				};
-				restoreSnapshot(*d.snap);
-				const int sT = replayTruth();
-				applyRestoreState(d.rs, d.enteringHold);
-				const int fT = replayTruth();
-				if (sT >= 0 || fT >= 0 || d.step == 1226)
-					log::info("Divergence hunter: TRUTH at step {} ({} recorded steps): snapshot {}, full restore {}",
-					          d.step, sva.truthRows.size(),
-					          sT < 0 ? std::string("follows it") : fmt::format("leaves it at +{}", sT),
-					          fT < 0 ? std::string("follows it") : fmt::format("leaves it at +{}", fT));
-				sva.truthPending = false;
-			}
-			std::vector<uint64_t> ta, tb;
-			restoreSnapshot(*d.snap);
-			play(kHuntSteps, &ta);
-			applyRestoreState(d.rs, d.enteringHold);
-			play(kHuntSteps, &tb);
-			int div = -1;
-			for (int k = 0; k < kHuntSteps && div < 0; k++) if (ta[k] != tb[k]) div = k;
-			if (div >= 0) {
-				sva.huntFound++;
-				// GROUND TRUTH: no restore at all. Reset to level start and replay
-				// the solver's own inputs up to this decision - what F4 and resyncs
-				// do - then play the same steps. That is what the game really does.
-				{
-					applyRestoreState(d.rs, d.enteringHold);
-					const uint32_t fx = probe::bits(m_player1->getPositionX());
-					const uint32_t fy = probe::bits(m_player1->getPositionY());
-					const uint64_t fv = probe::bits(m_player1->m_yVelocity);
-					auto& pst = ProbeState::get();
-					auto* plr = PlayLayer::get();
-					if (auto* arr = plr->m_checkpointArray) arr->removeAllObjects();
-					pst.solverRestoring = true;
-					pst.suppressDeath = true;
-					plr->resetLevel();
-					pst.solverRestoring = false;
-					for (int i = 0; i < d.step && i < static_cast<int>(sva.macro.size()); i++) {
-						applyInput(sva.macro[i] != 0);
-						g_caughtDeath = false;
-						GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
-					}
-					const bool arrived = probe::bits(m_player1->getPositionX()) == fx &&
-					                     probe::bits(m_player1->getPositionY()) == fy &&
-					                     probe::bits(m_player1->m_yVelocity) == fv;
-					std::vector<uint64_t> tt;
-					play(kHuntSteps, &tt);
-					pst.suppressDeath = false;
-					int sT = -1, fT = -1;
-					for (int k = 0; k < kHuntSteps; k++) {
-						if (sT < 0 && ta[k] != tt[k]) sT = k;
-						if (fT < 0 && tb[k] != tt[k]) fT = k;
-					}
-					log::info("Divergence hunter: GROUND TRUTH (replay from level start, no restore; "
-					          "arrived at the decision {}): snapshot {}, full restore {}",
-					          arrived ? "EXACTLY" : "NOT exactly - truth unreliable",
-					          sT < 0 ? std::string("follows it") : fmt::format("leaves it at +{}", sT),
-					          fT < 0 ? std::string("follows it") : fmt::format("leaves it at +{}", fT));
-				}
-				// The state one step before the player first differs: every field
-				// that differs THERE is a candidate cause, with 'div' steps of real
-				// physics having overwritten the restore's harmless leftovers.
-				StateDump a, b;
-				restoreSnapshot(*d.snap);
-				play(div, nullptr);
-				const float ax = m_player1->getPositionX(), ay = m_player1->getPositionY();
-				dumpState(a);
-				applyRestoreState(d.rs, d.enteringHold);
-				play(div, nullptr);
-				dumpState(b);
-				std::vector<std::pair<std::string, std::string>> diffs;
-				diffCollect(a, b, diffs);
-				log::info("Divergence hunter #{}: restore to step {} (hold {}), the player first "
-				          "differs at +{}; state at +{} (player x {:.2f} y {:.3f}) differs in {} fields:",
-				          sva.huntFound, d.step, hold, div, div, ax, ay, diffs.size());
-				for (size_t i = 0; i < diffs.size() && i < 60; i++)
-					log::info("Divergence hunter:     {}  {}", diffs[i].first, diffs[i].second);
-
-				// v1's transplants were confounded: the first ran on a freshly reset
-				// game and "matched", the rest ran after 120 steps of play and split.
-				// So the snapshot is right on top of a reset and wrong on top of a
-				// played-on game: some state the reset clears is not carried. Find it
-				// directly - the same snapshot restore from the two starting points,
-				// dumped over EVERY gameplay object, not only the carried ones.
-				if (!DumpWorld::get().built) DumpWorld::get().build(PlayLayer::get() ? PlayLayer::get()->m_objects : nullptr);
-				StateDump fromReset, fromPlay;
-				applyRestoreState(d.rs, d.enteringHold);
-				restoreSnapshot(*d.snap);
-				dumpState(fromReset);
-				std::vector<uint64_t> tr;
-				play(kHuntSteps, &tr);
-				int dvR = -1;
-				for (int k = 0; k < kHuntSteps && dvR < 0; k++) if (tr[k] != tb[k]) dvR = k;
-				// the game has now played on: restore by snapshot from here
-				restoreSnapshot(*d.snap);
-				dumpState(fromPlay);
-				std::vector<uint64_t> tp;
-				play(kHuntSteps, &tp);
-				int dvP = -1;
-				for (int k = 0; k < kHuntSteps && dvP < 0; k++) if (tp[k] != tb[k]) dvP = k;
-				log::info("Divergence hunter:   snapshot on top of a RESET -> {}; on top of a PLAYED-ON "
-				          "game -> {}", dvR < 0 ? std::string("matches the full restore") : fmt::format("splits at +{}", dvR),
-				          dvP < 0 ? std::string("matches the full restore") : fmt::format("splits at +{}", dvP));
-				std::vector<std::pair<std::string, std::string>> leftovers;
-				diffCollect(fromPlay, fromReset, leftovers);   // "full" column = from reset
-				log::info("Divergence hunter:   state the snapshot does not reset - {} fields differ "
-				          "between the two (\"full\" = on top of a reset, \"snapshot\" = on top of play):",
-				          leftovers.size());
-				for (size_t i = 0; i < leftovers.size() && i < 80; i++)
-					log::info("Divergence hunter:     {}  {}", leftovers[i].first, leftovers[i].second);
-
-				// Transplants, ordered correctly: EVERY one starts from the same
-				// played-on game - play, snapshot restore, set one candidate to its
-				// value on top of a reset, play, compare with the full restore's path.
-				auto* plh = PlayLayer::get();
-				applyRestoreState(d.rs, d.enteringHold);
-				restoreSnapshot(*d.snap);
-				const int   rClicks = m_clicks;
-				const bool  rArea   = m_areaObjectsUpdated;
-				const int   rSolid  = m_solidCollisionObjectsCount;
-				const float rSong   = m_songTriggerInterval;
-				const bool  rAudio  = m_audioPaused;
-				const int   rJumps  = plh ? plh->m_jumps : 0;
-				const int   rUJumps = plh ? plh->m_uncommittedJumps : 0;
-				struct T { const char* name; std::function<void()> apply; };
-				const T trans[] = {
-					{"m_solidCollisionObjectsCount", [&] { m_solidCollisionObjectsCount = rSolid; }},
-					{"m_areaObjectsUpdated",         [&] { m_areaObjectsUpdated = rArea; }},
-					{"m_clicks",                     [&] { m_clicks = rClicks; }},
-					{"m_jumps + m_uncommittedJumps",  [&] { if (plh) { plh->m_jumps = rJumps; plh->m_uncommittedJumps = rUJumps; } }},
-					{"m_songTriggerInterval + m_audioPaused", [&] { m_songTriggerInterval = rSong; m_audioPaused = rAudio; }},
-					{"ALL SEVEN", [&] {
-						m_solidCollisionObjectsCount = rSolid; m_areaObjectsUpdated = rArea; m_clicks = rClicks;
-						if (plh) { plh->m_jumps = rJumps; plh->m_uncommittedJumps = rUJumps; }
-						m_songTriggerInterval = rSong; m_audioPaused = rAudio; }},
-				};
-				for (auto const& t : trans) {
-					play(kHuntSteps, nullptr);          // the game plays on
-					restoreSnapshot(*d.snap);
-					t.apply();
-					std::vector<uint64_t> tt;
-					play(kHuntSteps, &tt);
-					int dv = -1;
-					for (int k = 0; k < kHuntSteps && dv < 0; k++) if (tt[k] != tb[k]) dv = k;
-					log::info("Divergence hunter:   transplant {:<42} -> {}", t.name,
-					          dv < 0 ? std::string("MATCHES the full restore") : fmt::format("still splits at +{}", dv));
-				}
-			}
-			// The solve continues from the full restore: the baseline route.
-			applyRestoreState(d.rs, d.enteringHold);
-		}
-		else if (useSnap) {
+		if (useSnap) {
 			restoreSnapshot(*d.snap);
 			sva.nSnapRestores++;
 			if (sva.truthPending) {
@@ -11051,14 +10690,11 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		// kTruthMax steps of it - but only the stretch that is pure physics from the
 		// state at `d`: it ends at the first row recorded after a later restore.
 		{
-			// 200 while the divergence hunter is active: the split it found is at
-			// +63, past a 60-step window.
-			const bool hunting = false;   // see kHunt
-			const size_t kTruthMax = hunting ? 200 : 60, kTruthMin = 8;
+			constexpr size_t kTruthMax = 60, kTruthMin = 8;
 			constexpr uint64_t kTruthEvery = 25;
 			sv.truthPending = false;
 			if (g_config.snapshotRestore && d.snap && !sv.snapDisabled && !sv.pathTraceFull &&
-			    ((++sv.truthCounter % kTruthEvery) == 0 || hunting)) {
+			    (++sv.truthCounter % kTruthEvery) == 0) {
 				sv.truthRows.clear();
 				sv.truthIn.clear();
 				const size_t from = static_cast<size_t>(d.step);
@@ -11488,7 +11124,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 				          sv.nSnapCaptures ? probe::ticksToMicros(sv.tSnapCapture) / sv.nSnapCaptures : 0.0,
 				          sv.nSnapCaptures ? sv.snapDeltaBytes / 1024.0 / sv.nSnapCaptures : 0.0);
 		}
-		sectionCensus(this, "solve");
 
 		// The speed multiplier matters for interpreting anything observed by eye:
 		// the search runs many times faster than real time, so a rewind of 3.3
@@ -12736,94 +12371,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 	//
 	// The FULL restore is also a control nobody has run: its world fidelity has
 	// never been measured on a level where the world moves.
-	// Probe 26. Which part of the search makes checkCollisions slow?
-	//
-	// Probe 24: 3.9 us a call in an F4 replay of Clubstep's solution, flat across
-	// the level; 75 us during the solve, on the same path. Probe 25: the section
-	// lists do not grow. The remaining differences between a solve and a replay are
-	// practice mode (on in a solve, off in F4), live checkpoints (thousands on the
-	// solver's stack, none in a replay), capturing, and restoring. Each condition
-	// below adds one of them, over the same stretch of level, noclip, no input.
-	void runProbe26() {
-		auto* pl = PlayLayer::get();
-		if (!pl || !m_player1) { log::warn("Probe 26: no level"); return; }
-		auto& ps = ProbeState::get();
-		g_probe26Running = true;
-		const bool savedPractice = pl->m_isPracticeMode;
-		constexpr int kSteps = 2400;                 // 10 s
-		constexpr int kEvery = 4;                    // capture cadence, as airBranchInterval
-		constexpr int kRestoreEvery = 50;            // E: restore this often...
-		constexpr int kRestoreBack = 5;              // ...to the capture this many captures back
-
-		auto startFromZero = [&]() {
-			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
-			ps.suppressDeath = false;
-			pl->resetLevel();
-			ps.suppressDeath = true;
-		};
-		auto stepOnce = [&](uint64_t& stepTicks) {
-			applyInput(false);
-			const uint64_t t0 = probe::nowTicks();
-			GJBaseGameLayer::update(static_cast<float>(kPhysicsDt));
-			stepTicks += probe::nowTicks() - t0;
-		};
-		struct C { const char* label; bool practice; int capture; bool restore; };
-		// capture: 0 none, 1 keep all, 2 release at once
-		const C conds[] = {
-			{"A practice off, plain",           false, 0, false},
-			{"B practice on, plain",            true,  0, false},
-			{"C practice on, capture+keep",     true,  1, false},
-			{"D practice on, capture+release",  true,  2, false},
-			{"E practice on, keep+restore",     true,  1, true},
-		};
-		log::info("Probe 26: {} steps from level start per condition, noclip, no input, "
-		          "visibility skipped; capture every {} steps.", kSteps, kEvery);
-		for (auto const& c : conds) {
-			pl->m_isPracticeMode = c.practice;
-			startFromZero();
-			const uint64_t cc0 = g_profTicks[P_checkCollisions], cn0 = g_profCalls[P_checkCollisions];
-			uint64_t stepTicks = 0, restoreTicks = 0;
-			int steps = 0, restores = 0;
-			std::vector<RestoreState> kept;
-			kept.reserve(kSteps / kEvery + 8);
-			for (int i = 0; i < kSteps; i++) {
-				if (c.capture && i % kEvery == 0) {
-					RestoreState rs;
-					captureRestoreState(rs);
-					if (c.capture == 1) kept.push_back(std::move(rs));
-					else releaseCheckpoint(rs.cp);
-				}
-				if (c.restore && i > 0 && i % kRestoreEvery == 0 &&
-				    kept.size() > static_cast<size_t>(kRestoreBack)) {
-					const uint64_t r0 = probe::nowTicks();
-					applyRestoreState(kept[kept.size() - 1 - kRestoreBack], false);
-					restoreTicks += probe::nowTicks() - r0;
-					ps.suppressDeath = true;
-					restores++;
-					// Step back up to where the restore left off, so the stretch covered
-					// matches the other conditions.
-					for (int k = 0; k < kRestoreBack * kEvery; k++) { stepOnce(stepTicks); steps++; }
-				}
-				stepOnce(stepTicks);
-				steps++;
-			}
-			const uint64_t ccT = g_profTicks[P_checkCollisions] - cc0;
-			const uint64_t ccN = g_profCalls[P_checkCollisions] - cn0;
-			log::info("Probe 26: {:<32} checkCollisions {:>7.2f} us/call ({} calls) | step {:>7.2f} us "
-			          "| live checkpoints {} | restores {} ({:.0f} us each)",
-			          c.label, ccN ? probe::ticksToMicros(ccT) / ccN : 0.0, ccN,
-			          steps ? probe::ticksToMicros(stepTicks) / steps : 0.0,
-			          kept.size(), restores,
-			          restores ? probe::ticksToMicros(restoreTicks) / restores : 0.0);
-			for (auto& k : kept) releaseCheckpoint(k.cp);
-		}
-		pl->m_isPracticeMode = savedPractice;
-		startFromZero();
-		ps.suppressDeath = false;
-		g_probe26Running = false;       // g_visStale is set: update() rebuilds once
-		log::info("Probe 26: done.");
-	}
-
 	// Probe 27. Is the gated snapshot exact everywhere it is allowed?
 	//
 	// Probe 23 has four capture points, which is enough to find a failure and not
@@ -12941,7 +12488,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		auto& ps = ProbeState::get();
 		g_probe23Running = true;
 		g_probe23Vis = false;
-		g_probe23Shader = false;
 		constexpr int kD = 600;                              // 2.5 s compared per point
 		constexpr int kSample = 8;                           // steps kept in full, for the sample
 		constexpr int kTimed = 5;                            // restores timed per variant
@@ -13002,7 +12548,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		};
 		auto startFromZero = [&]() {
 			if (auto* arr = pl->m_checkpointArray) arr->removeAllObjects();
-			g_probe23Shader = false;
 			ps.suppressDeath = false;
 			pl->resetLevel();
 			ps.suppressDeath = true;
@@ -13144,18 +12689,15 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 			for (auto const& v : variants) {
 				g_restoreVariant = v.id;
-				g_probe23Shader = v.shader;
 				std::vector<double> us;
 				std::memset(g_snapTicks, 0, sizeof(g_snapTicks));
 				g_snapTiming = (v.id >= 4);
-				const uint64_t ro0 = g_profCalls[P_R_GO_resetObject];
 				for (int t = 0; t < kTimed; t++) {
 					const uint64_t t0 = probe::nowTicks();
 					if (v.id >= 4) restoreSnapshot(snapSub);
 					else applyRestoreState(rs, false);
 					us.push_back(probe::ticksToMicros(probe::nowTicks() - t0));
 				}
-				const uint64_t resetObjs = (g_profCalls[P_R_GO_resetObject] - ro0) / kTimed;
 				g_snapTiming = false;
 				if (v.id >= 4)
 					log::info("Probe 23: t={} {}: capture {:.0f} us, {} bytes of world ({} objects) | "
@@ -13167,11 +12709,7 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 					          probe::ticksToMicros(g_snapTicks[1]) / kTimed,
 					          probe::ticksToMicros(g_snapTicks[2]) / kTimed,
 					          probe::ticksToMicros(g_snapTicks[3]) / kTimed);
-				else
-					log::info("Probe 23: t={} {}: GameObject::resetObject called {} times per restore "
-					          "(level has {} objects)", A, v.label, resetObjs, n);
 				std::sort(us.begin(), us.end());
-				g_probe23Shader = false;
 				ps.suppressDeath = true;                 // the restore clears it
 				Track got; record(got);
 				compare(ref, got, fmt::format("t={} {}", A, v.label),
@@ -13183,7 +12721,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 
 		g_restoreVariant = -1;
 		g_probe23Vis = false;
-		g_probe23Shader = false;
 		startFromZero();
 		ps.suppressDeath = false;
 		g_probe23Running = false;       // g_visStale is set: update() rebuilds once
@@ -13205,11 +12742,6 @@ class $modify(SolverBaseLayer, GJBaseGameLayer) {
 		if (g_probe23Pending) {
 			g_probe23Pending = false;
 			runProbe23();
-			return;
-		}
-		if (g_probe26Pending) {
-			g_probe26Pending = false;
-			runProbe26();
 			return;
 		}
 		if (g_probe27Pending) {
